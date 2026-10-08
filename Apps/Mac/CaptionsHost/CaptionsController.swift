@@ -146,7 +146,30 @@ final class CaptionsController: NSObject {
             }
             return
         }
+#if SP_APP_STORE
+
+        let directory = context.mediaURL.deletingLastPathComponent()
+        let generation = sessionGeneration
+        func requestGrant() {
+            SPFolderGrants.requestAccess(to: directory, message: L("access.folder.captionsMessage"),
+                                         window: context.window) { [weak self] granted in
+                guard granted, let self, self.sessionGeneration == generation else { return }
+                self.presentSheet(context: context)
+            }
+        }
+
+        SPFolderGrants.checkAccess(path: directory.path) { [weak self] accessible in
+            guard let self, self.sessionGeneration == generation else { return }
+            if accessible {
+                self.presentSheet(context: context)
+            } else {
+                requestGrant()
+            }
+        }
+        return
+#else
         presentSheet(context: context)
+#endif
     }
 
     func menuTitle(forMedia url: URL?) -> String { center.menuTitle(forMedia: url) }
@@ -261,12 +284,12 @@ final class CaptionsController: NSObject {
         guard !parts.isEmpty else { return }
         let target = parts.count > 1 ? Locale.Language(identifier: parts[1]) : nil
         if parts[0].hasPrefix("file:"), let target {
-            startSubtitle(source: .file(URL(fileURLWithPath: String(parts[0].dropFirst(5)))), target: target, context: context)
+            startSubtitle(source: .file(URL(fileURLWithPath: String(parts[0].dropFirst(5)))), target: target, context: context, interactive: false)
         } else if parts[0].hasPrefix("sub:"), let idx = Int(parts[0].dropFirst(4)), let target {
             let title = context.embeddedTextTracks.first { $0.index == idx }?.title ?? "#\(idx)"
-            startSubtitle(source: .embedded(index: idx, title: title), target: target, context: context)
+            startSubtitle(source: .embedded(index: idx, title: title), target: target, context: context, interactive: false)
         } else {
-            startSpeech(locale: parts[0] == "auto" ? nil : Locale(identifier: parts[0]), target: target, context: context)
+            startSpeech(locale: parts[0] == "auto" ? nil : Locale(identifier: parts[0]), target: target, context: context, interactive: false)
         }
     }
 
@@ -276,7 +299,8 @@ final class CaptionsController: NSObject {
     }
 
     /// Capture values on enqueue; reading, detection and installation all use the sole execution slot.
-    private func startSubtitle(source: SubtitleSource, target: Locale.Language, context: MediaContext) {
+    private func startSubtitle(source: SubtitleSource, target: Locale.Language, context: MediaContext,
+                               interactive: Bool = true) {
         let initial = Self.configuration(for: context, sourceLocale: Locale(identifier: "und"), target: target)
         let request = CaptionTaskCenter.Task(mediaURL: context.mediaURL, languageLabel: Self.languageName(target)) { task in
             CaptionTaskCenter.shared.preparationChanged(task, message: L("captions.status.preparing"))
@@ -311,10 +335,11 @@ final class CaptionsController: NSObject {
                                                        window: task.presentationWindow)
             return .ready(config)
         }
-        submit(request, context: context)
+        submit(request, context: context, interactive: interactive)
     }
 
-    private func startSpeech(locale: Locale?, target: Locale.Language?, context: MediaContext) {
+    private func startSpeech(locale: Locale?, target: Locale.Language?, context: MediaContext,
+                             interactive: Bool = true) {
         let initial = Self.configuration(for: context, sourceLocale: locale ?? Locale(identifier: "und"), target: target)
         let label = locale.map { Self.languageLabel(sourceLocale: $0, target: target) } ?? L("captions.language.auto")
         let request = CaptionTaskCenter.Task(mediaURL: context.mediaURL, languageLabel: label) { task in
@@ -354,7 +379,7 @@ final class CaptionsController: NSObject {
             }
             return .ready(config, note: note)
         }
-        submit(request, context: context)
+        submit(request, context: context, interactive: interactive)
     }
 
     private static func configuration(for context: MediaContext, sourceLocale: Locale,
@@ -366,10 +391,64 @@ final class CaptionsController: NSObject {
         return c
     }
 
-    private func submit(_ request: CaptionTaskCenter.Task, context: MediaContext) {
-        let submitted = center.submit(request)
+    /// Interactive submission while another file is generating asks "stop previous or
+    /// wait for it" first. Automation hooks, and a predecessor that is saving or
+    /// stopping, queue silently (their turn comes within seconds).
+    private func submit(_ request: CaptionTaskCenter.Task, context: MediaContext, interactive: Bool) {
+        if interactive, center.task(forMedia: request.mediaURL) == nil,
+           let predecessor = center.stoppablePredecessor(forMedia: request.mediaURL) {
+            askJumpAhead(of: predecessor, request: request, context: context)
+            return
+        }
+        submitNow(request, ahead: false, context: context)
+    }
+
+    private func submitNow(_ request: CaptionTaskCenter.Task, ahead: Bool, context: MediaContext) {
+        let submitted = center.submit(request, ahead: ahead)
         attach(to: submitted, context: context)
-        if submitted !== request { center.presentStatusDialog(for: submitted, in: context.window) }
+        // Deduplicated and Stop Previous already chosen: the action applied to that request, no extra status dialog.
+        if submitted !== request, !ahead { center.presentStatusDialog(for: submitted, in: context.window) }
+    }
+
+    /// Two buttons: Stop Previous moves ahead and stops it; Wait for It queues normally.
+    /// The dialog follows the predecessor's progress; if it ends first the dialog is
+    /// dismissed and handled as Wait for It (this file starts naturally). Changing media
+    /// or closing the window meanwhile drops the request (the sheet went with the window).
+    private func askJumpAhead(of predecessor: CaptionTaskCenter.Task, request: CaptionTaskCenter.Task,
+                              context: MediaContext) {
+        let gen = sessionGeneration
+        let alert = NSAlert()
+        let wait = alert.addButton(withTitle: L("captions.button.waitForIt"))
+        let stop = alert.addButton(withTitle: L("captions.button.stopPrevious"))
+        stop.hasDestructiveAction = true
+        let window = context.window
+        let refresh: (CaptionTaskCenter.Task) -> Void = { [weak alert, weak self] current in
+            guard let alert, let self else { return }
+            if current.isFinished {
+                window.endSheet(alert.window, returnCode: .alertFirstButtonReturn)
+                return
+            }
+            let content = self.center.jumpAheadContent(predecessor: current, queued: false,
+                                                       othersAhead: !self.center.queue.isEmpty)
+            let previous = (alert.messageText, alert.informativeText, stop.isEnabled)
+            alert.messageText = content.title
+            alert.informativeText = content.message
+            wait.title = content.primaryTitle
+            stop.title = content.secondaryTitle ?? ""
+            stop.isEnabled = content.secondaryEnabled
+            if previous != (alert.messageText, alert.informativeText, stop.isEnabled) { alert.layout() }
+        }
+        refresh(predecessor)
+        let observer = NSObject()
+        center.addListener(CaptionTaskCenter.Listener(owner: observer, onEvents: { _ in }, onProgress: refresh,
+                                                      onFinished: { t, _ in refresh(t) }),
+                           to: predecessor, owner: observer)
+        alert.beginSheetModal(for: window) { [weak self, weak predecessor] resp in
+            guard let self else { return }
+            if let predecessor { self.center.removeListener(owner: observer, from: predecessor) }
+            guard gen == self.sessionGeneration else { return }
+            self.submitNow(request, ahead: resp == .alertSecondButtonReturn, context: context)
+        }
     }
 
     // MARK: - Task attachment
@@ -452,13 +531,23 @@ final class CaptionsController: NSObject {
             }
             return
         }
-        if !t.isFinished { showStatus(L("captions.status.queued", center.running?.mediaName ?? ""), in: context) }
+        if !t.isFinished {
+            showStatus(L("captions.status.queued", center.blockingTaskName), in: context,
+                       actionTitle: L("captions.button.dequeue"), onCancel: { [weak self, weak t] in
+                guard let self, let t else { return }
+                self.center.stop(t)
+            })
+        }
     }
 
     private func handleFinished(_ t: CaptionTaskCenter.Task, error: Error?, context: MediaContext) {
         guard task === t else { return }
         if error is CancellationError {
-            hideStatus()
+            if let successor = t.supersededByName {
+                showStatus(L("captions.status.supersededBy", successor), in: context, autoHide: 5)
+            } else {
+                hideStatus()
+            }
             if taskDisplayActive {
                 if displayActive, let core { core.endGeneratedSubtitleTrack() }
                 displayActive = false

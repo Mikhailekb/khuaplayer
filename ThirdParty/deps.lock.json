@@ -28,6 +28,10 @@
         {
           "path": "Scripts/patches/ffmpeg-annexb-seek-flush.patch",
           "sha256": "2d853359670dfdc51e8465ea1b90aba4f1d4537f88acc36485da9cf320c6d52b"
+        },
+        {
+          "path": "Scripts/patches/ffmpeg-dovi-transport.patch",
+          "sha256": "807aa6b3910bd39ec81d80c3d5e479e299924aaeda40ba2020901db936ad66d5"
         }
       ]
     },

@@ -19,6 +19,14 @@ struct SPTsRapObservation {
     bool untilEof = false;
 };
 
+// Optional shadow-reader association (e.g. Dolby BL/EL). It must preserve BL
+// PTS, include actual read-ahead in bytesRead and obey the remaining byte
+// budget. flush drops buffered packets at every seek. Null keeps raw FFmpeg.
+struct SPTsRapPacketReader {
+    std::function<int(AVPacket *, int64_t remainingBytes, int64_t& bytesRead)> read;
+    std::function<void()> flush;
+};
+
 struct SPTsRapScanResult {
     int64_t pos = -1;
     int64_t ptsUs = INT64_MIN;
@@ -64,6 +72,7 @@ inline int64_t spThumbTsRapCompletionBytes(int64_t maxBytes) {
 SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
                                       int64_t absUs, int64_t floorAbsUs,
                                       const SPTsRapLimits &lim, int64_t *gopUsInOut,
-                                      const std::function<bool()> *abort);
+                                      const std::function<bool()> *abort,
+                                      const SPTsRapPacketReader *packets = nullptr);
 
 } // namespace sp

@@ -46,6 +46,7 @@ struct SPFrameGeneratorMediaInfo {
     int videoWidth = 0;
     int videoHeight = 0;
     bool dynamicHDRUnsafe = false;
+    bool dynamicHDRRequiresMetadata = false;
     bool interlaced = false;
 };
 

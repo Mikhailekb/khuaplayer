@@ -7,8 +7,9 @@ from lib.runtime_source import runtime_files
 
 ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED = re.compile(
-    rb'SP_(?:DUST|RESILIENT)_PROBE|SP_MEMC_\w+|SP_INTERPOLATION\b|'
-    rb'SP_(?:VIDEO_DECODER_(?:SCAN|OUTPUT)|FFMPEG_DECODER_OUTPUT)_TESTING',
+    rb'SP_(?:DUST|RESILIENT)_PROBE|SP_MEMC_\w+|SP_(?:INTERPOLATION|WELCOMECLICK)\b|'
+    rb'SP_TEST_(?:ROTATE|MIRROR)\b|'
+    rb'SP_(?:VIDEO_DECODER_(?:SCAN|OUTPUT)|FFMPEG_DECODER_OUTPUT|DOVI_DECODER)_TESTING',
     re.I,
 )
 SOURCE_TOKEN = re.compile(r'R"([^ ()\\\t\r\n]{0,16})\(.*?\)\1"|""".*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*(?:\n[ \t]*//[^\n]*)*|/\*.*?\*/', re.S)

@@ -1,4 +1,5 @@
 #include "TsRapScan.hpp"
+#include <algorithm>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -51,7 +52,8 @@ void publishSegment(SPTsRapScanResult &res, const SegmentTracker &seg, bool from
 SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
                                       int64_t absUs, int64_t floorAbsUs,
                                       const SPTsRapLimits &lim, int64_t *gopUsInOut,
-                                      const std::function<bool()> *abort) {
+                                      const std::function<bool()> *abort,
+                                      const SPTsRapPacketReader *packets) {
     SPTsRapScanResult res;
     if (!ctx || videoStream < 0 || (unsigned)videoStream >= ctx->nb_streams) return res;
     AVStream *st = ctx->streams[videoStream];
@@ -64,6 +66,12 @@ SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
         AVPacket **p;
         ~PacketGuard() { av_packet_free(p); }
     } guard{&probe};
+    auto readPacket = [&](int64_t remaining) {
+        int64_t bytes = 0;
+        const int result = packets ? packets->read(probe, remaining, bytes) : av_read_frame(ctx, probe);
+        res.bytes += packets ? bytes : result >= 0 ? std::max(probe->size, 0) : 0;
+        return result;
+    };
 
     auto observePacket = [&](int64_t pts, int64_t dts, bool key, int64_t pos) {
         if (pts != INT64_MIN && dts != INT64_MIN && pts - dts > res.reorderMaxUs)
@@ -81,6 +89,7 @@ SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
     for (int attempt = 0;; ++attempt) {
         if (abort && (*abort)()) { res.aborted = true; return res; }
         if (loUs < floorAbsUs) loUs = floorAbsUs;
+        if (packets) packets->flush();
 
         const bool headWindow = loUs == floorAbsUs &&
                                 av_seek_frame(ctx, videoStream, 0, AVSEEK_FLAG_BYTE) >= 0;
@@ -107,7 +116,7 @@ SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
                 res.capped = true;
                 break;
             }
-            const int rd = av_read_frame(ctx, probe);
+            const int rd = readPacket(winLim.maxBytes - res.bytes);
             if (rd < 0) {
 
                 if (rd == AVERROR_EOF) { hitEof = true; break; }
@@ -119,7 +128,6 @@ SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
                 readError = true;
                 break;
             }
-            res.bytes += probe->size;
             if (probe->stream_index != videoStream) {
                 av_packet_unref(probe);
                 continue;
@@ -176,6 +184,7 @@ SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
     }
 
     if (bestPos < 0 && !res.aborted) {
+        if (packets) packets->flush();
 
         bool positioned = av_seek_frame(ctx, videoStream, 0, AVSEEK_FLAG_BYTE) >= 0;
         if (!positioned) {
@@ -196,7 +205,9 @@ SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
                     res.capped = true;
                     return res;
                 }
-                const int rd = av_read_frame(ctx, probe);
+                const int64_t before = res.bytes;
+                const int rd = readPacket(4LL * 1024 * 1024 - fbBytes);
+                fbBytes += res.bytes - before;
                 if (rd < 0) {
                     if (rd == AVERROR_EXIT) {
                         publishSegment(res, seg, /*fromHead=*/true, /*untilEof=*/false);
@@ -205,8 +216,6 @@ SPTsRapScanResult spTsRapScanBackward(AVFormatContext *ctx, int videoStream,
                     }
                     break;
                 }
-                fbBytes += probe->size;
-                res.bytes += probe->size;
                 if (probe->stream_index != videoStream) { av_packet_unref(probe); continue; }
                 ++fbPkts;
                 ++res.videoPkts;

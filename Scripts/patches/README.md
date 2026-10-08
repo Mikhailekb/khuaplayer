@@ -76,3 +76,26 @@ Preserve the raw/container timing metadata and complete packet checks as well.
 No upstream submission or merge is recorded. Remove either patch only when a
 new locked upstream version passes its default-off, fault, seek, and unchanged-
 input invariants without it, removing its lock entry in the same change.
+
+## FFmpeg Dolby Vision transport and metadata parsing
+
+`ffmpeg-dovi-transport.patch` targets the same locked FFmpeg n8.1.2 archive.
+It preserves enhancement-layer configuration from hvcE records in public
+dictionary side data and exposes MP4 vdep and MPEG-TS dependency associations.
+It also initializes omitted optional CM4 controls to neutral values and rejects
+missing mapping or static metadata references for strict parser consumers.
+No FFmpeg structure ABI is extended.
+
+The small `Scripts/lib/sp_dovi_rpu.{c,h}` adapter is compiled against that exact
+patched source and archived into `libavcodec.a`. Only its opaque parser handle
+and public metadata types cross the application boundary. The patch, adapter,
+and header are recipe inputs; the installed header is a required build output.
+
+Validate container association, per-frame metadata, malformed input, and parser
+flush/replay against the public-built archives. Validate the actual decoder,
+rendering, thumbnails, and Motion+ independently; parser tests alone do not
+establish visual correctness. Keep media fixtures outside this repository.
+
+No upstream submission or merge is recorded. Remove this patch only after a
+newly locked version supplies equivalent behavior and passes those checks
+without it. Update the adapter, lock, and recipe together when changing FFmpeg.

@@ -95,6 +95,8 @@ ENGLISH_FILES=(
   Scripts/build_dav1d.sh
   Scripts/build_speex.sh
   Scripts/lib/ffmpeg_capabilities.c
+  Scripts/lib/sp_dovi_rpu.c
+  Scripts/lib/sp_dovi_rpu.h
   Scripts/build_ffmpeg_min.sh
   Scripts/build_subtitle_libs.sh
   Scripts/build_sparkle.sh

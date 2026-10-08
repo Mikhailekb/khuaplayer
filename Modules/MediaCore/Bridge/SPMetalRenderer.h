@@ -54,6 +54,9 @@
 
 // Main-thread user-facing description of the current output path.
 - (NSString *)outputModeDescription;
+// On-demand, localized status of the last committed DV frame (nil for non-DV).
+// Session epochs suppress stale status after stop/reopen; no per-frame formatting.
+- (NSString *)doviProcessingDescription;
 
 // Set stream color metadata using the original FFmpeg AVColor enum values.
 - (void)setColorimetryWithPrimaries:(int)primaries
@@ -66,7 +69,8 @@
 // no layer mutation or PSO rebuild, completion may run inline; otherwise it runs
 // on main after pixelFormat/colorspace/outputMode and the PSO agree. Opening
 // code uses this as the publication barrier before any frame in that generation
-// is submitted.
+// is submitted. A pending DV open can complete from an earlier queued layer
+// transaction as soon as that transaction makes the latest configuration ready.
 - (void)synchronizeOutputModeWithCompletion:(void (^)(BOOL ready))completion;
 
 // Viewport dimensions in physical pixels.
@@ -90,18 +94,17 @@
 - (CGFloat)displayEDRHeadroom;
 // Sample aspect ratio; display ratio is pixel width times SAR divided by height.
 - (void)setSampleAspect:(float)sar;
+// Container orientation (display matrix) for the current item, applied before
+// the manual rotation/mirror below. Counterclockwise quarter turns, then an
+// optional horizontal mirror (SPVideoOrientation.hpp). Set in OpenIssued with
+// the other stream-level facts; not cleared by resetPictureTransform.
+- (void)setStreamOrientationTurns:(int)turnsCCW mirrored:(BOOL)mirrored;
 // Dolby Vision Profile 5 uses its dedicated IPTPQ color-conversion path
 // instead of the ordinary YCbCr matrix.
 - (void)setDoviIPT:(BOOL)on;
-// Queue per-frame RPU metadata by packet timestamp and bind by decoded frame
-// timestamp before rendering. Seek and session boundaries clear the ring;
-// missing timestamps apply the newest value immediately.
-- (void)queueDoviReshapeFloats:(const float *)data ptsUs:(int64_t)ptsUs;
-- (void)bindDoviReshapeForPtsUs:(int64_t)ptsUs frameIntervalUs:(int64_t)frameIntervalUs;
-- (void)clearDoviReshapeQueue;
-// Clear RPU history and restore defaults before a new session begins decoding.
-// Publishing the Dolby Vision mode later must not erase early frame metadata.
-- (void)resetDoviSessionState;
+// OpenIssued: prepare the DV fallback PSO only for the selected DV stream.
+- (void)setDoviMappingEnabled:(BOOL)enabled;
+// Frame-local DV uniforms / EL are immutable CVPixelBuffer attachments.
 
 // Subtitle texture and rectangle in viewport coordinates; nil removes the overlay.
 @property (nonatomic, strong) id<MTLTexture> subtitleTexture;

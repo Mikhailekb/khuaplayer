@@ -1,9 +1,11 @@
 #include "SPMetalRenderer.h"
 #include "ShaderSource.h"
 #include "SPDoviRPU.hpp"
+#import "SPDoviFrame.h"
 #include "SPVideoColorMetadata.hpp"
 #include "SPShaderUniforms.h"
 #include "SPPlanarPixelFormat.h"
+#include "SPVideoOrientation.hpp"
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -18,7 +20,7 @@
 #import <ImageIO/ImageIO.h>
 #endif
 
-static_assert(sp::kDoviGpuFloats == kSPDoviUniformFloatCount,
+static_assert(sp::dovi_gpu::FloatCount == kSPDoviUniformFloatCount,
               "Dolby RPU serialization and Video.metal uniform counts differ");
 
 // Pure output-mode policy.  A HDR attachment requires a retry only on an EDR
@@ -79,6 +81,16 @@ static_assert(!spEffectiveSdrBoost(true, true, 1));
 static_assert(!spEffectiveSdrBoost(false, false, 1));
 
 #include "SPRuntimeGates.hpp"
+
+#if !SP_APP_STORE
+// SP_FORCE_EDR headroom: 10x, or SP_EDR_HEADROOM when pinned for reproducible
+// EDR goldens. Screen changes must not undo the value the core poll pins.
+static CGFloat spForcedEDRHeadroom() {
+    static const double pinned = spAutomation() && getenv("SP_EDR_HEADROOM")
+                                     ? atof(getenv("SP_EDR_HEADROOM")) : 0.0;
+    return pinned > 0 ? pinned : 10.0;
+}
+#endif
 
 static CGColorSpaceRef spSDRLayerColorSpace(int tagKey) {
 #if !SP_APP_STORE
@@ -172,16 +184,27 @@ static void spWriteRenderDump(id<MTLTexture> dumpTex, NSString *dumpPath,
 }
 #endif
 
+// What the last committed frame of a DV session showed (media-info status).
+enum class SPDoviFrameMode : uint8_t {
+    Pending, BaseLayer, FixedIPT, Rpu, RpuWithEnhancement, MissingEnhancement
+};
+
 @implementation SPMetalRenderer {
 
     bool _dbgAttachmentsDumped;
-    bool _dbgDoviBindLogged;
     OSType _dbgLoggedPixFmts[2];
     int _dbgSplitDraws;
     CAMetalLayer *_layer;
     id<MTLDevice> _device;
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
+    id<MTLRenderPipelineState> _doviPipeline;  // DV-only fallback, prepared on selected-file open
+    BOOL _doviMappingEnabled;
+    NSMutableArray *_doviOutputWaiters; // OpenIssued only, protected by _cfgMtx
+    uint64_t _doviStatusEpoch; // all fields below protected by _cfgMtx
+    SPDoviFrameMode _doviFrameMode; // last committed DV frame's processing (media info)
+    sp::DoviDisplaySelection _doviSelection;
+    bool _doviHasLevel1;
     id<MTLLibrary> _shaderLib;
 
     id<MTLRenderPipelineState> _specPipeline;
@@ -244,8 +267,6 @@ static void spWriteRenderDump(id<MTLTexture> dumpTex, NSString *dumpPath,
 
     id<MTLTexture> _submitPendingSubTex;
     CGRect _submitPendingSubRect;
-    SPDoviUniforms _submitPendingDovi;
-    bool _submitPendingDoviValid;
 
     bool _submitPendingSpeculative;
 
@@ -270,15 +291,8 @@ static void spWriteRenderDump(id<MTLTexture> dumpTex, NSString *dumpPath,
     float _forcedAspect;
     float _cropAspect;   // Independent crop ratio (>0 enabled; 0 disabled).
     BOOL _doviIPT;
-    SPDoviUniforms _doviGpu;
-    std::mutex _doviMtx;
 
     id<MTLBuffer> _doviZeroBuf;
-
-    struct SPDoviQueueEntry { int64_t ptsUs; SPDoviUniforms u; };
-    SPDoviQueueEntry _doviQueue[32];
-    int _doviQueueHead;
-    int _doviQueueCount;
     id<MTLTexture> _subtitleTexture;
     CVPixelBufferRef _compareBuffer;
 
@@ -288,6 +302,7 @@ static void spWriteRenderDump(id<MTLTexture> dumpTex, NSString *dumpPath,
     BOOL _compareSplitEnabled;
     CGRect _subtitleRect;
     int _aspectMode, _rotation, _mirror;
+    sp::VideoOrientation _streamOrientation; // container display matrix; _rotation/_mirror act on top
     float _brightness, _contrast, _saturation, _gamma;
 
     float _fxStrength;
@@ -327,7 +342,7 @@ enum class SPSubmitOutcome {
 };
 
 struct SPCVTexGuard {
-    CVMetalTextureRef refs[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
+    CVMetalTextureRef refs[10] = {};
     bool armed = false;
     ~SPCVTexGuard() {
         if (!armed) return;
@@ -352,6 +367,20 @@ static inline SPAspectModel spAspectModel(float vidW, float vidH, float sar,
         aV = cropAspect;
     }
     return {aV, eff, cw, ch};
+}
+
+// Aspect overrides and crop ratios describe the upright picture the user sees
+// before any manual rotation. With a quarter-turn container orientation, solve
+// the model in upright space (axes swapped, SAR inverted) and map the result
+// back to coded texture space, where uniform 27 is the coded-axis ratio and
+// 28/29 are texture u/v keep fractions.
+static inline SPAspectModel spOrientedAspectModel(float vidW, float vidH, float sar,
+                                                  float forcedAspect, float cropAspect,
+                                                  sp::VideoOrientation stream) {
+    if (!stream.swapsAxes()) return spAspectModel(vidW, vidH, sar, forcedAspect, cropAspect);
+    const float s = sar > 0 ? sar : 1.0f;
+    SPAspectModel up = spAspectModel(vidH, vidW, 1.0f / s, forcedAspect, cropAspect);
+    return {up.dispAspect, up.eff > 0.0f ? 1.0f / up.eff : 0.0f, up.ch, up.cw};
 }
 
 static id<MTLDevice> spSharedMetalDevice(void) {
@@ -432,8 +461,8 @@ static void spStorePipeline(uint64_t key, id<MTLRenderPipelineState> pipe) {
     [lock unlock];
 }
 
-static inline uint64_t spGenericPipeKey(MTLPixelFormat fmt) {
-    return 0x1000000000ULL | (uint64_t)fmt;
+static inline uint64_t spGenericPipeKey(MTLPixelFormat fmt, bool dovi) {
+    return 0x1000000000ULL | (uint64_t(dovi) << 32) | (uint64_t)fmt;
 }
 static inline uint64_t spSpecPipeKey(uint32_t contentKey) {
     return 0x2000000000ULL | (uint64_t)contentKey;
@@ -493,7 +522,7 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
         CGFloat potEDR = scr ? scr.maximumPotentialExtendedDynamicRangeColorComponentValue : 1.0;
 #if !SP_APP_STORE
         const char *forceEDR = getenv("SP_FORCE_EDR");
-        if (forceEDR) { maxEDR = 10.0; potEDR = 10.0; }
+        if (forceEDR) { maxEDR = spForcedEDRHeadroom(); potEDR = 10.0; }
         if (getenv("SP_NO_EDR")) potEDR = 1.0;
 #endif
         _displayEdrCapable = (potEDR > 1.01);
@@ -536,10 +565,6 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
         _sampleAspect = 1.0f;
         _forcedAspect = 0.0f;
         _cropAspect = 0.0f;
-        {
-            sp::DoviReshape def;
-            sp::doviToGpuFloats(def, _doviGpu.values);
-        }
         _aspectMode = 0; _rotation = 0; _mirror = 0;
         _brightness = 0; _contrast = 1; _saturation = 1; _gamma = 1;
         _specPipelineKey = UINT32_MAX;
@@ -586,7 +611,7 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
 
 - (void)updateOutputModeWithMaxEDR:(CGFloat)currentEDR potentialEDR:(CGFloat)potentialEDR {
 #if !SP_APP_STORE
-    if (getenv("SP_FORCE_EDR")) { currentEDR = 10.0; potentialEDR = 10.0; }
+    if (getenv("SP_FORCE_EDR")) { currentEDR = spForcedEDRHeadroom(); potentialEDR = 10.0; }
     if (getenv("SP_NO_EDR")) { potentialEDR = 1.0; }
 #endif
     // Capability is based on potentialEDR, not the currently available headroom.
@@ -603,7 +628,13 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
 
 - (void)applyOutputMode {
 
-    dispatch_async(dispatch_get_main_queue(), ^{ [self applyOutputModeOnMain]; });
+    const int64_t queued = spDebug() && _logNextPresent.load(std::memory_order_relaxed) ? spNowUs() : 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        const int64_t entered = queued ? spNowUs() : 0;
+        [self applyOutputModeOnMain];
+        if (queued) SPLOG(@"[RendererTiming] mode queue_ms=%.3f apply_ms=%.3f",
+                         (entered - queued) / 1000.0, (spNowUs() - entered) / 1000.0);
+    });
 }
 
 // Opening-session publication barrier.  Stream color/SAR/DoVi setters publish
@@ -616,7 +647,10 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
 // it does not query NSScreen or mutate the layer.  Mode changes and missing
 // pipelines still require the main-thread layer/rebuild path below.
 - (void)synchronizeOutputModeWithCompletion:(void (^)(BOOL ready))completion {
+    const int64_t started = spDebug() ? spNowUs() : 0;
     BOOL readyInline = NO;
+    __block BOOL delivered = NO; // deferred completion is consumed only on main
+    void (^deferred)(BOOL) = nil;
     {
         std::lock_guard<std::mutex> cfgLock(_cfgMtx);
         const int desiredMode =
@@ -625,32 +659,75 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
         readyInline = !spOutputConfigNeedsTransition(_displayEdrCapable, _hasHdr, _outputMode,
                                                      _sdrBoostRequested, _sourceGamut, _transfer,
                                                      _layerTagKey) &&
-                      _pipeline != nil && _textureCache != NULL;
+                      _pipeline != nil && (!_doviMappingEnabled || _doviPipeline != nil) &&
+                      _textureCache != NULL;
         if (readyInline && desiredMode == 1) {
             [self spSetDisplayEDRHeadroomLocked:_displayCurrentEDR];
+        }
+        if (!readyInline && _doviMappingEnabled && completion) {
+            // A setter's already-queued layer transaction can make us ready
+            // before this barrier's own main block. Publish from that first
+            // matching transaction, avoiding unrelated AppKit work in between.
+            // Allocate waiters only for an actual DV open, never Bootstrap.
+            deferred = [^(BOOL ready) {
+                if (delivered) return;
+                delivered = YES;
+                if (started) SPLOG(@"[RendererTiming] barrier dovi_early=1 total_ms=%.3f ready=%d",
+                                  (spNowUs() - started) / 1000.0, (int)ready);
+                completion(ready);
+            } copy];
+            if (!_doviOutputWaiters) _doviOutputWaiters = [NSMutableArray new];
+            [_doviOutputWaiters addObject:deferred];
         }
     }
     // Never invoke client code while holding the renderer configuration lock.
     if (readyInline) {
+        if (started) SPLOG(@"[RendererTiming] barrier inline=1 total_ms=%.3f", (spNowUs() - started) / 1000.0);
         if (completion) completion(YES);
         return;
     }
-    // Slow path must be FIFO-after the setters' queued apply blocks.  Calling
+    // Fallback block is FIFO-after the setters' queued apply blocks. Calling
     // the OnMain body once more is intentionally idempotent and makes this
     // completion independent of whether either preceding apply already ran.
+    // DV's waiter may have already delivered from one of those transactions.
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (deferred && delivered) return;
+        const int64_t entered = started ? spNowUs() : 0;
         [self applyOutputModeOnMain];
         BOOL ready = NO;
         {
             std::lock_guard<std::mutex> cfgLock(self->_cfgMtx);
-            ready = self->_pipeline != nil && self->_textureCache != NULL;
+            ready = self->_pipeline != nil && (!self->_doviMappingEnabled || self->_doviPipeline != nil) &&
+                    self->_textureCache != NULL;
+            if (deferred) [self->_doviOutputWaiters removeObjectIdenticalTo:deferred];
         }
-        if (completion) completion(ready);
+        if (started) SPLOG(@"[RendererTiming] barrier inline=0 queue_ms=%.3f apply_ms=%.3f ready=%d",
+                          (entered - started) / 1000.0, (spNowUs() - entered) / 1000.0, (int)ready);
+        if (deferred) deferred(ready);
+        else if (completion) completion(ready);
     });
 }
 
 - (void)applyOutputModeOnMain {
-    std::lock_guard<std::mutex> cfgLock(_cfgMtx);
+    NSArray *readyWaiters = nil;
+    {
+        const int64_t beforeLock = spDebug() && _logNextPresent.load(std::memory_order_relaxed) ? spNowUs() : 0;
+        std::lock_guard<std::mutex> cfgLock(_cfgMtx);
+        if (beforeLock) SPLOG(@"[RendererTiming] mode_lock wait_ms=%.3f dovi=%d",
+                             (spNowUs() - beforeLock) / 1000.0, (int)_doviMappingEnabled);
+        [self applyOutputModeLocked];
+        if (_doviOutputWaiters.count && _pipeline && (!_doviMappingEnabled || _doviPipeline) && _textureCache) {
+            readyWaiters = [_doviOutputWaiters copy];
+            [_doviOutputWaiters removeAllObjects];
+        }
+    }
+    // Client code may re-enter the renderer; never call it under _cfgMtx.
+    // Core binds each callback to its open generation before publishing ready.
+    for (void (^waiter)(BOOL) in readyWaiters) waiter(YES);
+}
+
+// Requires _cfgMtx and main. Layer publication and its PSOs are one transaction.
+- (void)applyOutputModeLocked {
     int mode = spDesiredRendererOutputMode(_displayEdrCapable, _hasHdr, _sdrBoostRequested);
     CGFloat currentEDR = _displayCurrentEDR;
     if (mode == _outputMode) {
@@ -668,7 +745,7 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
         // A previous pixel-format rebuild may have failed after invalidating
         // the old PSO.  Configuration synchronization is also the bounded
         // retry point; never report ready while the generic fallback is nil.
-        if (!_pipeline) [self buildPipeline];
+        if (!_pipeline || (_doviMappingEnabled && !_doviPipeline)) [self buildPipeline];
         return;
     }
     _outputMode = mode;
@@ -707,6 +784,7 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
     // "ready".  Reusing a BGRA8 PSO after the layer moved to RGBA16F (or the
     // reverse) is a format mismatch, not a usable fallback.
     _pipeline = nil;
+    _doviPipeline = nil;
     [self buildPipeline];
 }
 
@@ -776,7 +854,6 @@ static bool spRenderInlineMode(void) {
     }
     _submitPendingClear = false;
     _submitPendingSubTex = nil;
-    _submitPendingDoviValid = false;
     _submitPendingSpeculative = false;
     _submitAcceptedInEpoch = 0;
     _submitParked = false;
@@ -970,39 +1047,55 @@ static bool spRenderInlineMode(void) {
     }
 }
 
-- (void)buildPipeline {
+- (id<MTLRenderPipelineState>)buildGenericPipelineDovi:(BOOL)dovi {
+    const int64_t started = spDebug() ? spNowUs() : 0;
     NSError *error = nil;
 
     id<MTLLibrary> lib = spSharedShaderLibrary(_spLogId);
-    if (!lib) return;
+    if (!lib) return nil;
     _shaderLib = lib;
 
     const MTLPixelFormat fmt = _layer.pixelFormat;
-    if (id<MTLRenderPipelineState> cached = spCachedPipeline(spGenericPipeKey(fmt))) {
-        _pipeline = cached;
-        return;
+    if (id<MTLRenderPipelineState> cached = spCachedPipeline(spGenericPipeKey(fmt, dovi))) {
+        if (started) SPLOG(@"[RendererTiming] generic dovi=%d format=%lu cached=1 total_ms=%.3f main=%d",
+                          (int)dovi, (unsigned long)fmt, (spNowUs() - started) / 1000.0, (int)NSThread.isMainThread);
+        return cached;
     }
-
+    // Keep color/range/layout dynamic but eliminate the opposite DV branch.
+    // No DV PSO is compiled during ordinary-video Bootstrap or GPU prewarm.
     MTLFunctionConstantValues *emptyCv = [[MTLFunctionConstantValues alloc] init];
+    int dv = dovi ? 1 : 0;
+    [emptyCv setConstantValue:&dv type:MTLDataTypeInt atIndex:5];
+    const int64_t functionStarted = started ? spNowUs() : 0;
     id<MTLFunction> vs = [lib newFunctionWithName:@"videoVertex" constantValues:emptyCv error:&error];
     id<MTLFunction> fs = [lib newFunctionWithName:@"videoFragment" constantValues:emptyCv error:&error];
     // Do not call newArgumentEncoderWithBufferIndex here: buffer(0) is not an
     // argument buffer, and the invalid query aborts through a Metal assertion.
     if (!vs || !fs) {
         SPLOG(@"[Renderer] 着色器入口缺失");
-        return;
+        return nil;
     }
     MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
     desc.vertexFunction = vs;
     desc.fragmentFunction = fs;
     desc.colorAttachments[0].pixelFormat = fmt;
     error = nil;
-    _pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:&error];
-    if (!_pipeline) {
+    const int64_t pipelineStarted = started ? spNowUs() : 0;
+    id<MTLRenderPipelineState> pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (started) SPLOG(@"[RendererTiming] generic dovi=%d format=%lu cached=0 function_ms=%.3f pso_ms=%.3f total_ms=%.3f main=%d",
+                      (int)dovi, (unsigned long)fmt, (pipelineStarted - functionStarted) / 1000.0,
+                      (spNowUs() - pipelineStarted) / 1000.0, (spNowUs() - started) / 1000.0, (int)NSThread.isMainThread);
+    if (!pipeline) {
         SPLOG(@"[Renderer] 管线创建失败: %@", error);
     } else {
-        spStorePipeline(spGenericPipeKey(fmt), _pipeline);
+        spStorePipeline(spGenericPipeKey(fmt, dovi), pipeline);
     }
+    return pipeline;
+}
+
+- (void)buildPipeline {
+    if (!_pipeline) _pipeline = [self buildGenericPipelineDovi:NO];
+    if (_doviMappingEnabled && !_doviPipeline) _doviPipeline = [self buildGenericPipelineDovi:YES];
 }
 
 #pragma mark - Parameters
@@ -1140,60 +1233,9 @@ static bool spRenderInlineMode(void) {
     _sampleAspect = (sar > 0.01f && sar < 100.0f) ? sar : 1.0f;
 }
 
-- (void)queueDoviReshapeFloats:(const float *)data ptsUs:(int64_t)ptsUs {
-    if (!data) return;
-    std::lock_guard<std::mutex> lock(_doviMtx);
-    if (ptsUs < 0) {
-        memcpy(_doviGpu.values, data, sizeof(_doviGpu.values));
-        return;
-    }
-    SPDoviQueueEntry &e = _doviQueue[_doviQueueHead];
-    e.ptsUs = ptsUs;
-    memcpy(e.u.values, data, sizeof(e.u.values));
-    _doviQueueHead = (_doviQueueHead + 1) % 32;
-    if (_doviQueueCount < 32) _doviQueueCount++;
-}
-
-- (void)bindDoviReshapeForPtsUs:(int64_t)ptsUs frameIntervalUs:(int64_t)frameIntervalUs {
-    std::lock_guard<std::mutex> lock(_doviMtx);
-    if (_doviQueueCount == 0) return;
-    const int64_t limit = ptsUs + MAX((int64_t)0, frameIntervalUs / 4);
-    int best = -1;
-    int64_t bestPts = INT64_MIN;
-    for (int i = 0; i < _doviQueueCount; i++) {
-        int idx = (_doviQueueHead - 1 - i + 64) % 32;
-        const SPDoviQueueEntry &e = _doviQueue[idx];
-        if (e.ptsUs <= limit && e.ptsUs > bestPts) { best = idx; bestPts = e.ptsUs; }
-    }
-    if (best >= 0) {
-        if (spDebug()) {
-            if (!_dbgDoviBindLogged) {
-                _dbgDoviBindLogged = true;
-                SPLOG(@"[DoVi] 逐帧绑定命中 帧=%.3fs RPU=%.3fs (Δ=%.1fms)",
-                      ptsUs / 1e6, bestPts / 1e6, (ptsUs - bestPts) / 1000.0);
-            }
-        }
-        memcpy(_doviGpu.values, _doviQueue[best].u.values, sizeof(_doviGpu.values));
-
-        for (int i = 0; i < _doviQueueCount; i++) {
-            int idx = (_doviQueueHead - 1 - i + 64) % 32;
-            if (_doviQueue[idx].ptsUs < bestPts) _doviQueue[idx].ptsUs = INT64_MAX;
-        }
-    }
-}
-
-- (void)clearDoviReshapeQueue {
-    std::lock_guard<std::mutex> lock(_doviMtx);
-    _doviQueueHead = 0;
-    _doviQueueCount = 0;
-}
-
-- (void)resetDoviSessionState {
-    std::lock_guard<std::mutex> lock(_doviMtx);
-    sp::DoviReshape def;
-    sp::doviToGpuFloats(def, _doviGpu.values);
-    _doviQueueHead = 0;
-    _doviQueueCount = 0;
+- (void)setStreamOrientationTurns:(int)turnsCCW mirrored:(BOOL)mirrored {
+    std::lock_guard<std::mutex> lock(_cfgMtx);
+    _streamOrientation = sp::VideoOrientation{(uint8_t)(((turnsCCW % 4) + 4) % 4), mirrored != NO};
 }
 
 - (void)setDoviIPT:(BOOL)on {
@@ -1202,6 +1244,7 @@ static bool spRenderInlineMode(void) {
         std::lock_guard<std::mutex> lock(_cfgMtx);
         _doviIPT = on;
         if (on) {
+            _doviMappingEnabled = YES;
 
             _hasHdr = 1;
             _transfer = 1;
@@ -1209,8 +1252,38 @@ static bool spRenderInlineMode(void) {
             _sourceGamut = sp::kSPGamutBT2020;
         }
     }
-
     [self applyOutputMode];
+}
+
+- (void)setDoviMappingEnabled:(BOOL)enabled {
+    std::lock_guard<std::mutex> lock(_cfgMtx);
+    _doviMappingEnabled = enabled;
+    _doviFrameMode = SPDoviFrameMode::Pending;
+}
+
+- (NSString *)doviProcessingDescription {
+    std::lock_guard<std::mutex> lock(_cfgMtx);
+    if (!_doviMappingEnabled) return nil;
+    if (_doviFrameMode == SPDoviFrameMode::Pending ||
+        _doviStatusEpoch != _submitSessionEpoch.load(std::memory_order_relaxed))
+        return NSLocalizedString(@"dovi.status.pending", nil);
+    switch (_doviFrameMode) {
+        case SPDoviFrameMode::BaseLayer: return NSLocalizedString(@"dovi.status.base", nil);
+        case SPDoviFrameMode::FixedIPT: return NSLocalizedString(@"dovi.status.fixed", nil);
+        case SPDoviFrameMode::MissingEnhancement: return NSLocalizedString(@"dovi.status.missingEL", nil);
+        default: break;
+    }
+    NSString *mapping = _doviFrameMode == SPDoviFrameMode::RpuWithEnhancement ? @"BL + EL + RPU" : @"BL + RPU";
+    NSString *display = _doviHasLevel1 ? @"L1" : nil;
+    switch (_doviSelection) {
+        case sp::DoviDisplaySelection::L1: break;
+        case sp::DoviDisplaySelection::L2: display = @"L1 + L2"; break;
+        case sp::DoviDisplaySelection::CM4L3: display = @"CM4 (L1 + L3)"; break;
+        case sp::DoviDisplaySelection::CM4L8: display = NSLocalizedString(@"dovi.status.cm4Basic", nil); break;
+        case sp::DoviDisplaySelection::InvalidCM4: display = NSLocalizedString(@"dovi.status.invalidCM4", nil); break;
+        case sp::DoviDisplaySelection::UnavailableTarget: display = NSLocalizedString(@"dovi.status.unavailableTarget", nil); break;
+    }
+    return display ? [NSString stringWithFormat:@"%@ · %@", mapping, display] : mapping;
 }
 
 - (void)setViewportPixelSize:(CGSize)size {
@@ -1430,13 +1503,18 @@ static bool spRenderInlineMode(void) {
 
 #pragma mark - Content-specific pipelines
 
-- (uint32_t)currentSpecKey {
+- (uint32_t)specKeyHdr:(bool)hdr dovi:(bool)dovi gamut:(int)gamut sdrInHdrLayer:(bool)sdrInHdrLayer {
     return (uint32_t)((_primaries & 0xF) | ((_transfer & 0xF) << 4) |
                       ((_bits == 10 ? 1 : 0) << 8) | ((_range & 1) << 9) |
-                      ((_hasHdr & 1) << 10) | ((_doviIPT ? 1 : 0) << 11) |
-                      ((_outputMode & 1) << 12) | ((_sourceGamut & 7) << 16) |
+                      ((hdr ? 1 : 0) << 10) | ((dovi ? 1 : 0) << 11) |
+                      ((_outputMode & 1) << 12) | ((sdrInHdrLayer ? 1 : 0) << 13) |
                       ((_planar & 1) << 14) |
-                      ((spEffectiveSdrBoost(_sdrBoostRequested, _hasHdr, _outputMode) ? 1u : 0u) << 15));
+                      ((spEffectiveSdrBoost(_sdrBoostRequested, _hasHdr, _outputMode) ? 1u : 0u) << 15) |
+                      ((gamut & 7) << 16));
+}
+
+- (uint32_t)currentSpecKey {
+    return [self specKeyHdr:_hasHdr dovi:_doviIPT gamut:_sourceGamut sdrInHdrLayer:false];
 }
 
 - (void)publishSpecPipelineLocked:(id<MTLRenderPipelineState>)pipe key:(uint32_t)key {
@@ -1456,6 +1534,7 @@ static bool spRenderInlineMode(void) {
     int range = (key >> 9) & 1, hdr = (key >> 10) & 1;
     int dovi = (key >> 11) & 1, outMode = (key >> 12) & 1;
     int gamut = (key >> 16) & 7, planar = (key >> 14) & 1;
+    int sdrInHdrLayer = (key >> 13) & 1;
     int sdrBoost = (key >> 15) & 1;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 
@@ -1468,8 +1547,8 @@ static bool spRenderInlineMode(void) {
         }
         const int64_t t0 = spNowUs(); // µs
         MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
-        int v[10] = {prim, trc, bits, range, hdr, dovi, outMode, gamut, planar, sdrBoost};
-        for (int i = 0; i < 10; i++) {
+        int v[11] = {prim, trc, bits, range, hdr, dovi, outMode, gamut, planar, sdrBoost, sdrInHdrLayer};
+        for (int i = 0; i < 11; i++) {
             [cv setConstantValue:&v[i] type:MTLDataTypeInt atIndex:(NSUInteger)i];
         }
         NSError *err = nil;
@@ -1531,15 +1610,8 @@ static bool spRenderInlineMode(void) {
         _submitAcceptedInEpoch++;
         _submitRetryCount = 0;
         _submitParked = false;
-
         _submitPendingSubTex = _subtitleTexture;
         _submitPendingSubRect = _subtitleRect;
-        _submitPendingDoviValid = false;
-        if (_doviIPT) {
-            std::lock_guard<std::mutex> dk(_doviMtx);
-            _submitPendingDovi = _doviGpu;
-            _submitPendingDoviValid = true;
-        }
         if (_submitsSuspended.load(std::memory_order_relaxed)) {
 
             wakeNow = false;
@@ -1566,8 +1638,6 @@ static bool spRenderInlineMode(void) {
         bool clear = false;
         id<MTLTexture> subTex = nil;
         CGRect subRect = CGRectZero;
-        SPDoviUniforms dovi;
-        bool doviValid = false;
         bool speculative = false;
         uint64_t taskEpoch = 0;
         {
@@ -1591,8 +1661,6 @@ static bool spRenderInlineMode(void) {
             subRect = _submitPendingSubRect;
             taskEpoch = _submitPendingEpoch;
             speculative = _submitPendingSpeculative;
-            doviValid = _submitPendingDoviValid;
-            if (doviValid) dovi = _submitPendingDovi;
             if (!buf && !clear) {
                 _submitDrainScheduled = false;
                 return;
@@ -1605,7 +1673,6 @@ static bool spRenderInlineMode(void) {
             outcome = [self renderPixelBufferOutcome:buf
                                         pairedSubTex:subTex
                                        pairedSubRect:subRect
-                                          pairedDovi:(doviValid ? &dovi : NULL)
                                            taskEpoch:taskEpoch
                                          speculative:speculative];
         }
@@ -1626,8 +1693,6 @@ static bool spRenderInlineMode(void) {
                 _submitPendingSubRect = subRect;
                 _submitPendingEpoch = taskEpoch;
                 _submitPendingSpeculative = speculative;
-                _submitPendingDovi = dovi;
-                _submitPendingDoviValid = doviValid;
                 if (waitsForOutputMode) {
 
                     return;
@@ -1681,17 +1746,17 @@ static bool spRenderInlineMode(void) {
     return [self renderPixelBufferOutcome:buffer
                              pairedSubTex:liveSubTex
                             pairedSubRect:liveSubRect
-                               pairedDovi:NULL
                                 taskEpoch:_submitSessionEpoch.load(
                                               std::memory_order_relaxed)
                               speculative:speculative] ==
            SPSubmitOutcome::Committed;
 }
 
+// Encode the retained frame and its immutable DV attachments. Failure reasons
+// distinguish stale epochs, output transitions, transient failures and commits.
 - (SPSubmitOutcome)renderPixelBufferOutcome:(CVPixelBufferRef)buffer
                                pairedSubTex:(id<MTLTexture>)subTex
                               pairedSubRect:(CGRect)subRect
-                                 pairedDovi:(const SPDoviUniforms *)pairedDovi
                                   taskEpoch:(uint64_t)taskEpoch
                                 speculative:(BOOL)speculative {
 
@@ -1712,7 +1777,33 @@ static bool spRenderInlineMode(void) {
         return SPSubmitOutcome::StaleEpoch;
     }
 
-    if (!_doviIPT) {
+    // Stream configuration owns DV eligibility; a recycled attachment must not
+    // promote an ordinary session or add attachment lookups to its frame path.
+    const SPDoviUniforms *frameDovi = _doviMappingEnabled ? spDoviFrameUniforms(buffer) : nullptr;
+    if (frameDovi && frameDovi->values[sp::dovi_gpu::Valid] < 0.5f) frameDovi = nullptr;
+    const bool reconstructedDovi = frameDovi && spDoviFrameIsReconstructed(buffer);
+    CVPixelBufferRef enhancement = frameDovi ? spDoviEnhancementFrame(buffer) : nullptr;
+    const bool needsEnhancement = frameDovi && !reconstructedDovi &&
+                                  frameDovi->values[sp::dovi_gpu::NeedsEnhancement] > .5f;
+    bool missingEnhancement = needsEnhancement && !spDoviEnhancementBits(enhancement);
+    if (missingEnhancement) frameDovi = nullptr;
+    if ((frameDovi || _doviIPT) && !_doviPipeline) {
+        [self scheduleFrameOutputModeTransitionLocked];
+        return SPSubmitOutcome::OutputModeSwitch;
+    }
+    // Metadata can promote a P8.2 SDR-compatible stream to PQ presentation.
+    // Do not replace the declared base-layer colorimetry: damaged frames still
+    // need those original tags for their compatible fallback.
+    if (frameDovi) {
+        _hasHdr = 1;
+        if (spOutputConfigNeedsTransition(_displayEdrCapable, _hasHdr, _outputMode,
+                _sdrBoostRequested, _sourceGamut, _transfer, _layerTagKey)) {
+            [self scheduleFrameOutputModeTransitionLocked];
+            return SPSubmitOutcome::OutputModeSwitch;
+        }
+    }
+
+    if (!_doviIPT && !frameDovi) {
         if ([self updateColorimetryFromFrame:buffer]) {
 
             return SPSubmitOutcome::OutputModeSwitch;
@@ -1779,10 +1870,23 @@ static bool spRenderInlineMode(void) {
         return SPSubmitOutcome::Transient;
     }
 
+    id<MTLTexture> elYTex = nil, elUVTex = nil;
+    if (frameDovi && needsEnhancement) {
+        // A resource failure must not turn full FEL metadata into BL-only DV.
+        if (spDoviCreateEnhancementTextures(_textureCache, enhancement, &texGuard.refs[6])) {
+            elYTex = CVMetalTextureGetTexture(texGuard.refs[6]);
+            elUVTex = CVMetalTextureGetTexture(texGuard.refs[7]);
+        }
+        if (!elYTex || !elUVTex) { frameDovi = nullptr; missingEnhancement = true; }
+    }
+
     CVMetalTextureRef cmpYRef = NULL, cmpUVRef = NULL, cmpVRef = NULL;
     id<MTLTexture> cmpYTex = nil, cmpUVTex = nil, cmpVTex = nil;
+    id<MTLTexture> cmpElYTex = nil, cmpElUVTex = nil;
+    CVPixelBufferRef cmpEnhancement = nullptr;
+    SPDoviUniforms compareDoviSnapshot;
     CVPixelBufferRef cmpSrc = _compareBuffer;
-    if (cmpSrc && _compareSplitEnabled) {
+    if (cmpSrc && _compareSplitEnabled && !frameDovi) {
         const OSType cmpFmt = CVPixelBufferGetPixelFormatType(cmpSrc);
         if (cmpFmt != fmt && spPixelFormatIsPlanar3(cmpFmt) &&
             spPixelFormatBiPlanarEquivalent(cmpFmt) == fmt) {
@@ -1794,22 +1898,27 @@ static bool spRenderInlineMode(void) {
             cmpSrc = _compareConverted;
         }
     }
+    const OSType compareFormat = cmpSrc ? CVPixelBufferGetPixelFormatType(cmpSrc) : fmt;
+    const bool comparePlanar = cmpSrc && spPixelFormatIsPlanar3(compareFormat) && CVPixelBufferGetPlaneCount(cmpSrc)==3;
+    const bool compare10 = spPixelFormatIsTenBit(compareFormat);
     if (cmpSrc && _compareSplitEnabled &&
-        CVPixelBufferGetPixelFormatType(cmpSrc) == fmt &&
+        (compareFormat == fmt || (frameDovi && spDoviFrameUniforms(_compareBuffer))) &&
         CVPixelBufferGetWidthOfPlane(cmpSrc, 0) == w0 &&
         CVPixelBufferGetHeightOfPlane(cmpSrc, 0) == h0) {
+        const MTLPixelFormat cmpYFmt=compare10 ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm;
+        const MTLPixelFormat cmpCFmt=comparePlanar ? cmpYFmt : compare10 ? MTLPixelFormatRG16Unorm : MTLPixelFormatRG8Unorm;
         CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _textureCache,
-                                                  cmpSrc, NULL, yFmt, w0, h0, 0, &cmpYRef);
+                                                  cmpSrc, NULL, cmpYFmt, w0, h0, 0, &cmpYRef);
         CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _textureCache,
-                                                  cmpSrc, NULL, uvFmt, w1, h1, 1, &cmpUVRef);
-        if (planar) {
+                                                  cmpSrc, NULL, cmpCFmt, w1, h1, 1, &cmpUVRef);
+        if (comparePlanar) {
             CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, _textureCache,
-                                                      cmpSrc, NULL, uvFmt, w1, h1, 2, &cmpVRef);
+                                                      cmpSrc, NULL, cmpCFmt, w1, h1, 2, &cmpVRef);
         }
         cmpYTex = cmpYRef ? CVMetalTextureGetTexture(cmpYRef) : nil;
         cmpUVTex = cmpUVRef ? CVMetalTextureGetTexture(cmpUVRef) : nil;
         cmpVTex = cmpVRef ? CVMetalTextureGetTexture(cmpVRef) : nil;
-        if (!cmpYTex || !cmpUVTex || (planar && !cmpVTex)) {
+        if (!cmpYTex || !cmpUVTex || (comparePlanar && !cmpVTex)) {
             if (cmpYRef) { CFRelease(cmpYRef); cmpYRef = NULL; }
             if (cmpUVRef) { CFRelease(cmpUVRef); cmpUVRef = NULL; }
             if (cmpVRef) { CFRelease(cmpVRef); cmpVRef = NULL; }
@@ -1821,6 +1930,23 @@ static bool spRenderInlineMode(void) {
     texGuard.refs[2] = cmpYRef;
     texGuard.refs[3] = cmpUVRef;
     texGuard.refs[5] = cmpVRef;
+    if (cmpYTex && frameDovi) {
+        const auto *cmpDovi = spDoviFrameUniforms(_compareBuffer);
+        // FRC pairs require identical descriptions. Reject stale comparison
+        // frames rather than display their pixels through another frame's RPU.
+        const bool cmpReconstructed = spDoviFrameIsReconstructed(_compareBuffer);
+        if (!cmpDovi || memcmp(cmpDovi,frameDovi,sizeof(*frameDovi))) cmpYTex = nil;
+        else if (cmpDovi->values[sp::dovi_gpu::NeedsEnhancement] > .5f && !cmpReconstructed) {
+            cmpEnhancement = spDoviEnhancementFrame(_compareBuffer);
+            if (spDoviCreateEnhancementTextures(_textureCache, cmpEnhancement, &texGuard.refs[8])) {
+                cmpElYTex = CVMetalTextureGetTexture(texGuard.refs[8]);
+                cmpElUVTex = CVMetalTextureGetTexture(texGuard.refs[9]);
+            }
+            if (!cmpElYTex || !cmpElUVTex) cmpYTex = nil;
+        }
+        if (cmpYTex)
+            spDoviPrepareDrawSnapshot(compareDoviSnapshot, *cmpDovi, cmpSrc, cmpEnhancement, cmpReconstructed);
+    }
 
     const uint64_t cfgGenAtDrawable = _cfgGeneration.load(std::memory_order_relaxed);
     cfgLock.unlock();
@@ -1861,33 +1987,41 @@ static bool spRenderInlineMode(void) {
     uniforms.uvals[5] = _transfer;
     uniforms.uvals[6] = _range;
     uniforms.uvals[7] = _bits;
-    uniforms.uvals[8] = _hasHdr;
+    uniforms.uvals[8] = frameDovi || _doviIPT || _transfer == 1 || _transfer == 2;
     uniforms.uvals[9] = _peakNits;
     uniforms.uvals[10] = _sampleAspect;
 
     {
-        SPAspectModel am27 = spAspectModel(uniforms.uvals[0], uniforms.uvals[1],
-                                           _sampleAspect, _forcedAspect, _cropAspect);
+        SPAspectModel am27 = spOrientedAspectModel(uniforms.uvals[0], uniforms.uvals[1],
+                                                   _sampleAspect, _forcedAspect, _cropAspect,
+                                                   _streamOrientation);
         uniforms.uvals[27] = am27.eff;
         uniforms.uvals[28] = am27.cw;
         uniforms.uvals[29] = am27.ch;
     }
-    uniforms.uvals[11] = _doviIPT ? 1 : 0;
+    uniforms.uvals[11] = (frameDovi || _doviIPT) ? 1 : 0;
     uniforms.uvals[12] = (float)subRect.origin.x;
     uniforms.uvals[13] = (float)subRect.origin.y;
     uniforms.uvals[14] = (float)subRect.size.width;
     uniforms.uvals[15] = (float)subRect.size.height;
     uniforms.uvals[16] = subTex ? 1 : 0;
     uniforms.uvals[17] = _aspectMode;
-    uniforms.uvals[18] = _rotation;
-    uniforms.uvals[19] = _mirror;
+    {
+        // Manual rotation/mirror act on the upright picture: compose them after
+        // the container orientation into the single rotate-then-mirror pair the
+        // vertex shader implements.
+        const sp::VideoOrientation shown = sp::composeVideoOrientation(
+            sp::videoOrientationFromUserControls(_rotation, _mirror), _streamOrientation);
+        uniforms.uvals[18] = shown.turnsCCW;
+        uniforms.uvals[19] = shown.hflip ? 1 : 0;
+    }
     uniforms.uvals[20] = _brightness;
     uniforms.uvals[21] = _contrast;
     uniforms.uvals[22] = _saturation;
     uniforms.uvals[23] = _gamma;
     uniforms.uvals[24] = _displayPeakNits;
     uniforms.uvals[25] = _outputMode;
-    uniforms.uvals[26] = _sourceGamut;
+    uniforms.uvals[26] = frameDovi ? sp::kSPGamutBT2020 : _sourceGamut;
     uniforms.uvals[30] = _planar;
     if (spEffectiveSdrBoost(_sdrBoostRequested, _hasHdr, _outputMode)) {
 
@@ -1921,32 +2055,58 @@ static bool spRenderInlineMode(void) {
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
 
+    // Frame-local RPU survives reorder, retry, redraw and seek cancellation.
     SPDoviUniforms doviSnapshot;
     const SPDoviUniforms *doviData = NULL;
-    if (_doviIPT) {
-        if (pairedDovi) {
-            doviSnapshot = *pairedDovi;
-        } else {
-            std::lock_guard<std::mutex> lock(_doviMtx);
-            doviSnapshot = _doviGpu;
-        }
+    sp::DoviDisplaySelection displaySelection = sp::DoviDisplaySelection::L1;
+    if (frameDovi) {
+        spDoviPrepareDrawSnapshot(doviSnapshot, *frameDovi, buffer, enhancement, reconstructedDovi);
+        // SDR output is normalized to the 100-nit reference display; 203 nits
+        // in toneMap is the HDR input reference-white convention (BT.2408).
+        const float targetNits = _outputMode == 1 ? uniforms.uvals[24] : 100.f;
+        const auto targetGamut = _outputMode == 1 ? sp::DoviDisplayGamut::P3D65 : sp::DoviDisplayGamut::BT709;
+        displaySelection = sp::doviPrepareDisplay(doviSnapshot.values, targetNits, targetGamut, w0, h0);
         doviData = &doviSnapshot;
+        if (cmpYTex)
+            sp::doviPrepareDisplay(compareDoviSnapshot.values, targetNits, targetGamut, w0, h0);
+    } else if (_doviIPT) {
+        // P5 has no compatible base. Missing RPU uses the fixed fallback
+        // transform, never another frame's metadata.
+        static const SPDoviUniforms fallback = [] {
+            SPDoviUniforms u;
+            sp::doviToGpuFloats(sp::DoviReshape{}, u.values);
+            return u;
+        }();
+        doviData = &fallback;
+    } else if (_hasHdr && !uniforms.uvals[8]) {
+        // P8.2 damaged-RPU fallback after the layer has entered the HDR path.
+        // That layer is P3/extended-sRGB or tone-mapped sRGB, not source 709.
+        static const SPDoviUniforms fallback = [] {
+            SPDoviUniforms u{}; u.values[sp::dovi_gpu::SdrInHdrLayer] = 1; return u;
+        }();
+        doviData = &fallback;
     }
 
-    id<MTLRenderPipelineState> activePipeline = _pipeline;
+    id<MTLRenderPipelineState> fallbackPipeline = uniforms.uvals[11] ? _doviPipeline : _pipeline;
+    id<MTLRenderPipelineState> activePipeline = fallbackPipeline;
 #if SP_APP_STORE
     static const bool noSpec = false;
 #else
     static const bool noSpec = getenv("SP_NO_SPEC") != nullptr;
 #endif
     if (!noSpec) {
-        uint32_t key = [self currentSpecKey];
+        // Specialize the effective frame path, including a P8.2 SDR fallback
+        // while the session's layer remains EDR. Curves stay dynamic uniforms.
+        const bool frameHdr = uniforms.uvals[8] != 0;
+        const uint32_t key = [self specKeyHdr:frameHdr dovi:uniforms.uvals[11] != 0
+                                        gamut:(int)uniforms.uvals[26]
+                                sdrInHdrLayer:_hasHdr && !frameHdr];
         {
             std::lock_guard<std::mutex> lock(_specMtx);
             if (_specPipeline && _specPipelineKey == key) activePipeline = _specPipeline;
             else if (_specPipeline2 && _specPipelineKey2 == key) activePipeline = _specPipeline2;
         }
-        if (activePipeline == _pipeline && _specFailedKey.load() != key) {
+        if (activePipeline == fallbackPipeline && _specFailedKey.load() != key) {
             [self buildSpecializedPipelineForKey:key];
         }
     }
@@ -1964,6 +2124,8 @@ static bool spRenderInlineMode(void) {
     [enc setFragmentTexture:subTex atIndex:2];
 
     [enc setFragmentTexture:(vTex ?: uvTex) atIndex:3];
+    [enc setFragmentTexture:(elYTex ?: yTex) atIndex:4];
+    [enc setFragmentTexture:(elUVTex ?: uvTex) atIndex:5];
     if (cmpYTex && _compareSplitEnabled) {
 
         NSUInteger dw = drawable.texture.width, dh = drawable.texture.height;
@@ -1972,11 +2134,32 @@ static bool spRenderInlineMode(void) {
         [enc setFragmentTexture:cmpYTex atIndex:0];
         [enc setFragmentTexture:cmpUVTex atIndex:1];
         if (cmpVTex) [enc setFragmentTexture:cmpVTex atIndex:3];
+        if (frameDovi) {
+            // DV source and reconstructed synthetic output can differ in bit
+            // depth, range and plane layout (P9 NV12 or P10 planar -> P010).
+            // The already-built generic DV pipeline reads this draw's layout.
+            SPColorUniforms compareUniforms=uniforms;
+            compareUniforms.uvals[6]=spPixelFormatIsFullRange(compareFormat);
+            compareUniforms.uvals[7]=compare10 ? 10 : 8;
+            compareUniforms.uvals[30]=comparePlanar;
+            [enc setRenderPipelineState:_doviPipeline];
+            [enc setFragmentBytes:&compareUniforms length:sizeof(compareUniforms) atIndex:0];
+            spBindDovi(enc,&compareDoviSnapshot,_doviZeroBuf);
+            [enc setFragmentTexture:cmpElYTex ?: cmpYTex atIndex:4];
+            [enc setFragmentTexture:cmpElUVTex ?: cmpUVTex atIndex:5];
+        }
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc setScissorRect:(MTLScissorRect){midX, 0, dw - midX, dh}];
         [enc setFragmentTexture:yTex atIndex:0];
         [enc setFragmentTexture:uvTex atIndex:1];
         if (vTex) [enc setFragmentTexture:vTex atIndex:3];
+        if (frameDovi) {
+            [enc setRenderPipelineState:activePipeline];
+            [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+            spBindDovi(enc,doviData,_doviZeroBuf);
+            [enc setFragmentTexture:elYTex ?: yTex atIndex:4];
+            [enc setFragmentTexture:elUVTex ?: uvTex atIndex:5];
+        }
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         if (spDebug()) {
             if (_dbgSplitDraws++ < 3) SPLOG(@"[Renderer] 分屏对比 draw（左=compare 右=当前）");
@@ -2086,8 +2269,10 @@ static bool spRenderInlineMode(void) {
 #endif
     [cmd presentDrawable:drawable];
 
+    CVMetalTextureRef elYRef = texGuard.refs[6], elUVRef = texGuard.refs[7];
+    CVMetalTextureRef cmpElYRef = texGuard.refs[8], cmpElUVRef = texGuard.refs[9];
     texGuard.armed = false;
-    BOOL usedSpec = (activePipeline != _pipeline);
+    BOOL usedSpec = (activePipeline != fallbackPipeline);
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
         CFRelease(yRef);
         CFRelease(uvRef);
@@ -2095,6 +2280,10 @@ static bool spRenderInlineMode(void) {
         if (cmpYRef) CFRelease(cmpYRef);
         if (cmpUVRef) CFRelease(cmpUVRef);
         if (cmpVRef) CFRelease(cmpVRef);
+        if (elYRef) CFRelease(elYRef);
+        if (elUVRef) CFRelease(elUVRef);
+        if (cmpElYRef) CFRelease(cmpElYRef);
+        if (cmpElUVRef) CFRelease(cmpElUVRef);
         if (spDebug()) {
 
             int64_t ns = (int64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1e9);
@@ -2115,6 +2304,18 @@ static bool spRenderInlineMode(void) {
     if (!speculative &&
         taskEpoch == _submitSessionEpoch.load(std::memory_order_relaxed)) {
         _committedFrames.fetch_add(1, std::memory_order_relaxed);
+        if (_doviMappingEnabled) {
+            _doviStatusEpoch = taskEpoch;
+            _doviSelection = displaySelection;
+            _doviHasLevel1 = frameDovi && frameDovi->values[sp::dovi_gpu::HasLevel1] > .5f;
+            _doviFrameMode = frameDovi
+                ? (frameDovi->values[sp::dovi_gpu::NeedsEnhancement] > .5f ? SPDoviFrameMode::RpuWithEnhancement
+                                                                           : SPDoviFrameMode::Rpu)
+                : _doviIPT ? SPDoviFrameMode::FixedIPT
+                : (missingEnhancement ||
+                   CVBufferGetAttachment(buffer, kSPDoviMissingEnhancement, nullptr) == kCFBooleanTrue)
+                    ? SPDoviFrameMode::MissingEnhancement : SPDoviFrameMode::BaseLayer;
+        }
     }
 
     cfgLock.unlock();

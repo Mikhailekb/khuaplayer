@@ -4,6 +4,20 @@ All notable public releases will be documented here.
 
 ## Unreleased
 
+### 0.7.0
+
+- Added native Dolby Vision reconstruction using per-frame metadata and
+  enhancement layers, with matching thumbnail and Motion+ handling.
+- Applied container rotation and reflection metadata to video presentation.
+- Reduced time to the first frame by deferring playback controls and menu setup.
+- Improved opening and resuming recent media on slow or sleeping network disks,
+  recovery after rebuffering, and opening healthy AVI files.
+- Added a choice to stop the previous subtitle-generation task or wait for it,
+  with clearer queue status and cancellation.
+- Added sandbox-aware folder access for subtitles and adjacent media, while
+  retaining the dedicated App Store configuration.
+- Reviewed interface strings across all 17 languages and public English comments.
+
 ## 0.6.1
 
 - Reused existing update checks for installation-level activity and version

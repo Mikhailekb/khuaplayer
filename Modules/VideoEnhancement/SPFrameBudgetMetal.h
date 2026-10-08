@@ -54,6 +54,11 @@ typedef struct SPBudgetProbeSummary {
 /// bit depth. Forward and inverse conversion use the same coefficients.
 - (void)adoptColorMatrixFromFrame:(CVPixelBufferRef)frame;
 
+/// DV-only, before creating FRC/output pools. Lazily loads reconstruction from
+/// the renderer library and selects BT.2020 PQ P010 synthetic output.
+- (BOOL)enableDoviReconstructionWithError:(NSError **)error;
+@property (nonatomic, readonly) BOOL doviReconstruction;
+
 // Motion analysis
 - (id<MTLTexture>)newProbeTexture;
 - (id<MTLBuffer>)newBlockResultBuffer;

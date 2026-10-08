@@ -1,6 +1,8 @@
 #import "SPTimelineThumbnailer.h"
 #import "SPVideoDecoder.h"
 #import "SPFFmpegDecoder.h"
+#import "SPDoviDecoder.h"
+#import "SPDoviFrame.h"
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreVideo/CoreVideo.h>
@@ -32,6 +34,10 @@ extern "C" {
 #include "SPThumbBlackBorder.hpp"
 #include "TsRapScan.hpp"
 #include "SPDoviRPU.hpp"
+#include "SPVideoOrientation.hpp"
+#include "../Core/SPDoviConfig.hpp"
+#include "../Core/SPDoviPacketJoiner.hpp"
+#include "../Core/SPDoviStreamAssociation.hpp"
 
 using spthumb::SPThumbClaim;
 using spthumb::SPThumbHoldVerdict;
@@ -50,7 +56,6 @@ struct SPThumbShared {
     int videoStreamIndex = -1;
     int videoStreamId = 0;
     bool doviIPT = false;
-    int doviNalLengthSize = 4;
     ~SPThumbShared() { if (videoPar) avcodec_parameters_free(&videoPar); }
     std::mutex mtx;
     std::condition_variable cv;
@@ -93,10 +98,13 @@ static int spThumbInterruptCb(void *opaque) {
                ? 1 : 0;
 }
 
-static void spThumbFitSize(int w, int h, AVRational sar, int *ow, int *oh) {
+static void spThumbFitSize(int w, int h, AVRational sar, int *ow, int *oh,
+                           sp::VideoOrientation orient = {}) {
     double dw = w > 0 ? w : 2, dh = h > 0 ? h : 2;
     if (sar.num > 0 && sar.den > 0) dw = dw * sar.num / sar.den;
-    double s = std::min(384.0 / dw, 216.0 / dh);
+    const double boxW = orient.swapsAxes() ? 216.0 : 384.0;
+    const double boxH = orient.swapsAxes() ? 384.0 : 216.0;
+    double s = std::min(boxW / dw, boxH / dh);
     if (s > 1.0) s = 1.0;
     *ow = std::max((int)llround(dw * s) & ~1, 2);
     *oh = std::max((int)llround(dh * s) & ~1, 2);
@@ -166,7 +174,21 @@ static CIImage *spThumbCropLetterbox(CIImage *ci, CVPixelBufferRef buf) {
                                                                   -r.origin.y)];
 }
 
-static CIImage *spThumbFitCI(CIImage *ci) {
+static CIImage *spThumbFitCI(CIImage *ci, AVRational sar = {1,1},
+                             sp::VideoOrientation orient = {}) {
+    // DV decodes at native size to preserve reshape inputs. Compatible BL
+    // fallback still needs its coded pixel aspect before fitting the image.
+    if (sar.num > 0 && sar.den > 0 && sar.num != sar.den)
+        ci = [ci imageByApplyingTransform:CGAffineTransformMakeScale(av_q2d(sar),1)];
+    if (!orient.isIdentity()) {
+        // Core Image space is y-up like the orientation matrix; re-anchor the
+        // rotated extent at the origin. Pure geometry: no resampling or color work.
+        int m[4];
+        sp::videoOrientationMatrix(orient, m);
+        ci = [ci imageByApplyingTransform:CGAffineTransformMake(m[0], m[2], m[1], m[3], 0, 0)];
+        ci = [ci imageByApplyingTransform:CGAffineTransformMakeTranslation(
+                 -ci.extent.origin.x, -ci.extent.origin.y)];
+    }
     CGFloat w = ci.extent.size.width, h = ci.extent.size.height;
     double s = std::min(384.0 / w, 216.0 / h);
     if (s >= 1.0) return ci;
@@ -179,12 +201,13 @@ static CIImage *spThumbFitCI(CIImage *ci) {
 
 static CGImageRef spThumbRenderCG(CIContext *ciCtx, CGColorSpaceRef srgb,
                                   CVPixelBufferRef buf, int hdrTrc,
-                                  bool *outHDR, unsigned logId)
+                                  bool *outHDR, unsigned logId, AVRational sar = {1,1},
+                                  sp::VideoOrientation orient = {})
     CF_RETURNS_RETAINED {
     *outHDR = false;
     if (hdrTrc == 16 /*PQ*/ || hdrTrc == 18 /*HLG*/) {
         CIImage *ci = [CIImage imageWithCVPixelBuffer:buf];
-        if (ci) ci = spThumbFitCI(spThumbCropLetterbox(ci, buf));
+        if (ci) ci = spThumbFitCI(spThumbCropLetterbox(ci, buf),sar,orient);
         CGColorSpaceRef hdrSpace = CGColorSpaceCreateWithName(
             hdrTrc == 16 ? kCGColorSpaceITUR_2100_PQ : kCGColorSpaceITUR_2100_HLG);
         if (ci && hdrSpace) {
@@ -209,7 +232,7 @@ static CGImageRef spThumbRenderCG(CIContext *ciCtx, CGColorSpaceRef srgb,
     CIImage *ci = [CIImage imageWithCVPixelBuffer:buf
                                           options:@{kCIImageToneMapHDRtoSDR : @YES}];
     if (!ci) return NULL;
-    ci = spThumbFitCI(spThumbCropLetterbox(ci, buf));
+    ci = spThumbFitCI(spThumbCropLetterbox(ci, buf),sar,orient);
     return [ciCtx createCGImage:ci
                        fromRect:ci.extent
                          format:kCIFormatRGBA8
@@ -259,21 +282,170 @@ static bool spThumbDoviGpuSetup(SPThumbDoviGpu &g, unsigned logId) {
     return g.ready();
 }
 
-static void spThumbDoviFloatsFromPacket(const AVPacket *pkt, int nalLengthSize, float *out) {
-    sp::DoviReshape rp;
-    bool ok = false;
-    if (pkt && pkt->data && pkt->size > 8) {
-        const bool annexB = pkt->data[0] == 0 && pkt->data[1] == 0 &&
-                            (pkt->data[2] == 1 || (pkt->data[2] == 0 && pkt->data[3] == 1));
-        ok = sp::doviParseRPUFromPacket(pkt->data, (size_t)pkt->size, annexB, rp, nalLengthSize) &&
-             rp.valid && !rp.usePrev;
+// One state per thumbnail seek. Prefer metadata inspected on the actual output
+// picture; other backends use the conservative packet/PTS parser. A picture's
+// explicit absent/invalid verdict must also override the packet cache.
+struct SPThumbDoviState {
+    std::unique_ptr<sp::DoviParser> parser;
+    std::map<int64_t, std::array<float, sp::dovi_gpu::FloatCount>> frames;
+    AVRational tb;
+    AVCodecID codec = AV_CODEC_ID_NONE;
+    int profile = 0, lengthSize = 0;
+    bool dualLayer = false, rejectUnsupportedRPU = false, requiresMetadata = false;
+    explicit SPThumbDoviState(const AVCodecParameters *par, AVRational timebase) : tb(timebase) {
+        const auto *cfg = sp::doviConfig(par);
+        const auto metadataPolicy = sp::doviMetadataPolicy(cfg);
+        rejectUnsupportedRPU = metadataPolicy.rejectUnsupportedRPU;
+        requiresMetadata = metadataPolicy.requireFrameMetadata;
+        if (!cfg || !sp::doviMappingSupported(par)) return;
+        profile = cfg->dv_profile;
+        codec = par->codec_id;
+        dualLayer = sp::doviHEVCDualLayerSupported(par);
+        if (dualLayer) return; // the paired decorator owns RPU + EL
+        parser = std::make_unique<sp::DoviParser>(profile, cfg->dv_bl_signal_compatibility_id,
+                                                 cfg->dv_md_compression);
+        lengthSize = sp::doviNalLengthSize(par);
+        if (profile == 10) parser->setAV1Config(par->extradata,std::max(par->extradata_size,0));
     }
-    if (!ok) rp = sp::DoviReshape{};
-    sp::doviToGpuFloats(rp, out);
+    void feed(const AVPacket *pkt, id<SPVideoDecoding> decoder = nil) {
+        if (!parser || !pkt || pkt->size <= 0) return;
+        if (profile == 10 && [decoder isKindOfClass:SPFFmpegDecoder.class] &&
+            ((SPFFmpegDecoder *)decoder).doviPictureMetadataActive) return;
+        size_t size = 0;
+        if (const auto *extra = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &size)) {
+            parser->reset();
+            if (profile == 10) parser->setAV1Config(extra,size);
+            lengthSize = sp::doviNalLengthSize(codec, extra, size);
+        }
+        sp::DoviReshape rp;
+        const auto parsed = profile == 10 ? parser->parseAV1(pkt->data, pkt->size, rp)
+                                         : parser->parse(pkt->data, pkt->size, lengthSize, rp);
+        if (rejectUnsupportedRPU && parsed == sp::DoviParser::Result::Unsupported) requiresMetadata = true;
+        if (pkt->pts == AV_NOPTS_VALUE) return;
+        const int64_t pts = av_rescale_q(pkt->pts, tb, AV_TIME_BASE_Q);
+        frames.erase(pts);
+        // This single-layer helper must never apply a residual-dependent RPU.
+        // Dual-layer metadata and enhancement are handled by the paired decorator.
+        if (rp.valid && !rp.needsEnhancement) sp::doviToGpuFloats(rp, frames[pts].data());
+        while (frames.size() > 96) frames.erase(frames.begin());
+    }
+    const float *find(int64_t pts) const {
+        const auto it = frames.find(pts);
+        return it == frames.end() ? nullptr : it->second.data();
+    }
+    const float *find(const SPDecodedVideoOutput& out) const {
+        if (dualLayer || (profile == 10 &&
+            CVBufferGetAttachment(out.pixelBuffer,kSPDoviPictureMetadata,nullptr))) {
+            const auto *metadata = spDoviFrameUniforms(out.pixelBuffer);
+            return metadata ? metadata->values : nullptr;
+        }
+        return find(out.ptsUs);
+    }
+};
+
+// Worker-private, supported HEVC dual-layer inputs only. Other inputs read
+// directly. The same bounded join preserves exact timestamps and explicit track/PID
+// association. Read-ahead bytes count against the preview's existing budget.
+struct SPThumbDoviPackets {
+    AVFormatContext *ctx;
+    int base, enhancement = -1, enhancementId = -1;
+    int pmtVersion = -2;
+    unsigned streamCount = 0;
+    bool extraNeeded = false;
+    sp::DoviPacketJoiner joiner;
+    SPThumbDoviPackets(AVFormatContext *c, int b) : ctx(c), base(b) {
+        // Establish the BL even before EL is known. A PMT discovered inside
+        // the first raw read can then activate pairing without that first EL
+        // escaping through the unconfigured joiner's raw-reader fast path.
+        joiner.configure(base,-1,ctx->streams[base]->time_base,{0,1},0);
+        refresh();
+    }
+    void flush() { joiner.clear(); }
+    void refresh() {
+        const AVProgram *program = av_find_program_from_stream(ctx, nullptr, base);
+        const int version = program ? program->pmt_version : -1;
+        if (streamCount == ctx->nb_streams && pmtVersion == version) return;
+        streamCount = ctx->nb_streams; pmtVersion = version;
+        const int next = sp::doviUniqueEnhancement(ctx, base);
+        const auto *el = next >= 0 ? ctx->streams[next] : nullptr;
+        const int id = el ? el->id : -1;
+        if (el) {
+            sp::doviPublishCombinedConfig(ctx->streams[base]->codecpar, el->codecpar);
+            extraNeeded = true;
+        }
+        if (next != enhancement || id != enhancementId) {
+            joiner.changeAssociation(next,el ? el->time_base : AVRational{0,1},
+                                    el ? sp::doviNalLengthSize(el->codecpar) : 0);
+        }
+        enhancement = next; enhancementId = id;
+    }
+    template<class Interrupted>
+    int read(AVPacket *out, int64_t budget, int64_t& bytes, Interrupted&& interrupted) {
+        bytes = 0;
+        const int ret = joiner.read(out, [&](AVPacket *pkt) {
+            if (interrupted()) return AVERROR_EXIT;
+            if (bytes >= budget) return AVERROR(EAGAIN);
+            const int r = av_read_frame(ctx,pkt);
+            if (r < 0) return r;
+            bytes += std::max(pkt->size,0);
+            refresh();
+            if (pkt->stream_index == enhancement && extraNeeded) {
+                const auto *par = ctx->streams[enhancement]->codecpar;
+                size_t size = 0;
+                if (!av_packet_get_side_data(pkt,AV_PKT_DATA_NEW_EXTRADATA,&size) &&
+                    par->extradata_size > 0 && par->extradata_size <= 65536) {
+                    if (auto *extra = av_packet_new_side_data(pkt,AV_PKT_DATA_NEW_EXTRADATA,par->extradata_size))
+                        memcpy(extra,par->extradata,par->extradata_size);
+                }
+                extraNeeded = false;
+            }
+            return r;
+        });
+        if (ret >= 0) if (const auto *el = sp::doviPacketEnhancement(out); el && el->packet->pos >= 0)
+            out->pos = out->pos >= 0 ? std::min(out->pos,el->packet->pos) : el->packet->pos;
+        return ret;
+    }
+};
+
+// Orientation in y-down pixel space. A point (x, y) of a w x h image maps to the
+// oriented image (axes swapped for quarter turns); doubled coordinates keep
+// pixel centers integral.
+static void spThumbOrientPoint(double x, double y, size_t w, size_t h,
+                               sp::VideoOrientation o, double *ox, double *oy) {
+    int m[4];
+    sp::videoOrientationMatrix(o, m);
+    const double ow = o.swapsAxes() ? h : w, oh = o.swapsAxes() ? w : h;
+    const double u = x - w / 2.0, v = h / 2.0 - y; // centered, y-up
+    *ox = m[0] * u + m[1] * v + ow / 2.0;
+    *oy = oh / 2.0 - (m[2] * u + m[3] * v);
+}
+
+// Exact pixel permutation (any packed pixel size) into a tightly packed buffer.
+static NSData *spThumbOrientPixels(const uint8_t *src, size_t w, size_t h, size_t bpp,
+                                   sp::VideoOrientation o) {
+    NSMutableData *out = [NSMutableData dataWithLength:w * h * bpp];
+    if (!out) return nil;
+    int m[4];
+    sp::videoOrientationMatrix(o, m);
+    const long ow = o.swapsAxes() ? (long)h : (long)w, oh = o.swapsAxes() ? (long)w : (long)h;
+    uint8_t *dst = (uint8_t *)out.mutableBytes;
+    for (long y = 0; y < (long)h; y++) {
+        const long Y2 = (long)h - 2 * y - 1;
+        for (long x = 0; x < (long)w; x++) {
+            const long X2 = 2 * x + 1 - (long)w;
+            const long dx = (m[0] * X2 + m[1] * Y2 + ow - 1) / 2;
+            const long dy = (oh - 1 - (m[2] * X2 + m[3] * Y2)) / 2;
+            memcpy(dst + ((size_t)dy * ow + dx) * bpp, src + ((size_t)y * w + x) * bpp, bpp);
+        }
+    }
+    return out;
 }
 
 static CGImageRef spThumbRenderDoviCG(SPThumbDoviGpu &g, CVPixelBufferRef buf,
-                                      const float *dovi, unsigned logId)
+                                      const float *dovi, unsigned logId,
+                                      CVPixelBufferRef enhancement = nullptr,
+                                      AVRational sar = {1,1},
+                                      sp::VideoOrientation orient = {})
     CF_RETURNS_RETAINED {
     const OSType fmt = CVPixelBufferGetPixelFormatType(buf);
     const bool is10 = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
@@ -281,9 +453,14 @@ static CGImageRef spThumbRenderDoviCG(SPThumbDoviGpu &g, CVPixelBufferRef buf,
     const bool is8 = fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
                      fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
     if ((!is10 && !is8) || CVPixelBufferGetPlaneCount(buf) < 2) return NULL;
+    const bool fel = dovi[sp::dovi_gpu::NeedsEnhancement] > .5f;
+    if (fel && !spDoviEnhancementBits(enhancement)) return NULL;
     const size_t W = CVPixelBufferGetWidthOfPlane(buf, 0), H = CVPixelBufferGetHeightOfPlane(buf, 0);
     const size_t W1 = CVPixelBufferGetWidthOfPlane(buf, 1), H1 = CVPixelBufferGetHeightOfPlane(buf, 1);
     if (W == 0 || H == 0 || W1 == 0 || H1 == 0) return NULL;
+    int ow=0, oh=0;
+    spThumbFitSize((int)W,(int)H,sar,&ow,&oh,orient);
+    const size_t outW=ow, outH=oh;
     CVMetalTextureRef yRef = NULL, uvRef = NULL;
     CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, g.texCache, buf, NULL,
                                               is10 ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm,
@@ -296,7 +473,13 @@ static CGImageRef spThumbRenderDoviCG(SPThumbDoviGpu &g, CVPixelBufferRef buf,
         if (uvRef) CFRelease(uvRef);
         return NULL;
     }
-    const size_t bytes = W * H * 8;
+    CVMetalTextureRef elRefs[2] = {};
+    if (fel && !spDoviCreateEnhancementTextures(g.texCache, enhancement, elRefs)) {
+        CFRelease(yRef); CFRelease(uvRef);
+        return NULL;
+    }
+    CVMetalTextureRef elYRef = elRefs[0], elUVRef = elRefs[1];
+    const size_t bytes = outW * outH * 8;
     if (!g.outBuf || g.outBuf.length < bytes) {
         g.outBuf = [g.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     }
@@ -307,24 +490,32 @@ static CGImageRef spThumbRenderDoviCG(SPThumbDoviGpu &g, CVPixelBufferRef buf,
         [enc setComputePipelineState:g.pso];
         [enc setTexture:CVMetalTextureGetTexture(yRef) atIndex:0];
         [enc setTexture:CVMetalTextureGetTexture(uvRef) atIndex:1];
-        [enc setBytes:dovi length:sp::kDoviGpuFloats * sizeof(float) atIndex:0];
-        const int32_t meta[4] = {is10 ? 10 : 8, (int32_t)W, (int32_t)H, 0};
+        [enc setTexture:CVMetalTextureGetTexture(fel ? elYRef : yRef) atIndex:2];
+        [enc setTexture:CVMetalTextureGetTexture(fel ? elUVRef : uvRef) atIndex:3];
+        SPDoviUniforms rpu, snapshot; memcpy(rpu.values, dovi, sizeof(rpu));
+        spDoviPrepareDrawSnapshot(snapshot, rpu, buf, fel ? enhancement : nullptr, false);
+        [enc setBytes:&snapshot length:sizeof(snapshot) atIndex:0];
+        const int32_t meta[4] = {is10 ? 10 : 8, ow, oh, 0};
         [enc setBytes:meta length:sizeof(meta) atIndex:1];
         [enc setBuffer:g.outBuf offset:0 atIndex:2];
         const MTLSize tg = MTLSizeMake(16, 16, 1);
-        const MTLSize groups = MTLSizeMake((W + 15) / 16, (H + 15) / 16, 1);
+        const MTLSize groups = MTLSizeMake((outW + 15) / 16, (outH + 15) / 16, 1);
         [enc dispatchThreadgroups:groups threadsPerThreadgroup:tg];
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
-        if (cmd.error) {
+        if (!enc || cmd.status != MTLCommandBufferStatusCompleted) {
             NSLog(@"[c%u][Thumb] DoVi 转换核执行失败: %@", logId, cmd.error);
         } else {
-            NSData *data = [NSData dataWithBytes:g.outBuf.contents length:bytes];
-            CGDataProviderRef prov = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+            NSData *data = orient.isIdentity()
+                ? [NSData dataWithBytes:g.outBuf.contents length:bytes]
+                : spThumbOrientPixels((const uint8_t *)g.outBuf.contents, outW, outH, 8, orient);
+            const size_t imgW = orient.swapsAxes() ? outH : outW;
+            const size_t imgH = orient.swapsAxes() ? outW : outH;
+            CGDataProviderRef prov = data ? CGDataProviderCreateWithCFData((__bridge CFDataRef)data) : NULL;
             CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
             if (prov && cs) {
-                cg = CGImageCreate(W, H, 16, 64, W * 8, cs,
+                cg = CGImageCreate(imgW, imgH, 16, 64, imgW * 8, cs,
                                    (CGBitmapInfo)kCGImageAlphaNoneSkipLast |
                                        (CGBitmapInfo)kCGBitmapByteOrder16Little,
                                    prov, NULL, false, kCGRenderingIntentDefault);
@@ -335,13 +526,21 @@ static CGImageRef spThumbRenderDoviCG(SPThumbDoviGpu &g, CVPixelBufferRef buf,
     }
     CFRelease(yRef);
     CFRelease(uvRef);
+    if (elYRef) CFRelease(elYRef);
+    if (elUVRef) CFRelease(elUVRef);
     if (!cg) return NULL;
 
     size_t top = 0, bot = 0, left = 0, right = 0;
-    if (spThumbBlackBorders(buf, true, dovi[23] > 0.5f ? 1 : 0, &top, &bot, &left, &right)) {
-        CGImageRef cropped = CGImageCreateWithImageInRect(
-            cg, CGRectMake((CGFloat)left, (CGFloat)top,
-                           (CGFloat)(W - left - right), (CGFloat)(H - top - bot)));
+    if (spThumbBlackBorders(buf, true, dovi[sp::dovi_gpu::FullRange] > 0.5f ? 1 : 0, &top, &bot, &left, &right)) {
+        CGRect keep = CGRectMake((CGFloat)left * outW/W, (CGFloat)top * outH/H,
+                                 (CGFloat)(W - left - right) * outW/W, (CGFloat)(H - top - bot) * outH/H);
+        if (!orient.isIdentity()) {
+            double x0, y0, x1, y1;
+            spThumbOrientPoint(CGRectGetMinX(keep), CGRectGetMinY(keep), outW, outH, orient, &x0, &y0);
+            spThumbOrientPoint(CGRectGetMaxX(keep), CGRectGetMaxY(keep), outW, outH, orient, &x1, &y1);
+            keep = CGRectMake(std::min(x0, x1), std::min(y0, y1), fabs(x1 - x0), fabs(y1 - y0));
+        }
+        CGImageRef cropped = CGImageCreateWithImageInRect(cg, keep);
         if (cropped) {
             CGImageRelease(cg);
             cg = cropped;
@@ -433,11 +632,13 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
 
     AVFormatContext *ctx = nullptr;
     id<SPVideoDecoding> dec = nil;
+    std::unique_ptr<SPThumbDoviPackets> doviPackets;
     CIContext *ciCtx = nil;
     SPThumbDoviGpu doviGpu;
     CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     int vs = -1;
     int hdrTrc = 0;
+    sp::VideoOrientation orient; // container display matrix, baked into each image
     bool opened = false, openFailed = false, decoderFailed = false;
     bool planBuilt = false;
     std::vector<int64_t> keyAbsUs;
@@ -564,6 +765,20 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
             if (par->color_range == AVCOL_RANGE_UNSPECIFIED && sh->colorRange > 0)
                 par->color_range = (AVColorRange)sh->colorRange;
             hdrTrc = par->color_trc;
+            {
+                const AVPacketSideData *dm = av_packet_side_data_get(
+                    par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+                orient = sp::videoOrientationFromDisplayMatrixData(dm ? dm->data : nullptr,
+                                                                   dm ? dm->size : 0);
+            }
+            // The main context may have published a combined DV configuration
+            // after associating separate tracks. Preserve shadow color fields.
+            if (matched && !sp::doviConfig(par) && sp::doviConfig(sh->videoPar) &&
+                par->codec_id == sh->videoPar->codec_id) {
+                auto *side = av_packet_side_data_new(&par->coded_side_data,&par->nb_coded_side_data,
+                    AV_PKT_DATA_DOVI_CONF,sizeof(AVDOVIDecoderConfigurationRecord),0);
+                if (side) memcpy(side->data,sp::doviConfig(sh->videoPar),sizeof(AVDOVIDecoderConfigurationRecord));
+            }
         }
         AVStream *st = ctx->streams[vs];
         indexTrusted = spthumb::spThumbIndexTrustworthy(c->iformat ? c->iformat->name : nullptr);
@@ -593,6 +808,8 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
                 return SPThumbOpenResult::Preempted;
             }
         }
+        if (sp::doviHEVCDualLayerSupported(st->codecpar))
+            doviPackets = std::make_unique<SPThumbDoviPackets>(ctx,vs);
 
         int64_t dur = sh->durationUs;
         if (dur <= 0 && ctx->duration > 0) dur = ctx->duration;
@@ -730,12 +947,15 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
         };
         SPDecodedVideoOutput out = SPDecodedVideoOutputEmpty();
         int fed = 0;
-        float doviFloats[sp::kDoviGpuFloats];
+        struct ReleasePreviewPackets {
+            SPThumbDoviPackets *packets;
+            ~ReleasePreviewPackets() { if (packets) packets->flush(); }
+        } releasePreviewPackets{doviPackets.get()};
+        // Open copied the main stream's DV configuration only onto a matched
+        // stream; never apply it to another stream's pictures.
+        SPThumbDoviState doviState(st->codecpar, st->time_base);
 
         auto feedPacket = [&](AVPacket *pkt) -> bool {
-            if (sh->doviIPT && fed == 0) {
-                spThumbDoviFloatsFromPacket(pkt, sh->doviNalLengthSize, doviFloats);
-            }
             if (!dec) {
                 if (decoderFailed) return false;
                 SPVideoDecoder *vt = [SPVideoDecoder new];
@@ -744,7 +964,12 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
                 vt.firstPacketHint = spThumbFirstPacketHint(st->codecpar, pkt);
                 int ow = 0, oh = 0;
                 spThumbFitSize(st->codecpar->width, st->codecpar->height,
-                               st->codecpar->sample_aspect_ratio, &ow, &oh);
+                               st->codecpar->sample_aspect_ratio, &ow, &oh, orient);
+                // DV reshape/residuals are nonlinear. Decode at native size;
+                // compute integrates reconstructed linear light into the small
+                // thumbnail directly. This work is on-demand, outside playback.
+                const bool nativeDovi = sp::doviMappingSupported(st->codecpar);
+                if (nativeDovi) { ow=st->codecpar->width; oh=st->codecpar->height; }
                 vt.outputWidthHint = ow;
                 vt.outputHeightHint = oh;
                 int r = [vt setupWithCodecParameters:st->codecpar
@@ -778,11 +1003,24 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
                     if (spDebug()) NSLog(@"[c%u][Thumb] VT 不支持(r=%d)，FFmpeg 软解兜底", sh->logId, r);
                 }
                 decoderSetupFails = 0;
+                dec = SPWrapDoviThumbnailDecoder(dec,st->codecpar,st->time_base.num,
+                                                 st->time_base.den,nativeDovi ? 0 : ow,nativeDovi ? 0 : oh);
+                if (!dec) { decoderFailed = true; return false; }
             }
+            doviState.feed(pkt,dec);
             out = [dec decodePacketOutput:pkt];
             fed++;
             return true;
         };
+        // A join can read ahead while waiting for EL. Count the physical
+        // packets here, including discarded/unmatched EL, and stop on cancel.
+        auto readPacket = [&](AVPacket *pkt, int64_t budget, int64_t& bytes) {
+            if (doviPackets) return doviPackets->read(pkt,budget,bytes,interrupted);
+            const int r = av_read_frame(ctx,pkt);
+            bytes = r >= 0 ? std::max(pkt->size,0) : 0;
+            return r;
+        };
+        auto flushPackets = [&] { if (doviPackets) doviPackets->flush(); };
 
         auto readAndFeed = [&]() -> bool {
             AVPacket *pkt = av_packet_alloc();
@@ -791,8 +1029,10 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
             int64_t videoPkts = 0, bytes = 0;
             while (!spthumb::spThumbReadBudgetExhausted(videoPkts, bytes)) {
                 if (interrupted()) { av_packet_free(&pkt); return false; }
-                if (av_read_frame(ctx, pkt) < 0) break;
-                bytes += pkt->size;
+                int64_t readBytes = 0;
+                const int r = readPacket(pkt,16LL*1024*1024-bytes,readBytes);
+                bytes += readBytes;
+                if (r < 0) break;
                 if (pkt->stream_index != vs) { av_packet_unref(pkt); continue; }
                 videoPkts++;
                 if (!keyFed && !(pkt->flags & AV_PKT_FLAG_KEY)) {
@@ -812,13 +1052,18 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
         };
 
         auto feedKnownKey = [&](const spthumb::SPThumbKeyHit &hit) -> int {
+            flushPackets();
             if (av_seek_frame(ctx, vs, hit.pos, AVSEEK_FLAG_BYTE) < 0) return 0;
             AVPacket *pkt = av_packet_alloc();
             if (!pkt) return 0;
             int r = 0;
+            int64_t bytes = 0;
             for (int n = 0; n < 256; ++n) {
                 if (interrupted()) { r = -1; break; }
-                if (av_read_frame(ctx, pkt) < 0) break;
+                int64_t readBytes = 0;
+                const int rd = readPacket(pkt,16LL*1024*1024-bytes,readBytes);
+                bytes += readBytes;
+                if (rd < 0) break;
                 if (pkt->stream_index != vs) { av_packet_unref(pkt); continue; }
                 const int64_t pts = pkt->pts != AV_NOPTS_VALUE
                     ? av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q) : INT64_MIN;
@@ -834,6 +1079,7 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
         if (indexTrusted) {
 
             int64_t ts = av_rescale_q(absTargetUs, AV_TIME_BASE_Q, st->time_base);
+            flushPackets();
             if (avformat_seek_file(ctx, vs, INT64_MIN, ts, ts, 0) < 0) {
                 if (interrupted()) return -1;
                 noteFail();
@@ -858,8 +1104,14 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
             }
             if (!tsFed) {
                 const std::function<bool()> abortFn = [&] { return interrupted(); };
+                sp::SPTsRapPacketReader associatedReader;
+                if (doviPackets) {
+                    associatedReader.read = readPacket;
+                    associatedReader.flush = flushPackets;
+                }
                 sp::SPTsRapScanResult rap = sp::spTsRapScanBackward(
-                    ctx, vs, absTargetUs, sh->originUs, tsLim, &tsGopUs, &abortFn);
+                    ctx, vs, absTargetUs, sh->originUs, tsLim, &tsGopUs, &abortFn,
+                    doviPackets ? &associatedReader : nullptr);
 
                 tsKeys.noteReorder(rap.reorderMaxUs);
                 for (const auto &k : rap.keys) tsKeys.noteKey(k.first, k.second);
@@ -894,10 +1146,17 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
 
                 [dec flush];
                 fed = 0;
+                flushPackets();
                 if (av_seek_frame(ctx, vs, replayPos, AVSEEK_FLAG_BYTE) >= 0) {
                     if (!readAndFeed()) { [dec flush]; return -1; }
                 }
             }
+        }
+        if (!out.pixelBuffer) {
+            // Isolated preview: drain both reorder queues within the existing
+            // packet budget before falling back to BL or declaring no image.
+            if (doviState.dualLayer && dec && !interrupted())
+                out = [dec decodePacketOutput:nullptr];
         }
         if (!out.pixelBuffer) {
             if (dec) [dec flush];
@@ -913,6 +1172,7 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
         if (spthumb::discardDecodedFrame(sh->stop.load(), sh->yieldSeq.load(),
                                          claim.yieldBase, sh->cancelSeq.load(),
                                          claim.cancelBase)) {
+            if (doviState.dualLayer) CVBufferRemoveAttachment(out.pixelBuffer,kSPDoviEnhancementFrame);
             CVPixelBufferRelease(out.pixelBuffer);
             [dec flush];
             return -1;
@@ -926,14 +1186,33 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
         bool isHEIC = false;
 
         CGImageRef cg = NULL;
-        if (sh->doviIPT) {
-
+        const auto *frameDovi = doviState.dualLayer ? spDoviFrameUniforms(out.pixelBuffer) : nullptr;
+        const float *doviFloats = doviState.find(out);
+        if (!doviFloats && doviState.requiresMetadata) {
+            CVPixelBufferRelease(out.pixelBuffer);
+            [dec flush];
+            noteFail();
+            return 0;
+        }
+        std::array<float, sp::dovi_gpu::FloatCount> fallback;
+        if (!doviFloats && sh->doviIPT) {
+            sp::doviToGpuFloats(sp::DoviReshape{}, fallback.data());
+            doviFloats = fallback.data();
+        }
+        const bool mappedDovi = doviFloats != nullptr;
+        if (mappedDovi) {
+            // Preserve mapped BT.2020 PQ, including compatible P8/P10 and MEL.
             if (spThumbDoviGpuSetup(doviGpu, sh->logId)) {
-                cg = spThumbRenderDoviCG(doviGpu, out.pixelBuffer, doviFloats, sh->logId);
+                cg = spThumbRenderDoviCG(doviGpu, out.pixelBuffer, doviFloats, sh->logId,
+                    frameDovi ? spDoviEnhancementFrame(out.pixelBuffer) : nullptr,
+                    sp::doviMappingSupported(st->codecpar) ? st->codecpar->sample_aspect_ratio : AVRational{1,1},
+                    orient);
             }
             isHEIC = cg != NULL;
         } else {
-            cg = spThumbRenderCG(ciCtx, srgb, out.pixelBuffer, hdrTrc, &isHEIC, sh->logId);
+            cg = spThumbRenderCG(ciCtx, srgb, out.pixelBuffer, hdrTrc, &isHEIC, sh->logId,
+                sp::doviMappingSupported(st->codecpar) ? st->codecpar->sample_aspect_ratio : AVRational{1,1},
+                orient);
         }
 
         int64_t tPublishUs = 0;
@@ -942,16 +1221,19 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
             tPublishUs = spNowUs();
         }
         NSData *jpeg = cg ? spThumbEncodeCG(cg, isHEIC) : nil;
-        if (!jpeg && isHEIC && !sh->doviIPT) {
+        if (!jpeg && isHEIC && !mappedDovi) {
 
             if (spDebug()) NSLog(@"[c%u][Thumb] HEIC 编码失败，跌落 SDR", sh->logId);
             CGImageRelease(cg);
             isHEIC = false;
             cg = spThumbRenderCG(ciCtx, srgb, out.pixelBuffer, /*hdrTrc=*/0,
-                                 &isHEIC, sh->logId);
+                                 &isHEIC, sh->logId,
+                sp::doviMappingSupported(st->codecpar) ? st->codecpar->sample_aspect_ratio : AVRational{1,1},
+                orient);
             jpeg = cg ? spThumbEncodeCG(cg, false) : nil;
             if (jpeg) spThumbPublishImage(weakSelf, cg, keyUs, resolvedTargetUs);
         }
+        if (doviState.dualLayer) CVBufferRemoveAttachment(out.pixelBuffer,kSPDoviEnhancementFrame);
         CVPixelBufferRelease(out.pixelBuffer);
         [dec flush];
         if (!jpeg) {
@@ -1332,7 +1614,6 @@ static bool spThumbDustColor(CGImageRef cg, float *hue, float *sat, float *luma)
             videoStreamIndex:(int)videoStreamIndex
                videoStreamId:(int)videoStreamId
                      doviIPT:(BOOL)doviIPT
-           doviNalLengthSize:(int)doviNalLengthSize
                    idleProbe:(SPThumbIdleProbe)idleProbe
                seekBusyProbe:(nullable SPThumbSeekBusyProbe)seekBusyProbe
                     onUpdate:(void (^)(void))onUpdate {
@@ -1349,7 +1630,6 @@ static bool spThumbDustColor(CGImageRef cg, float *hue, float *sat, float *luma)
         _shared->videoStreamIndex = videoStreamIndex;
         _shared->videoStreamId = videoStreamId;
         _shared->doviIPT = doviIPT;
-        _shared->doviNalLengthSize = doviNalLengthSize > 0 ? doviNalLengthSize : 4;
         if (videoParams) {
             _shared->videoPar = avcodec_parameters_alloc();
             if (_shared->videoPar && avcodec_parameters_copy(_shared->videoPar, videoParams) < 0) {

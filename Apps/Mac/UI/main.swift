@@ -28,9 +28,14 @@ spLaunchMark("main 入口")
 SPPrewarmMetalDevice()
 
 let spCLIFilePath: String? = {
+#if SP_APP_STORE
+
+    return nil
+#else
     guard let arg = CommandLine.arguments.dropFirst().first,
           FileManager.default.fileExists(atPath: arg) else { return nil }
     return arg
+#endif
 }()
 
 if spCLIFilePath == nil,
@@ -41,6 +46,8 @@ if spCLIFilePath == nil,
 if spCLIFilePath == nil,
    UserDefaults.standard.object(forKey: WelcomeView.bareLaunchHintKey) as? Bool ?? true {
     WelcomeView.prewarmTexture(scale: NSScreen.main?.backingScaleFactor ?? 2.0)
+
+    RecentPlaysWarmer.wakeRecentVolumesAtLaunch()
 }
 
 let app = NSApplication.shared

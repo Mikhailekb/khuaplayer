@@ -2,6 +2,7 @@
 
 #import <CoreVideo/CoreVideo.h>
 #import "SPPlanarPixelFormat.h"
+#import "SPDoviFrame.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -82,7 +83,32 @@ enum class SPMotionPairCompatibility : uint8_t {
     SurfaceMismatch,
     UnsupportedChromaSiting,
     StaticImageDescriptionMismatch,
+    DynamicImageDescriptionMismatch,
 };
+
+inline bool spMotionDoviFrameEligible(CVPixelBufferRef frame) {
+    const auto *gpu = spDoviFrameUniforms(frame);
+    if (!gpu || gpu->values[sp::dovi_gpu::Valid] != 1.0f || spDoviFrameIsReconstructed(frame)) return false;
+    const auto el = spDoviEnhancementFrame(frame);
+    if (gpu->values[sp::dovi_gpu::NeedsEnhancement] == 0.0f) return !el;
+    return gpu->values[sp::dovi_gpu::NeedsEnhancement] == 1.0f && spDoviEnhancementBits(el) != 0;
+}
+
+// Called only after the pair check. The immutable metadata is retained, not
+// reserialized; pooled output surfaces must also lose any previous DV/EL data.
+inline void spMotionCopyDoviMetadata(CVPixelBufferRef source, CVPixelBufferRef destination) {
+    CVBufferRemoveAttachment(destination, kSPDoviFrameMetadata);
+    CVBufferRemoveAttachment(destination, kSPDoviEnhancementFrame);
+    CVBufferRemoveAttachment(destination, kSPDoviMissingEnhancement);
+    CVBufferRemoveAttachment(destination, kSPDoviReconstructedFrame);
+    if (!spMotionDoviFrameEligible(source)) return;
+    CFTypeRef data = CVBufferCopyAttachment(source, kSPDoviFrameMetadata, nullptr);
+    if (data) {
+        CVBufferSetAttachment(destination, kSPDoviFrameMetadata, data,
+                              kCVAttachmentMode_ShouldNotPropagate);
+        CFRelease(data);
+    }
+}
 
 struct SPMotionChromaSiting {
     // Physical centre of chroma texel (0, 0), expressed in luma-pixel
@@ -155,8 +181,19 @@ inline bool spMotionFrameHasSupportedChromaSiting(CVPixelBufferRef frame) {
 #pragma clang diagnostic pop
 
 inline SPMotionPairCompatibility spMotionPairCompatibility(
-    CVPixelBufferRef frameA, CVPixelBufferRef frameB) {
+    CVPixelBufferRef frameA, CVPixelBufferRef frameB, bool checkDoviMetadata = true) {
     if (!frameA || !frameB) return SPMotionPairCompatibility::InvalidInput;
+
+    // The generator knows its stream type. Other callers retain the safe
+    // default of inspecting both frames, including ordinary/DV transitions.
+    if (checkDoviMetadata) {
+        const bool doviA = spDoviFrameUniforms(frameA) != nullptr;
+        const bool doviB = spDoviFrameUniforms(frameB) != nullptr;
+        if ((doviA || doviB) &&
+            (!spMotionDoviFrameEligible(frameA) || !spMotionDoviFrameEligible(frameB) ||
+             !spMotionAttachmentValuesEqual(frameA, frameB, kSPDoviFrameMetadata)))
+            return SPMotionPairCompatibility::DynamicImageDescriptionMismatch;
+    }
 
     // Pixel format is the range carrier for every currently supported NV12 /
     // P010 variant, so this comparison also prevents full/video-range pairs.

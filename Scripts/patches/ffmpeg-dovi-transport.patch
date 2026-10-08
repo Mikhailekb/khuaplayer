@@ -1,0 +1,191 @@
+--- a/libavformat/dovi_isom.h
++++ b/libavformat/dovi_isom.h
+@@ -30,6 +30,7 @@
+ 
+ int ff_isom_parse_dvcc_dvvc(void *logctx, AVStream *st,
+                             const uint8_t *buf_ptr, uint64_t size);
++int ff_isom_parse_hvce(AVStream *st, const uint8_t *data, size_t size);
+ void ff_isom_put_dvcc_dvvc(void *logctx, uint8_t out[ISOM_DVCC_DVVC_SIZE],
+                            const AVDOVIDecoderConfigurationRecord *dovi);
+ 
+--- a/libavformat/dovi_isom.c
++++ b/libavformat/dovi_isom.c
+@@ -28,6 +28,52 @@
+ 
+ #include "avformat.h"
+ #include "dovi_isom.h"
++
++/* Preserve EL configuration independently of the BL extradata, using the
++ * public dictionary side-data format (no AVCodecParameters ABI extension).
++ * A small, versioned key is consumed by the player's DV decoder. */
++int ff_isom_parse_hvce(AVStream *st, const uint8_t *data, size_t size)
++{
++    static const char hex[] = "0123456789abcdef";
++    AVDictionary *dict = NULL;
++    const AVPacketSideData *old;
++    uint8_t *packed;
++    char *value;
++    size_t packed_size;
++    int ret;
++    if (size < 23 || size > 65536 || data[0] != 1)
++        return 0; /* invalid optional EL configuration leaves the BL usable */
++    value = av_malloc(size * 2 + 1);
++    if (!value)
++        return AVERROR(ENOMEM);
++    for (size_t i = 0; i < size; i++) {
++        value[2*i] = hex[data[i] >> 4];
++        value[2*i+1] = hex[data[i] & 15];
++    }
++    value[size * 2] = 0;
++    old = av_packet_side_data_get(st->codecpar->coded_side_data,
++                                  st->codecpar->nb_coded_side_data, AV_PKT_DATA_STRINGS_METADATA);
++    if (old && (ret = av_packet_unpack_dictionary(old->data, old->size, &dict)) < 0) {
++        av_free(value);
++        av_dict_free(&dict);
++        return ret;
++    }
++    ret = av_dict_set(&dict, "sp.dovi.el_config.v1", value, AV_DICT_DONT_STRDUP_VAL);
++    if (ret < 0) {
++        av_dict_free(&dict);
++        return ret;
++    }
++    packed = av_packet_pack_dictionary(dict, &packed_size);
++    av_dict_free(&dict);
++    if (!packed)
++        return AVERROR(ENOMEM);
++    if (!av_packet_side_data_add(&st->codecpar->coded_side_data, &st->codecpar->nb_coded_side_data,
++                                 AV_PKT_DATA_STRINGS_METADATA, packed, packed_size, 0)) {
++        av_free(packed);
++        return AVERROR(ENOMEM);
++    }
++    return 0;
++}
+ 
+ int ff_isom_parse_dvcc_dvvc(void *logctx, AVStream *st,
+                             const uint8_t *buf_ptr, uint64_t size)
+--- a/libavformat/matroskadec.c
++++ b/libavformat/matroskadec.c
+@@ -2537,6 +2537,11 @@
+                     return AVERROR_INVALIDDATA;
+             }
+             break;
++        case 0x68766345: /* hvcE: enhancement HEVCDecoderConfigurationRecord */
++            if (st->codecpar->codec_id == AV_CODEC_ID_HEVC &&
++                (ret = ff_isom_parse_hvce(st, mapping->extradata.data, mapping->extradata.size)) < 0)
++                return ret;
++            break;
+         case MATROSKA_BLOCK_ADD_ID_TYPE_DVCC:
+         case MATROSKA_BLOCK_ADD_ID_TYPE_DVVC:
+             if ((ret = mkv_parse_dvcc_dvvc(s, st, track, &mapping->extradata)) < 0)
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -2548,6 +2548,32 @@
+     return 0;
+ }
+ 
++/* DV enhancement track explicitly references its base track through vdep. */
++static int mov_read_vdep(MOVContext *c, AVIOContext *pb, MOVAtom atom)
++{
++    AVStream *st;
++    if (c->fc->nb_streams < 1 || atom.size != 4)
++        return 0;
++    st = c->fc->streams[c->fc->nb_streams - 1];
++    return av_dict_set_int(&st->metadata, "sp.dovi.base_id", avio_rb32(pb), 0);
++}
++
++static int mov_read_hvce(MOVContext *c, AVIOContext *pb, MOVAtom atom)
++{
++    uint8_t *buf;
++    int ret;
++    if (c->fc->nb_streams < 1 || atom.size < 23 || atom.size > 65536)
++        return 0;
++    buf = av_malloc(atom.size);
++    if (!buf)
++        return AVERROR(ENOMEM);
++    ret = ffio_read_size(pb, buf, atom.size);
++    if (ret >= 0)
++        ret = ff_isom_parse_hvce(c->fc->streams[c->fc->nb_streams - 1], buf, atom.size);
++    av_free(buf);
++    return ret;
++}
++
+ static int mov_read_sbas(MOVContext* c, AVIOContext* pb, MOVAtom atom)
+ {
+     AVStream* st;
+@@ -9564,6 +9590,8 @@
+ { MKTAG('p','a','s','p'), mov_read_pasp },
+ { MKTAG('c','l','a','p'), mov_read_clap },
+ { MKTAG('s','b','a','s'), mov_read_sbas },
++{ MKTAG('v','d','e','p'), mov_read_vdep },
++{ MKTAG('h','v','c','E'), mov_read_hvce },
+ { MKTAG('s','i','d','x'), mov_read_sidx },
+ { MKTAG('s','t','b','l'), mov_read_default },
+ { MKTAG('s','t','c','o'), mov_read_stco },
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -2415,6 +2415,8 @@
+             if (!dovi->bl_present_flag && desc_end - *pp >= 2) {
+                 buf = get16(pp, desc_end);
+                 dependency_pid = buf >> 3; // 13 bits
++                av_dict_set_int(&st->metadata, "sp.dovi.base_id", dependency_pid, 0);
++                st->disposition |= AV_DISPOSITION_DEPENDENT;
+             }
+             if (desc_end - *pp >= 1) {  // 8 bits
+                 buf = get8(pp, desc_end);
+@@ -2738,6 +2740,12 @@
+         desc_list_end  = p + desc_list_len;
+         if (desc_list_end > p_end)
+             goto out;
++        /* A new PMT may remove the Dolby dependency descriptor on this PID. */
++        if (av_dict_get(st->metadata, "sp.dovi.base_id", NULL, 0)) {
++            av_dict_set(&st->metadata, "sp.dovi.base_id", NULL, 0);
++            st->disposition &= ~AV_DISPOSITION_DEPENDENT;
++        }
++
+         for (;;) {
+             if (ff_parse_mpeg2_descriptor(ts->stream, st, stream_type, h->id, &p,
+                                           desc_list_end, mp4_descr,
+--- a/libavcodec/dovi_rpudec.c
++++ b/libavcodec/dovi_rpudec.c
+@@ -213,6 +213,14 @@
+         dm->l3.avg_pq_offset = get_bits(gb, 12);
+         break;
+     case 8:
++        /* Omitted optional CM4 controls are neutral, not zero-valued trims. */
++        if (ext_block_length != 10 && ext_block_length != 12 &&
++            ext_block_length != 13 && ext_block_length != 19 && ext_block_length != 25)
++            return AVERROR_INVALIDDATA;
++        dm->l8.target_mid_contrast = 2048;
++        dm->l8.clip_trim = 2048;
++        memset(dm->l8.saturation_vector_field, 128, sizeof(dm->l8.saturation_vector_field));
++        memset(dm->l8.hue_vector_field, 128, sizeof(dm->l8.hue_vector_field));
+         dm->l8.target_display_index = get_bits(gb, 8);
+         dm->l8.trim_slope = get_bits(gb, 12);
+         dm->l8.trim_offset = get_bits(gb, 12);
+@@ -520,7 +528,9 @@
+     if (use_prev_vdr_rpu) {
+         int prev_vdr_rpu_id = get_ue_golomb_31(gb);
+         VALIDATE(prev_vdr_rpu_id, 0, DOVI_MAX_DM_ID);
+-        if (!s->vdr[prev_vdr_rpu_id])
++        /* Strict consumers must not attach another mapping after a lost
++         * extended-compression reference (e.g. a seek or damaged RPU). */
++        if (!s->vdr[prev_vdr_rpu_id] && !(err_recognition & AV_EF_EXPLODE))
+             prev_vdr_rpu_id = 0;
+         if (!s->vdr[prev_vdr_rpu_id]) {
+             /* FIXME: Technically, the spec says that in this case we should
+@@ -655,6 +665,15 @@
+             return AVERROR_PATCHWELCOME;
+         }
+ 
++        /* Method 1 inherits level-0 DM and static extension blocks. An
++         * independent mapping alone cannot initialize that separate state. */
++        if (dm_compression && (!s->dm || s->dm->dm_metadata_id != affected_dm_id)) {
++            av_log(s->logctx, AV_LOG_ERROR, "Missing static DM reference: %d\n",
++                   affected_dm_id);
++            ff_dovi_ctx_unref(s);
++            return AVERROR_INVALIDDATA;
++        }
++
+         if (!s->dm) {
+             s->dm = av_refstruct_allocz(sizeof(AVDOVIColorMetadata));
+             if (!s->dm) {

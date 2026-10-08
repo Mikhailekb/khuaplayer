@@ -427,6 +427,11 @@ static void spSetGrowthMode(LocalFileIO* io, SourceGrowthPub* pub, spgrow::Mode 
 }
 
 static int spPathWriterOpen(const std::string& path) {
+#if SP_APP_STORE
+
+    (void)path;
+    return -1;
+#endif
 
     struct stat target {};
     if (::stat(path.c_str(), &target) != 0) return -1;
@@ -1853,6 +1858,118 @@ ReadSourceView Demuxer::captureOpeningReadSourceView(const std::vector<spresil::
     } catch (const std::bad_alloc&) { return {}; }
 }
 
+static bool spVolumeHeartbeatClaim(dev_t dev, int64_t nowUs, int64_t intervalUs) {
+    static std::mutex mtx;
+    static std::map<dev_t, int64_t> lastBeatUs;
+    std::lock_guard<std::mutex> lk(mtx);
+    int64_t& last = lastBeatUs[dev];
+    if (last > 0 && nowUs - last < intervalUs * 4 / 5) return false;
+    last = nowUs;
+    return true;
+}
+
+extern "C" int SPVolumeHeartbeatBeat(const char* path, int intervalMs, int64_t* devOut) {
+    if (!path || intervalMs <= 0) return -1;
+    struct statfs sfs {};
+    if (statfs(path, &sfs) != 0) return -2;
+    const char* t = sfs.f_fstypename;
+    if (!(strcmp(t, "smbfs") == 0 || strcmp(t, "afpfs") == 0 ||
+          strcmp(t, "nfs") == 0 || strcmp(t, "webdav") == 0)) return -1;
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -2;
+    struct stat st {};
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) { ::close(fd); return -2; }
+    if (devOut) *devOut = (int64_t)st.st_dev;
+    if (!spVolumeHeartbeatClaim(st.st_dev, spNowUs(), (int64_t)intervalMs * 1000)) { ::close(fd); return 0; }
+    (void)fcntl(fd, F_NOCACHE, 1);
+    char buf[4096];
+    const uint64_t r = ((uint64_t)arc4random() << 32) | arc4random();
+    const int64_t maxOff = st.st_size > (int64_t)sizeof(buf) ? st.st_size - (int64_t)sizeof(buf) : 0;
+    const int64_t off = maxOff > 0 ? (int64_t)(r % (uint64_t)maxOff) & ~(int64_t)4095 : 0;
+    const int64_t t0 = spNowUs();
+    const ssize_t n = ::pread(fd, buf, sizeof(buf), off);
+    ::close(fd);
+    if (spDebug()) {
+        fprintf(stderr, "[DemuxIO] 欢迎页心跳 off=%.1fGB %.0fms%s\n",
+                off / 1e9, (spNowUs() - t0) / 1000.0, n <= 0 ? "（读失败）" : "");
+        fflush(stderr);
+    }
+    return n > 0 ? 1 : -2;
+}
+
+extern "C" int64_t SPSpeculativeOpenWarm(const char* path, double resumeSec, double aheadSec,
+                                         int (*shouldYield)(void*), void* ctx) {
+    if (!path) return -1;
+
+    static constexpr int64_t kByteBudget = 96LL * 1024 * 1024;
+    struct YieldCtx { int (*fn)(void*); void* ctx; AVFormatContext* fmt; bool overBudget; };
+    YieldCtx yc{shouldYield, ctx, nullptr, false};
+    auto yielded = [&yc] { return yc.fn && yc.fn(yc.ctx) != 0; };
+    AVFormatContext* fmt = avformat_alloc_context();
+    if (!fmt) return -1;
+    yc.fmt = fmt;
+    fmt->interrupt_callback.callback = [](void* o) -> int {
+        auto* y = static_cast<YieldCtx*>(o);
+        if (y->fmt && y->fmt->pb && y->fmt->pb->bytes_read > kByteBudget) { y->overBudget = true; return 1; }
+        return y->fn && y->fn(y->ctx) ? 1 : 0;
+    };
+    fmt->interrupt_callback.opaque = &yc;
+    const int64_t t0 = spNowUs();
+    if (avformat_open_input(&fmt, path, nullptr, nullptr) < 0) return -1;
+    const char* fmtName = fmt->iformat ? fmt->iformat->name : "";
+    if (!(strstr(fmtName, "matroska") || strstr(fmtName, "mov"))) {
+        avformat_close_input(&fmt);
+        return -3;
+    }
+    int vidx = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVStream* st = fmt->streams[i];
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            !(st->disposition & AV_DISPOSITION_ATTACHED_PIC)) { vidx = (int)i; break; }
+    }
+    int64_t bytes = 0;
+    int pkts = 0;
+    const char* stop = "eof";
+    const int64_t tOpen = spNowUs();
+    int64_t tSeek = tOpen;
+    if (vidx >= 0 && !yielded()) {
+        AVStream* st = fmt->streams[vidx];
+
+        const int64_t originUs = st->start_time != AV_NOPTS_VALUE
+            ? av_rescale_q(st->start_time, st->time_base, AV_TIME_BASE_Q) : 0;
+        const int64_t targetUs = originUs + (int64_t)(std::max(0.0, resumeSec) * 1e6);
+        const int64_t target = av_rescale_q(targetUs, AV_TIME_BASE_Q, st->time_base);
+        if (resumeSec > 0.5) av_seek_frame(fmt, vidx, target, AVSEEK_FLAG_BACKWARD);
+        tSeek = spNowUs();
+        const int64_t endPts = av_rescale_q(targetUs + (int64_t)(std::max(0.0, aheadSec) * 1e6),
+                                            AV_TIME_BASE_Q, st->time_base);
+        AVPacket* pkt = av_packet_alloc();
+        while (pkt) {
+            if (yc.overBudget) { stop = "budget"; break; }
+            if (yielded()) { stop = "yield"; break; }
+            if (av_read_frame(fmt, pkt) < 0) break;
+            bytes += pkt->size;
+            ++pkts;
+            const bool done = pkt->stream_index == vidx && pkt->pts != AV_NOPTS_VALUE && pkt->pts >= endPts;
+            av_packet_unref(pkt);
+            if (done) { stop = "target"; break; }
+            if (bytes > 64LL * 1024 * 1024) { stop = "cap"; break; }
+        }
+        av_packet_free(&pkt);
+    }
+    if (yc.overBudget) stop = "budget";
+    avformat_close_input(&fmt);
+    if (spDebug()) {
+        const char* slash = strrchr(path, '/');
+        fprintf(stderr, "[DemuxIO] 投机打开预热 %s @%.1fs 开=%lldms 定位=%lldms 读=%lldms %.1fMB 包=%d 止=%s\n",
+                slash ? slash + 1 : path, resumeSec, (long long)((tOpen - t0) / 1000),
+                (long long)((tSeek - tOpen) / 1000), (long long)((spNowUs() - tSeek) / 1000),
+                bytes / 1048576.0, pkts, stop);
+        fflush(stderr);
+    }
+    return bytes;
+}
+
 void Demuxer::startVolumeKeepAliveIfNeeded() {
     if (!localIO_ || !remoteVolume_) return;
     if (!admitAuxWorker("keepalive")) return;
@@ -1868,38 +1985,41 @@ void Demuxer::startVolumeKeepAliveIfNeeded() {
         if (abortIO_.load()) { ::close(fd); return; }
         keepAliveCancel_ = cancel;
     }
-    int intervalSec = 45;
+    int intervalMs = 2500;
 #if !SP_APP_STORE
     if (const char* e = getenv("SP_KEEPALIVE_SEC")) {
         int v = atoi(e);
-        if (v >= 1 && v <= 600) intervalSec = v;
+        if (v >= 1 && v <= 600) intervalMs = v * 1000;
     }
 #endif
+    struct stat st {};
+    const dev_t dev = fstat(fd, &st) == 0 ? st.st_dev : 0;
     const bool debug = spDebug();
     rsv.handOff();
-    std::thread([fd, size, cancel, intervalSec, debug, aux = auxWorkers_,
+    std::thread([fd, size, dev, cancel, intervalMs, debug, aux = auxWorkers_,
                  act = ioActivityUs_] {
         AuxWorkerScope scope(aux, /*adoptReservation=*/true);
         pthread_setname_np("sp.demux.keepalive");
         pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
-        uint64_t lcg = 0x9E3779B97F4A7C15ULL ^ (uint64_t)fd;
+        uint64_t lcg = ((uint64_t)arc4random() << 32) | arc4random();
         char buf[4096];
-        if (debug) fprintf(stderr, "[DemuxIO] 保活启动（远端卷，每 %ds）\n", intervalSec);
+        if (debug) fprintf(stderr, "[DemuxIO] 心跳启动（远端卷，每 %dms）\n", intervalMs);
         while (!cancel->cancel.load()) {
 
             {
                 std::unique_lock<std::mutex> lk(cancel->waitMtx);
-                cancel->waitCv.wait_for(lk, std::chrono::seconds(intervalSec),
+                cancel->waitCv.wait_for(lk, std::chrono::milliseconds(intervalMs),
                                         [&] { return cancel->cancel.load(); });
             }
             if (cancel->cancel.load()) break;
 
             if (act) {
                 const int64_t last = act->load(std::memory_order_relaxed);
-                if (last > 0 && spNowUs() - last < (int64_t)intervalSec * 1000000) {
+                if (last > 0 && spNowUs() - last < (int64_t)intervalMs * 1000) {
                     continue;
                 }
             }
+            if (!spVolumeHeartbeatClaim(dev, spNowUs(), (int64_t)intervalMs * 1000)) continue;
             lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
             int64_t maxOff = size > (int64_t)sizeof(buf) ? size - (int64_t)sizeof(buf) : 0;
             int64_t off = maxOff > 0 ? (int64_t)(lcg % (uint64_t)maxOff) : 0;
@@ -2452,7 +2572,7 @@ Demuxer::Demuxer() = default;
 Demuxer::~Demuxer() { close(); }
 
 static bool isRealVideoStream(const AVStream* s) {
-    return (s->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0;
+    return (s->disposition & (AV_DISPOSITION_ATTACHED_PIC | AV_DISPOSITION_DEPENDENT)) == 0;
 }
 
 static bool isTextSubtitleStream(const AVStream* s) {
@@ -2470,6 +2590,7 @@ static bool isTextSubtitleStream(const AVStream* s) {
 }
 
 void Demuxer::close() {
+    dovi_.reset();
     if (openingSource_) openingSource_->openingViewActive.store(false, std::memory_order_release);
     mkvContentCancelJob();
 
@@ -3160,12 +3281,14 @@ void Demuxer::rebuildStreamTable() {
     subtitleStream_ = -1;
     durationUs_ = (fmtCtx_->duration != AV_NOPTS_VALUE) ? fmtCtx_->duration : 0;
     if (durationUs_ < 0) durationUs_ = 0;
+    dovi_.prepareStreams(fmtCtx_);
 
     computeTimelineOrigin();
     for (unsigned i = 0; i < fmtCtx_->nb_streams; ++i) {
         buildStreamInfo(fmtCtx_->streams[i]);
     }
     selectStreams();
+    dovi_.select(fmtCtx_, videoStream_, fmtCtx_->iformat && strstr(fmtCtx_->iformat->name, "mpegts"));
 
     publishAltVideoCandidates();
     publishTsPcrIdentities(true);
@@ -3412,6 +3535,8 @@ void Demuxer::buildStreamInfo(AVStream* s) {
                 info.doviBlCompatId = dovi->dv_bl_signal_compatibility_id;
             } else if (sd->type == AV_PKT_DATA_DYNAMIC_HDR10_PLUS) {
                 info.hasHdr10Plus = true;
+            } else if (sd->type == AV_PKT_DATA_DISPLAYMATRIX) {
+                info.orientation = videoOrientationFromDisplayMatrixData(sd->data, sd->size);
             }
         }
     }
@@ -3801,6 +3926,7 @@ bool Demuxer::tryAviChunkSizeReopen() {
         spresil::AviLayout L;
         if (!spresil::aviLocate(read, size, L, &abortFn_)) return;
         tested = spresil::aviIdx1Sample(read, size, L, rel, absm, &mismatch, &idMismatch, samples, true);
+        if ((mismatch > 0 || idMismatch > 0) && !aviWholeChainScanAffordable("打开期抽样矛盾")) return;
         if (tested > 0 && mismatch > 0) plan = spresil::planAviChunkSizes(read, size, &abortFn_);
 
         if (plan.empty() && tested > 0 && idMismatch > 0) plan = spresil::planAviUnknownStreamIds(read, size, &abortFn_);
@@ -3823,8 +3949,20 @@ bool Demuxer::tryAviChunkSizeReopen() {
     return true;
 }
 
+bool Demuxer::aviWholeChainScanAffordable(const char* why) const {
+    const int64_t size = localIO_ ? localIO_->size : 0;
+    const int64_t cap = scanCap(1024ll * 1024 * 1024, 64ll * 1024 * 1024);
+    if (size > 0 && size <= cap) return true;
+    if (spDebug()) {
+        fprintf(stderr, "[Demux] AVI 整链裁决跳过（%s）：文件 %.0fMB 超过%s上限 %.0fMB\n", why, size / 1048576.0,
+                remoteVolume_ ? "远端卷" : "本地", cap / 1048576.0);
+    }
+    return false;
+}
+
 bool Demuxer::attemptAviChunkSizeRecovery(int64_t lostTsUs, const std::string& why) {
     if (!fmtCtx_ || !localIO_) return false;
+    if (!aviWholeChainScanAffordable(why.c_str())) return false;
     spresil::RecoveryPlan plan;
     const int64_t t0 = spNowUs();
     withPatchedFileReader([&](const spresil::Reader& rd, int64_t size) {
@@ -4042,7 +4180,8 @@ void Demuxer::applyStreamDiscard(int audioIndex, int subtitleIndex) {
     if (!fmtCtx_ || !discardEligible_) return;
     for (unsigned i = 0; i < fmtCtx_->nb_streams; ++i) {
         AVStream* s = fmtCtx_->streams[i];
-        const bool keep = ((int)i == videoStream_ && !videoIsolated_) || (int)i == audioIndex || (int)i == subtitleIndex;
+        const bool keep = (((int)i == videoStream_ || dovi_.retainsStream(s, (int)i)) && !videoIsolated_) ||
+                          (int)i == audioIndex || (int)i == subtitleIndex;
         s->discard = keep ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
     }
 }
@@ -4124,6 +4263,24 @@ int Demuxer::readFrameGrowthAware(AVPacket* pkt) {
         av_packet_free(&p);
         return 0;
     }
+    // Ordinary streams never enter DV association tracking. Do not use active():
+    // a configured DV BL can acquire its EL from a later transport PMT.
+    return dovi_.configured() ? readFrameDoviJoined(pkt) : readFrameRawGrowthAware(pkt);
+}
+
+// Kept out of line: inlining the join into the per-packet read measurably slowed
+// ordinary demux (+11% CPU per video packet on MPEG-PS in demux_bench).
+__attribute__((noinline)) int Demuxer::readFrameDoviJoined(AVPacket* pkt) {
+    bool associationChanged = false;
+    const int ret = dovi_.read(pkt, fmtCtx_, [this](AVPacket* p) { return readFrameRawGrowthAware(p); },
+                               &associationChanged);
+    // Only the selected BL remains the main video. A new dependent PID must be
+    // retained by FFmpeg, while a retired EL stops consuming decode I/O.
+    if (associationChanged && discardApplied_) applyStreamDiscard(lastDiscardAudio_, lastDiscardSub_);
+    return ret;
+}
+
+int Demuxer::readFrameRawGrowthAware(AVPacket* pkt) {
     LocalFileIO* io = localIO_.get();
     if (!io) return av_read_frame(fmtCtx_, pkt);
     if (io->growth.zeroEofOutsidePlay) {
@@ -4275,7 +4432,7 @@ int Demuxer::readPacket(AVPacket* pkt) {
         return AVERROR(ESTALE); // No fresh fstat; only the fault-time check sets this latch.
     }
 
-    const int64_t posBefore = fmtCtx_->pb ? avio_tell(fmtCtx_->pb) : 0;
+    int64_t posBefore = fmtCtx_->pb ? avio_tell(fmtCtx_->pb) : 0;
     if (localIO_ && mkvLike_ && resilientRecoveryEnabled_ && !localIO_->contentSuspectEnabled && !mkvContent_.prepareFailed &&
         localIO_->contentGaps.empty() && !growthActive() && mkvContent_.jumps == 0 && !mkvContent_.prepared) {
         localIO_->contentSuspectEnabled = true;
@@ -4397,6 +4554,9 @@ int Demuxer::readPacket(AVPacket* pkt) {
     if (ret < 0) {
 
         if (ret == AVERROR_EXIT) return ret;
+        // A DV join may report the error after delivering packets buffered
+        // ahead of it: classify from the failing raw read, not this call.
+        if (const int64_t failedAt = dovi_.takeReportedErrorPos(); failedAt >= 0) posBefore = failedAt;
         const int64_t posAfter = fmtCtx_->pb ? avio_tell(fmtCtx_->pb) : posBefore;
         lastReadAdvanced_ = posAfter > posBefore;
         lastReadPos_ = posAfter;
@@ -4468,7 +4628,10 @@ int Demuxer::readPacket(AVPacket* pkt) {
     if (aviLike_ && resilientRecoveryEnabled_ && !aviChunkSizeTried_ && pkt->pos > 8 && pkt->stream_index >= 0 &&
         pkt->stream_index < (int)fmtCtx_->nb_streams && !abortIO_.load()) {
         AVStream* st = fmtCtx_->streams[pkt->stream_index];
-        const int n = avformat_index_get_entries_count(st);
+
+        const AVCodecParserContext* parser = av_stream_get_parser(st);
+        const bool wholeChunks = !parser || (parser->flags & PARSER_FLAG_COMPLETE_FRAMES);
+        const int n = wholeChunks ? avformat_index_get_entries_count(st) : 0;
         if ((size_t)pkt->stream_index >= aviIdxCursor_.size()) aviIdxCursor_.resize(fmtCtx_->nb_streams, -1);
         int& cur = aviIdxCursor_[pkt->stream_index];
         const int64_t hdrPos = pkt->pos - 8;
@@ -6140,6 +6303,7 @@ bool Demuxer::recoverRegion(int64_t from, int64_t to, const char* why) {
 }
 
 void Demuxer::dropSeekPushback() {
+    dovi_.clear();
     for (AVPacket* p : seekPushback_) { AVPacket* t = p; av_packet_free(&t); }
     seekPushback_.clear();
 }
@@ -6184,7 +6348,7 @@ void Demuxer::noteTsKeyframePtsUs(int64_t relPtsUs) {
 int64_t Demuxer::findTsRapPos(int64_t absUs, int streamIndex, bool forward,
                               int64_t floorAbsUs,
                               const std::function<bool()>* abortFn,
-                              int64_t* outPtsUs, bool* cappedOut) {
+                              int64_t* outPtsUs, bool* cappedOut, bool* outDoviPaired) {
     *cappedOut = false;
     AVStream* st = fmtCtx_->streams[videoStream_];
     const AVRational tb = st->time_base;
@@ -6201,6 +6365,7 @@ int64_t Demuxer::findTsRapPos(int64_t absUs, int streamIndex, bool forward,
     } guard{&probe};
 
     int64_t bestPos = -1, bestPts = AV_NOPTS_VALUE;
+    bool bestPaired = false;
     int64_t vpkts = 0;
 
     int64_t prevKeyPts = AV_NOPTS_VALUE;
@@ -6219,12 +6384,16 @@ int64_t Demuxer::findTsRapPos(int64_t absUs, int streamIndex, bool forward,
         bool discontinuity = false;
         for (;;) {
 
-            if (abortFn && (*abortFn)()) return -1;
-            if (spTsRapExhausted(lim, absUs - loUs, bytesRead(), vpkts)) {
-                *cappedOut = true;
-                return -1;
+            bool aborted = false, capped = false;
+            if (dovi_.readProbe(probe, [&](AVPacket* p) {
+                    aborted = abortFn && (*abortFn)();
+                    capped = !aborted && spTsRapExhausted(lim, absUs - loUs, bytesRead(), vpkts);
+                    return aborted || capped ? AVERROR_EXIT : av_read_frame(fmtCtx_, p);
+                }) < 0) {
+                if (capped) *cappedOut = true;
+                if (aborted || capped) return -1;
+                break;
             }
-            if (av_read_frame(fmtCtx_, probe) < 0) break;
             if (probe->stream_index != videoStream_) {
                 av_packet_unref(probe);
                 continue;
@@ -6237,7 +6406,10 @@ int64_t Demuxer::findTsRapPos(int64_t absUs, int streamIndex, bool forward,
                                     ? av_rescale_q(probe->dts, tb, AV_TIME_BASE_Q)
                                     : pts;
             const bool key = (probe->flags & AV_PKT_FLAG_KEY) != 0;
-            const int64_t pos = probe->pos;
+            // The associated EL PES can precede the BL RAP in transport order.
+            // Replaying only from the BL byte offset would lose that EL RAP.
+            const int64_t pos = DoviTransport::landingPos(probe);
+            const bool paired = doviPacketEnhancement(probe) != nullptr;
             av_packet_unref(probe);
 
             if (dts != AV_NOPTS_VALUE) {
@@ -6249,11 +6421,12 @@ int64_t Demuxer::findTsRapPos(int64_t absUs, int streamIndex, bool forward,
                     gopSample = pts - prevKeyPts;
                 prevKeyPts = pts;
                 if (forward) {
-                    if (pts >= absUs) { bestPos = pos; bestPts = pts; break; }
+                    if (pts >= absUs) { bestPos = pos; bestPts = pts; bestPaired = paired; break; }
                 } else if (pts <= absUs) {
 
                     bestPos = pos;
                     bestPts = pts;
+                    bestPaired = paired;
                 }
             }
 
@@ -6272,6 +6445,7 @@ int64_t Demuxer::findTsRapPos(int64_t absUs, int streamIndex, bool forward,
 
         tsGopUs_ = spTsRapBlendGopUs(tsGopUs_, gopSample);
         *outPtsUs = bestPts;
+        if (outDoviPaired) *outDoviPaired = bestPaired;
     }
     return bestPos;
 }
@@ -6407,6 +6581,7 @@ int Demuxer::seekToUs(int64_t us, bool forwardKeyframe,
             const bool atHead = attempt > 0 && tryUs == floorAbsUs;
             auto seekAttempt = [&]() -> int {
                 if (atHead) {
+                    dropSeekPushback();
                     const int r = av_seek_frame(fmtCtx_, streamIndex, 0, AVSEEK_FLAG_BYTE);
                     if (r >= 0) return r;
                 }
@@ -6415,14 +6590,19 @@ int Demuxer::seekToUs(int64_t us, bool forwardKeyframe,
             };
             if (attempt > 0 && seekAttempt() < 0) break;
 
-            bool foundKey = false, foundVideo = false;
+            bool foundKey = false, foundVideo = false, doviPaired = false;
+            int64_t videoPos = -1, videoPtsUs = AV_NOPTS_VALUE;
             AVPacket* probe = av_packet_alloc();
             if (!probe) { ret = AVERROR(ENOMEM); break; }
             for (int n = 0; n < 400; ++n) {
-                if (av_read_frame(fmtCtx_, probe) < 0) break;
+                if (dovi_.readProbe(probe, [this](AVPacket* p) { return av_read_frame(fmtCtx_, p); }) < 0) break;
                 if (probe->stream_index == videoStream_) {
                     foundVideo = true;
                     foundKey = (probe->flags & AV_PKT_FLAG_KEY) != 0;
+                    videoPos = DoviTransport::landingPos(probe);
+                    doviPaired = doviPacketEnhancement(probe) != nullptr;
+                    if (probe->pts != AV_NOPTS_VALUE)
+                        videoPtsUs = av_rescale_q(probe->pts, fmtCtx_->streams[videoStream_]->time_base, AV_TIME_BASE_Q);
                     av_packet_unref(probe);
                     break;
                 }
@@ -6431,7 +6611,9 @@ int Demuxer::seekToUs(int64_t us, bool forwardKeyframe,
             av_packet_free(&probe);
             if (foundKey || !foundVideo || tryUs == floorAbsUs) {
 
-                int rret = seekAttempt();
+                int rret = foundVideo && videoPos >= 0 && dovi_.active() && tsMpegTs_
+                    ? dovi_.tsByteReplay(fmtCtx_, videoStream_, videoPos, videoPtsUs, doviPaired, abortFn)
+                    : seekAttempt();
                 if (rret < 0) ret = rret;
                 if (spDebug() && attempt > 0) {
                     int64_t relUs = tryUs - timelineOriginUs_;
@@ -6445,11 +6627,11 @@ int Demuxer::seekToUs(int64_t us, bool forwardKeyframe,
             if (attempt == 0 && tsMpegTs_ && !tsRapScanRetired_ &&
                 !tsRapScanDisabled_) {
                 int64_t rapPts = AV_NOPTS_VALUE;
-                bool capped = false;
+                bool capped = false, rapPaired = false;
                 const int64_t scanT0 = spNowUs();
                 const int64_t rapPos =
                     findTsRapPos(absUs + gridTolUs, streamIndex, forwardKeyframe,
-                                 floorAbsUs, abortFn, &rapPts, &capped);
+                                 floorAbsUs, abortFn, &rapPts, &capped, &rapPaired);
                 if (capped) {
                     tsRapScanRetired_ = true;
                     if (spDebug()) {
@@ -6461,8 +6643,9 @@ int Demuxer::seekToUs(int64_t us, bool forwardKeyframe,
                 }
                 if (rapPos >= 0) {
 
-                    int bret = av_seek_frame(fmtCtx_, streamIndex, rapPos,
-                                             AVSEEK_FLAG_BYTE);
+                    int bret = dovi_.active()
+                        ? dovi_.tsByteReplay(fmtCtx_, videoStream_, rapPos, rapPts, rapPaired, abortFn)
+                        : av_seek_frame(fmtCtx_, streamIndex, rapPos, AVSEEK_FLAG_BYTE);
                     if (bret >= 0) {
                         if (spDebug()) {
                             int64_t relUs = rapPts - timelineOriginUs_;
@@ -6682,7 +6865,12 @@ void Demuxer::verifyMp4SeekRap(int64_t absUs, int streamIndex, bool forwardKeyfr
     for (int n = 0; n < 64; ++n) {
         AVPacket* probe = av_packet_alloc();
         if (!probe) break;
-        if (av_read_frame(fmtCtx_, probe) < 0) { av_packet_free(&probe); break; }
+        // Pushback is delivered directly, so associate the EL before retaining
+        // the verified BL RAP. Otherwise its enhancement RAP is skipped.
+        if (dovi_.readProbe(probe, [this](AVPacket* p) { return av_read_frame(fmtCtx_, p); }) < 0) {
+            av_packet_free(&probe);
+            break;
+        }
         seekPushback_.push_back(probe);
         if (probe->stream_index == videoStream_) {
             landedPos = probe->pos;

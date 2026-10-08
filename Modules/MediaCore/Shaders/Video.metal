@@ -9,10 +9,39 @@ static_assert(alignof(Uniforms) == 4, "CPU Uniforms alignment mismatch");
 static_assert(__builtin_offsetof(Uniforms, uvals) == 0,
               "CPU Uniforms field offset mismatch");
 
-struct DoviUniforms {
-    float v[232];
+namespace dovi_gpu {
+enum Offset : int {
+    YccToRgb = 0, YccOffset = 9, RgbToLms = 12,
+    MinPq = 21, MaxPq = 22, FullRange = 23, HasCurves = 24,
+    ActiveLeft = 25, ActiveRight = 26, ActiveTop = 27,
+    Components = 28, Mmr = 160,
+    ElLumaOffsetX = 38, ElLumaOffsetY = 39,
+    ElChromaOffsetX = 82, ElChromaOffsetY = 83,
+    Reconstructed = 126, PublicCurveEnabled = 127,
+    PublicCurveC1 = 183, PublicCurveC2 = 207, PublicCurveC3 = 231,
+    PublicCurveSourcePeak = 255, PublicCurveBlack = 279,
+    NlqMaxY = 303, NlqMaxCb = 327, NlqMaxCr = 351,
+    Valid = 736, NeedsEnhancement = 737, HasLevel1 = 738, EnhancementTenBit = 739,
+    Nlq = 740, ActiveBottom = 749,
+    SceneMinPq = 750, SceneMaxPq = 751, SceneAvgPq = 752,
+    SdrInHdrLayer = 753, TrimCount = 754, TrimEnabled = 755, TrimValues = 756,
+    TrimSlope = 756, TrimOffset = 757, TrimPower = 758, TrimChroma = 759, TrimSaturation = 760,
+    Cm4Status = 761, Cm4MinPq = 762, Cm4MaxPq = 763, Cm4AvgPq = 764,
+    Cm4Selected = 765, HasLevel8 = 766, Cm4ExactOnly = 767, TrimTable = 768,
 };
-static_assert(sizeof(DoviUniforms) == 928, "CPU DoviUniforms size mismatch");
+constant int FloatCount = 992;
+constant int MaxPieces = 8;
+constant int ComponentStride = 44;
+constant int PieceOffset = 12;
+constant int PieceStride = 4;
+constant int MmrStride = 24;
+constant int NlqStride = 3;
+} // namespace dovi_gpu
+struct DoviUniforms {
+    float v[992];
+};
+static_assert(sizeof(DoviUniforms) == 3968, "CPU DoviUniforms size mismatch");
+static_assert(sizeof(DoviUniforms) == dovi_gpu::FloatCount * sizeof(float), "DoviUniforms bound");
 static_assert(alignof(DoviUniforms) == 4,
               "CPU DoviUniforms alignment mismatch");
 static_assert(__builtin_offsetof(DoviUniforms, v) == 0,
@@ -32,6 +61,7 @@ constant int fcOutputMode [[function_constant(6)]];
 constant int fcSourceGamut [[function_constant(7)]];
 constant int fcPlanar     [[function_constant(8)]];
 constant int fcSdrBoost   [[function_constant(9)]];
+constant int fcSdrInHdrLayer [[function_constant(10)]];
 constant bool kSpec = is_function_constant_defined(fcPrimaries);
 
 #pragma mark - Full-screen triangle
@@ -279,8 +309,79 @@ float3 toneMap(float3 lin10k, float contentPeak, float targetPeak) {
     return num / (1.0 + x);
 }
 
+// SMPTE ST 2094-10 Annex B equations 8/9, following the player's base tone
+// mapping. CPU selects authored L2 targets; neutral or unavailable trims skip
+// this work. RGB is linear in the actual output gamut, normalized to its peak.
+float3 doviDisplayTrim(float3 rgb, float3 luma, constant DoviUniforms& dv) {
+    if (dv.v[dovi_gpu::TrimEnabled] < 0.5) return rgb;
+    float3 f = pow(clamp(rgb * dv.v[dovi_gpu::TrimSlope] + dv.v[dovi_gpu::TrimOffset], 0.0, 1.0),
+                   float3(dv.v[dovi_gpu::TrimPower]));
+    const float y = max(dot(f, luma), 1e-8);
+    // ST 2094-10 Annex B eq. 9: G = F * ((1 + chroma) * F / Y)^saturation.
+    return f * pow(max((1.0 + dv.v[dovi_gpu::TrimChroma]) * f / y, 1e-8),
+                   float3(dv.v[dovi_gpu::TrimSaturation]));
+}
+
+static float3 doviPublicToneMap(float3 nits, constant DoviUniforms& dv) {
+    float3 x = max(nits, 0.0) / dv.v[dovi_gpu::PublicCurveSourcePeak];
+    return clamp((dv.v[dovi_gpu::PublicCurveC1] + dv.v[dovi_gpu::PublicCurveC2] * x) /
+                 (1.0 + dv.v[dovi_gpu::PublicCurveC3] * x),
+                 dv.v[dovi_gpu::PublicCurveBlack], 1.0);
+}
+
+static float doviInterpolateCodes(float4 samples, float2 f, float offset, bool tenBit) {
+    float4 codes = floor(samples * (tenBit ? 65535.0 : 255.0) + 0.5);
+    if (tenBit) codes = floor(codes / 64.0); // P010 high-aligned code words
+    float maximum = tenBit ? 1023.0 : 255.0;
+    codes -= offset * maximum;
+    // Metal gather order: (lo.x,hi.y), (hi.x,hi.y), (hi.x,lo.y), (lo.x,lo.y).
+    return mix(mix(codes.w,codes.z,f.x), mix(codes.x,codes.y,f.x), f.y) / maximum;
+}
+
+// Hardware UNorm bilinear filtering may round a fractional EL code to the
+// neutral code, crossing LINEAR_DZ's discontinuity. Interpolate decoded integer
+// codes explicitly; subtract the neutral code first to retain near-zero detail.
+// This is FEL-only and needs no intermediate image or additional render pass.
+static float2 doviCenteredSample(texture2d<float> tex, float2 uv, float2 offset, bool tenBit) {
+    float2 size = float2(tex.get_width(), tex.get_height());
+    float2 p = uv * size - 0.5, lo = floor(p), f = p - lo;
+    // Anchor the gather in the middle of its four texels, away from footprint
+    // boundaries; retain the original full-precision weights for interpolation.
+    float2 gatherUV = (lo + 1.0) / size;
+    constexpr sampler gatherSampler(coord::normalized, address::clamp_to_edge, filter::nearest);
+    return float2(doviInterpolateCodes(tex.gather(gatherSampler,gatherUV,int2(0),component::x), f, offset.x, tenBit),
+                  doviInterpolateCodes(tex.gather(gatherSampler,gatherUV,int2(0),component::y), f, offset.y, tenBit));
+}
+
+static float3 doviResidual(texture2d<float> yTex, texture2d<float> uvTex,
+                          float2 uv, constant DoviUniforms& dv) {
+    constant float *nlq = dv.v + dovi_gpu::Nlq; // per component: offset, slope, threshold
+    const bool tenBit = dv.v[dovi_gpu::EnhancementTenBit] > 0.5;
+    float3 centered = float3(
+        doviCenteredSample(yTex, uv + float2(dv.v[dovi_gpu::ElLumaOffsetX], dv.v[dovi_gpu::ElLumaOffsetY]),
+                           float2(nlq[0], 0), tenBit).r,
+        doviCenteredSample(uvTex, uv + float2(dv.v[dovi_gpu::ElChromaOffsetX], dv.v[dovi_gpu::ElChromaOffsetY]),
+                           float2(nlq[dovi_gpu::NlqStride], nlq[2 * dovi_gpu::NlqStride]), tenBit));
+    // Interpolated texture coordinates can leave two float ULPs at an exact
+    // neutral crossing. This bound is <0.00025 of one 10-bit code step.
+    centered = select(centered, float3(0.0), abs(centered) <= 2.384185791015625e-7);
+    constexpr int S = dovi_gpu::NlqStride;
+    float3 slope = float3(nlq[1], nlq[S + 1], nlq[2 * S + 1]);
+    float3 threshold = float3(nlq[2], nlq[S + 2], nlq[2 * S + 2]);
+    // LINEAR_DZ output is bounded by vdr_in_max (final words of MMR records 5-7).
+    float3 bound = float3(dv.v[dovi_gpu::NlqMaxY], dv.v[dovi_gpu::NlqMaxCb], dv.v[dovi_gpu::NlqMaxCr]);
+    return sign(centered) * min(abs(centered) * slope + threshold, bound);
+}
+
+// L5 describes the active picture. Preserve encoded bars outside it when a
+// positive trim offset would otherwise lift them. This never crops the image.
+bool doviActiveArea(float2 uv, constant DoviUniforms& dv) {
+    return uv.x >= dv.v[dovi_gpu::ActiveLeft] && uv.x < dv.v[dovi_gpu::ActiveRight] &&
+           uv.y >= dv.v[dovi_gpu::ActiveTop] && uv.y < dv.v[dovi_gpu::ActiveBottom];
+}
+
 float doviReshapeComp(int c, float3 s, constant float *v) {
-    int C = 28 + c * 44;
+    int C = dovi_gpu::Components + c * dovi_gpu::ComponentStride;
     int np = int(v[C]);
     float x = s[c];
     if (np <= 0) return x;
@@ -288,12 +389,12 @@ float doviReshapeComp(int c, float3 s, constant float *v) {
     for (int i = 1; i < np; i++) {
         if (x >= v[C + 1 + i]) p = i;
     }
-    int P = C + 12 + p * 4;
+    int P = C + dovi_gpu::PieceOffset + p * dovi_gpu::PieceStride;
     if (v[P] < 0.5) {
-        return v[P + 1] + v[P + 2] * x + v[P + 3] * x * x;
+        return clamp(v[P + 1] + v[P + 2] * x + v[P + 3] * x * x, v[C+1], v[C+1+np]);
     }
 
-    int M = 160 + c * 24;
+    int M = dovi_gpu::Mmr + (c * dovi_gpu::MaxPieces + p) * dovi_gpu::MmrStride;
     int order = int(v[M]);
     float t[7] = {s.x, s.y, s.z, s.x * s.y, s.x * s.z, s.y * s.z, s.x * s.y * s.z};
     float r = v[M + 1];
@@ -304,16 +405,53 @@ float doviReshapeComp(int c, float3 s, constant float *v) {
             r += v[M + 2 + o * 7 + j] * tp;
         }
     }
-    return r;
+    return clamp(r, v[C+1], v[C+1+np]);
 }
 
 #pragma mark - Fragments
+
+// Shared reconstruction, before display management. Real playback remains a
+// single render pass; only requested DV interpolation/preview work uses compute.
+static float3 doviReconstruct(float3 sig, float2 uv,
+                              texture2d<float> elYTex, texture2d<float> elUVTex,
+                              constant DoviUniforms& dv) {
+    if (dv.v[dovi_gpu::HasCurves] > 0.5) {
+        sig = float3(doviReshapeComp(0, sig, dv.v),
+                     doviReshapeComp(1, sig, dv.v),
+                     doviReshapeComp(2, sig, dv.v));
+        sig = clamp(sig, 0.0, 1.0);
+    }
+    // FEL: reshape BL first, then add inverse-quantized EL residuals.
+    // Decoder has paired this EL with this exact BL PTS. No intermediate
+    // 4K RGB texture: composition shares the existing render pass.
+    if (dv.v[dovi_gpu::NeedsEnhancement] > 0.5) {
+        sig += doviResidual(elYTex, elUVTex, uv, dv);
+    }
+    constant float *ycc = dv.v + dovi_gpu::YccToRgb, *offset = dv.v + dovi_gpu::YccOffset;
+    float3 ipt = sig - float3(offset[0], offset[1], offset[2]);
+    float3 lmsPq = float3(
+        ycc[0] * ipt.x + ycc[1] * ipt.y + ycc[2] * ipt.z,
+        ycc[3] * ipt.x + ycc[4] * ipt.y + ycc[5] * ipt.z,
+        ycc[6] * ipt.x + ycc[7] * ipt.y + ycc[8] * ipt.z);
+    lmsPq = clamp(lmsPq, 0.0, 1.0);
+    float3 lms = float3(eotfPQ(lmsPq.x), eotfPQ(lmsPq.y), eotfPQ(lmsPq.z));
+    constant float *crosstalk = dv.v + dovi_gpu::RgbToLms;
+    lms = float3(
+        crosstalk[0] * lms.x + crosstalk[1] * lms.y + crosstalk[2] * lms.z,
+        crosstalk[3] * lms.x + crosstalk[4] * lms.y + crosstalk[5] * lms.z,
+        crosstalk[6] * lms.x + crosstalk[7] * lms.y + crosstalk[8] * lms.z);
+
+    float3 lin = spDoviHpeLmsToBt2020(lms);
+    return max(lin, 0.0); // 1.0 = 10000 nits
+}
 
 fragment float4 videoFragment(VertexOut in [[stage_in]],
                               texture2d<float> yTex [[texture(0)]],
                               texture2d<float> uvTex [[texture(1)]],
                               texture2d<float> subTex [[texture(2)]],
                               texture2d<float> vTex [[texture(3)]],
+                              texture2d<float> elYTex [[texture(4)]],
+                              texture2d<float> elUVTex [[texture(5)]],
                               constant Uniforms &u [[buffer(0)]],
                               constant DoviUniforms &dv [[buffer(1)]]) {
     constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
@@ -323,12 +461,14 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
     const bool is10bit   = (kSpec ? fcBits : int(u.uvals[7])) == 10;
     const bool fullRange = (kSpec ? fcRange : int(u.uvals[6])) == 1;
     const bool hasHdr    = (kSpec ? fcHdr : (u.uvals[8] > 0.5 ? 1 : 0)) == 1;
-    const bool doviIPT   = (kSpec ? fcDovi : (u.uvals[11] > 0.5 ? 1 : 0)) == 1;
+    const bool doviIPT   = fcDovi == 1; // every videoFragment PSO defines it (generic: DV or not)
     const bool edrOut    = (kSpec ? fcOutputMode : int(u.uvals[25])) == 1;
     const int  gamut     = kSpec ? fcSourceGamut : int(u.uvals[26]);
     const bool gamut2020 = gamut == 1;
     const bool planar    = (kSpec ? fcPlanar : int(u.uvals[30])) == 1;
     const bool sdrBoost  = kSpec ? (fcSdrBoost == 1) : (u.uvals[31] >= 1.0);
+    const bool sdrInHdrLayer = is_function_constant_defined(fcSdrInHdrLayer)
+        ? fcSdrInHdrLayer == 1 : dv.v[dovi_gpu::SdrInHdrLayer] > 0.5;
 
     bool inVideo = (in.uv.x >= 0.0 && in.uv.x <= 1.0 && in.uv.y >= 0.0 && in.uv.y <= 1.0);
     float3 out = float3(0.0);
@@ -370,7 +510,7 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
         Cr = uvTex.sample(s, suv).g;
     }
 
-    bool limitedRange = doviIPT ? (dv.v[23] < 0.5) : !fullRange;
+    bool limitedRange = !doviIPT && !fullRange;
     if (limitedRange) {
         if (is10bit) {
             Y  = (Y  - 64.0 / 1023.0) / (876.0 / 1023.0);
@@ -391,30 +531,18 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
     float3 lin = float3(0.0);
     float3 rgbEnc = float3(0.0);
 
-    const bool sdrPassthrough = !doviIPT && !hasHdr && !edrOut;
+    const bool sdrPassthrough = !doviIPT && !hasHdr && !edrOut && !sdrInHdrLayer;
     if (doviIPT) {
 
-        float3 sig = float3(Y, Cb, Cr);
-        if (dv.v[24] > 0.5) {
-            sig = float3(doviReshapeComp(0, sig, dv.v),
-                         doviReshapeComp(1, sig, dv.v),
-                         doviReshapeComp(2, sig, dv.v));
-            sig = clamp(sig, 0.0, 1.0);
+        if (dv.v[dovi_gpu::Reconstructed] > .5) {
+            // FRC already reconstructed these P010 pixels. Keep the RPU for
+            // display trims, but do not reshape or apply the FEL residual twice.
+            float3 pq = clamp(yuvToRgb(1, (Y*1023.0-64.0)/876.0,
+                (Cb*1023.0-512.0)/896.0, (Cr*1023.0-512.0)/896.0), 0.0, 1.0);
+            lin = float3(eotfPQ(pq.r), eotfPQ(pq.g), eotfPQ(pq.b));
+        } else {
+            lin = doviReconstruct(float3(Y,Cb,Cr), suv, elYTex, elUVTex, dv);
         }
-        float3 ipt = sig - float3(dv.v[9], dv.v[10], dv.v[11]);
-        float3 lmsPq = float3(
-            dv.v[0] * ipt.x + dv.v[1] * ipt.y + dv.v[2] * ipt.z,
-            dv.v[3] * ipt.x + dv.v[4] * ipt.y + dv.v[5] * ipt.z,
-            dv.v[6] * ipt.x + dv.v[7] * ipt.y + dv.v[8] * ipt.z);
-        lmsPq = clamp(lmsPq, 0.0, 1.0);
-        float3 lms = float3(eotfPQ(lmsPq.x), eotfPQ(lmsPq.y), eotfPQ(lmsPq.z));
-        lms = float3(
-            dv.v[12] * lms.x + dv.v[13] * lms.y + dv.v[14] * lms.z,
-            dv.v[15] * lms.x + dv.v[16] * lms.y + dv.v[17] * lms.z,
-            dv.v[18] * lms.x + dv.v[19] * lms.y + dv.v[20] * lms.z);
-
-        lin = spDoviHpeLmsToBt2020(lms);
-        lin = max(lin, 0.0);
     } else {
 
         rgbEnc = clamp(yuvToRgb(primaries, Y, Cb - chromaCenter, Cr - chromaCenter), 0.0, 1.0);
@@ -434,25 +562,43 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
     }
 
     float contentPeak = u.uvals[9];
-    if (doviIPT && dv.v[22] > 0.0) {
-        contentPeak = max(eotfPQ(dv.v[22]) * 10000.0, 203.0);
+    if (doviIPT && (dv.v[dovi_gpu::HasLevel1] > 0.5 || dv.v[dovi_gpu::MaxPq] > 0.0)) {
+        float peakPq = dv.v[dovi_gpu::HasLevel1] > 0.5 ? dv.v[dovi_gpu::SceneMaxPq] : dv.v[dovi_gpu::MaxPq];
+        contentPeak = max(eotfPQ(peakPq) * 10000.0, 203.0);
     }
     if (hasHdr) {
 
         if (edrOut) {
 
             float3 nits;
-            if (contentPeak > u.uvals[24]) {
-                nits = toneMap(lin, contentPeak, max(u.uvals[24], 1.0)) * u.uvals[24];
+            if (doviIPT && dv.v[dovi_gpu::PublicCurveEnabled] > .5 && doviActiveArea(suv,dv)) {
+                nits = doviPublicToneMap(spSourceToP3(gamut,lin*10000.0),dv) * u.uvals[24];
             } else {
-                nits = lin * 10000.0;
+                if (contentPeak > u.uvals[24])
+                    nits = toneMap(lin, contentPeak, max(u.uvals[24], 1.0)) * u.uvals[24];
+                else nits = lin * 10000.0;
+                nits = max(spSourceToP3(gamut, nits), float3(0.0));
             }
-            nits = max(spSourceToP3(gamut, nits), float3(0.0));
+            if (doviIPT && dv.v[dovi_gpu::TrimEnabled] > 0.5) {
+                if (doviActiveArea(suv, dv)) {
+                    const float peak = max(u.uvals[24], 1.0);
+                    nits = doviDisplayTrim(nits/peak, float3(0.22897,0.69174,0.07929), dv) * peak;
+                }
+            }
             out = oetfSRGBExt(nits / 100.0);
         } else {
 
-            float3 tm = toneMap(lin, max(contentPeak, 203.0), 203.0);
-            tm = clamp(spSourceTo709(gamut, tm), 0.0, 1.0);
+            float3 tm;
+            if (doviIPT && dv.v[dovi_gpu::PublicCurveEnabled] > .5 && doviActiveArea(suv,dv)) {
+                tm = doviPublicToneMap(spSourceTo709(gamut,lin*10000.0),dv);
+            } else {
+                tm = toneMap(lin, max(contentPeak, 203.0), 203.0);
+                tm = clamp(spSourceTo709(gamut, tm), 0.0, 1.0);
+            }
+            if (doviIPT && dv.v[dovi_gpu::TrimEnabled] > 0.5) {
+                if (doviActiveArea(suv, dv))
+                    tm = doviDisplayTrim(tm, float3(0.2126,0.7152,0.0722), dv);
+            }
             out = float3(oetfSRGB(tm.r), oetfSRGB(tm.g), oetfSRGB(tm.b));
         }
     } else if (sdrBoost && edrOut) {
@@ -461,6 +607,12 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
         float yEnc = dot(rgbEnc, gamut2020 ? float3(0.2627, 0.6780, 0.0593)
                                            : float3(0.2126, 0.7152, 0.0722));
         out = oetfSRGBExt(max(rgbP3 * spXdrGain2(yEnc, u.uvals[31], is10bit), float3(0.0)));
+    } else if (edrOut) {
+        // SDR fallback in an EDR DV session (e.g. damaged P8.2 RPU).
+        // Preserve SDR luminance while encoding for the actual P3 layer.
+        out = oetfSRGBExt(max(spSourceToP3(gamut, lin), float3(0.0)));
+    } else if (sdrInHdrLayer) {
+        out = oetfSRGBExt(clamp(spSourceTo709(gamut, lin), 0.0, 1.0));
     } else {
 
         out = rgbEnc;
@@ -495,7 +647,7 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
                 float3 enc;
                 if (edrOut) {
                     enc = oetfSRGBExt(max(m709ToP3 * linSub, float3(0.0)));
-                } else if (!hasHdr && !doviIPT) {
+                } else if (!hasHdr && !doviIPT && !sdrInHdrLayer) {
                     enc = oetfSdrTier(transfer, clamp(sp709ToSource(gamut, linSub), 0.0, 1.0));
                 } else {
                     enc = col;
@@ -670,63 +822,76 @@ static float oetfPQ(float lin) {
     return pow((c1 + c2 * ym) / (1.0 + c3 * ym), m2);
 }
 
-kernel void doviThumbConvert(texture2d<float, access::read> yTex [[texture(0)]],
-                             texture2d<float, access::read> uvTex [[texture(1)]],
+// Read native code words and interpolate chroma at the fragment's sample
+// positions, but exactly: the fragment's hardware-filtered 10-bit sample
+// truncates the interpolated code (up to one code), these compute paths do not.
+// meta.w distinguishes dav1d's low-aligned, three-plane 10-bit surfaces.
+static float3 doviSourceSignal(texture2d<float> yTex, texture2d<float> uvTex,
+                                texture2d<float> vTex, uint2 pixel, int4 meta) {
+    float2 uv = (float2(pixel)+.5) / float2(yTex.get_width(),yTex.get_height());
+    float y=yTex.read(pixel).r;
+    if (meta.x == 10) y=floor(y*65535.0+.5)/(meta.w ? 1023.0 : 65472.0);
+    const float2 chromaSize=float2(uvTex.get_width(),uvTex.get_height());
+    const float2 p=uv*chromaSize-.5, lo=floor(p), f=p-lo;
+    constexpr sampler gatherSampler(coord::normalized,address::clamp_to_edge,filter::nearest);
+    const float2 gatherUV=(lo+1.0)/chromaSize;
+    float4 cb=uvTex.gather(gatherSampler,gatherUV,int2(0),component::x);
+    float4 cr=meta.w ? vTex.gather(gatherSampler,gatherUV,int2(0),component::x)
+                    : uvTex.gather(gatherSampler,gatherUV,int2(0),component::y);
+    const float maximum=meta.x==10 ? 1023.0 : 255.0;
+    const float align=meta.x==10 && !meta.w ? 64.0 : 1.0;
+    const float unorm=meta.x==10 ? 65535.0 : 255.0;
+    cb=floor(floor(cb*unorm+.5)/align); cr=floor(floor(cr*unorm+.5)/align);
+    return clamp(float3(y,mix(mix(cb.w,cb.z,f.x),mix(cb.x,cb.y,f.x),f.y)/maximum,
+                         mix(mix(cr.w,cr.z,f.x),mix(cr.x,cr.y,f.x),f.y)/maximum),0.0,1.0);
+}
+
+// BT.2020 PQ RGBA16F is the common FRC working signal for all DV profiles.
+// Reconstruct each endpoint independently, including its own FEL enhancement.
+kernel void doviFrameToRGBA(texture2d<float> yTex [[texture(0)]],
+                             texture2d<float> uvTex [[texture(1)]],
+                             texture2d<float> elYTex [[texture(2)]],
+                             texture2d<float> elUVTex [[texture(3)]],
+                             texture2d<float> vTex [[texture(4)]],
+                             texture2d<half, access::write> out [[texture(5)]],
+                             constant DoviUniforms &dv [[buffer(0)]],
+                             constant int4 &meta [[buffer(1)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(meta.y) || gid.y >= uint(meta.z)) return;
+    float2 uv = (float2(gid)+.5) / float2(meta.y,meta.z);
+    float3 lin = doviReconstruct(doviSourceSignal(yTex,uvTex,vTex,gid,meta),uv,elYTex,elUVTex,dv);
+    float3 pq = clamp(float3(oetfPQ(lin.r),oetfPQ(lin.g),oetfPQ(lin.b)),0.0,1.0);
+    out.write(half4(half3(pq),half(1.0)),gid);
+}
+
+// Reconstruct BEFORE shrinking. Area-weighted linear-light integration avoids
+// averaging IPT/reshape inputs or FEL residuals before their nonlinear mapping.
+// Output is small; no full-resolution RGB intermediate or additional GPU pass.
+// meta.y/z are output dimensions, native dimensions come from the BL textures.
+kernel void doviThumbConvert(texture2d<float> yTex [[texture(0)]],
+                             texture2d<float> uvTex [[texture(1)]],
+                             texture2d<float> elYTex [[texture(2)]],
+                             texture2d<float> elUVTex [[texture(3)]],
                              constant DoviUniforms &dv [[buffer(0)]],
                              constant int4 &meta [[buffer(1)]],
                              device ushort4 *outPix [[buffer(2)]],
                              uint2 gid [[thread_position_in_grid]]) {
-    const uint W = uint(meta.y), H = uint(meta.z);
+    const uint W=uint(meta.y), H=uint(meta.z);
     if (gid.x >= W || gid.y >= H) return;
-    const bool is10bit = meta.x == 10;
-    const uint2 cg = uint2(min(gid.x / 2, uvTex.get_width() - 1),
-                           min(gid.y / 2, uvTex.get_height() - 1));
-    float Y, Cb, Cr;
-    if (is10bit) {
-        uint y16 = uint(yTex.read(gid).r * 65535.0 + 0.5);
-        float2 uv = uvTex.read(cg).rg;
-        uint u16 = uint(uv.x * 65535.0 + 0.5);
-        uint v16 = uint(uv.y * 65535.0 + 0.5);
-        Y  = float(y16 >> 6) / 1023.0;
-        Cb = float(u16 >> 6) / 1023.0;
-        Cr = float(v16 >> 6) / 1023.0;
-    } else {
-        Y  = yTex.read(gid).r;
-        float2 uv = uvTex.read(cg).rg;
-        Cb = uv.x;
-        Cr = uv.y;
-    }
-    if (dv.v[23] < 0.5) { // RPU signal_full_range=0：limited → full
-        if (is10bit) {
-            Y  = (Y  - 64.0 / 1023.0) / (876.0 / 1023.0);
-            Cb = (Cb - 64.0 / 1023.0) / (896.0 / 1023.0);
-            Cr = (Cr - 64.0 / 1023.0) / (896.0 / 1023.0);
-        } else {
-            Y  = (Y  - 16.0 / 255.0) / (219.0 / 255.0);
-            Cb = (Cb - 16.0 / 255.0) / (224.0 / 255.0);
-            Cr = (Cr - 16.0 / 255.0) / (224.0 / 255.0);
+    float2 nativeSize=float2(yTex.get_width(),yTex.get_height());
+    float2 scale=nativeSize/float2(W,H);
+    float2 lo=float2(gid)*scale, hi=min(float2(gid+1)*scale,nativeSize);
+    float3 sum=0.0;
+    for (uint y=uint(floor(lo.y)); y<uint(ceil(hi.y)); ++y) {
+        float wy=max(0.0,min(float(y+1),hi.y)-max(float(y),lo.y));
+        for (uint x=uint(floor(lo.x)); x<uint(ceil(hi.x)); ++x) {
+            float wx=max(0.0,min(float(x+1),hi.x)-max(float(x),lo.x));
+            uint2 p=min(uint2(x,y),uint2(nativeSize)-1);
+            float2 uv=(float2(p)+.5)/nativeSize;
+            sum+=wx*wy*doviReconstruct(doviSourceSignal(yTex,uvTex,uvTex,p,meta),uv,elYTex,elUVTex,dv);
         }
     }
-    float3 sig = clamp(float3(Y, Cb, Cr), 0.0, 1.0);
-    if (dv.v[24] > 0.5) {
-        sig = float3(doviReshapeComp(0, sig, dv.v),
-                     doviReshapeComp(1, sig, dv.v),
-                     doviReshapeComp(2, sig, dv.v));
-        sig = clamp(sig, 0.0, 1.0);
-    }
-    float3 ipt = sig - float3(dv.v[9], dv.v[10], dv.v[11]);
-    float3 lmsPq = float3(
-        dv.v[0] * ipt.x + dv.v[1] * ipt.y + dv.v[2] * ipt.z,
-        dv.v[3] * ipt.x + dv.v[4] * ipt.y + dv.v[5] * ipt.z,
-        dv.v[6] * ipt.x + dv.v[7] * ipt.y + dv.v[8] * ipt.z);
-    lmsPq = clamp(lmsPq, 0.0, 1.0);
-    float3 lms = float3(eotfPQ(lmsPq.x), eotfPQ(lmsPq.y), eotfPQ(lmsPq.z));
-    lms = float3(
-        dv.v[12] * lms.x + dv.v[13] * lms.y + dv.v[14] * lms.z,
-        dv.v[15] * lms.x + dv.v[16] * lms.y + dv.v[17] * lms.z,
-        dv.v[18] * lms.x + dv.v[19] * lms.y + dv.v[20] * lms.z);
-    float3 lin = max(spDoviHpeLmsToBt2020(lms), 0.0);
-    float3 pq = clamp(float3(oetfPQ(lin.r), oetfPQ(lin.g), oetfPQ(lin.b)), 0.0, 1.0);
-    outPix[gid.y * W + gid.x] = ushort4(ushort(pq.r * 65535.0 + 0.5), ushort(pq.g * 65535.0 + 0.5),
-                                        ushort(pq.b * 65535.0 + 0.5), 65535);
+    float3 lin=sum/max((hi.x-lo.x)*(hi.y-lo.y),1e-6);
+    float3 pq=clamp(float3(oetfPQ(lin.r),oetfPQ(lin.g),oetfPQ(lin.b)),0.0,1.0);
+    outPix[gid.y*W+gid.x]=ushort4(ushort3(pq*65535.0+.5),65535);
 }

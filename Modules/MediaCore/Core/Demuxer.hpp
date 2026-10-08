@@ -17,6 +17,8 @@
 #include "SPResilience.hpp"
 #include "Recovery/RecoveryTypes.hpp"
 #include "SPReadSourceView.hpp"
+#include "SPDoviTransport.hpp"
+#include "SPVideoOrientation.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -138,6 +140,10 @@ struct StreamInfo {
     int doviBlCompatId = 0;
 
     bool hasHdr10Plus = false;
+    // Container display matrix (iPhone portrait clips, rotated MP4/MOV, MKV
+    // projection roll) reduced to an axis-aligned rotate/mirror; identity
+    // when absent or not axis-aligned.
+    VideoOrientation orientation;
 
     int channels = 0;
     std::string channelLayout;
@@ -308,7 +314,8 @@ private:
 
     int64_t findTsRapPos(int64_t absUs, int streamIndex, bool forward,
                          int64_t floorAbsUs, const std::function<bool()>* abortFn,
-                         int64_t* outPtsUs, bool* cappedOut);
+                         int64_t* outPtsUs, bool* cappedOut,
+                         bool* outDoviPaired = nullptr);
 
     void noteTsKeyframePtsUs(int64_t relPtsUs);
     void computeTimelineOrigin();
@@ -353,6 +360,8 @@ private:
     bool growthResyncPending_ = false;
 
     int readFrameGrowthAware(AVPacket* pkt);
+    int readFrameRawGrowthAware(AVPacket* pkt);
+    int readFrameDoviJoined(AVPacket* pkt); // DV BL/EL join around readFrameRawGrowthAware
     bool growthActive() const;
 
     int growthRefreshOnStructuralEof();
@@ -372,6 +381,7 @@ private:
     std::string path_;
     std::vector<StreamInfo> streams_;
     int videoStream_ = -1;
+    DoviTransport dovi_; // demux-thread owned; buffered packets drop with seek pushback
     int audioStream_ = -1;
     int subtitleStream_ = -1;
     std::atomic<bool> eof_{false};
@@ -728,7 +738,8 @@ private:
     std::vector<int> aviIdxCursor_;
     bool tryAviChunkSizeReopen();
     bool attemptAviChunkSizeRecovery(int64_t lostTsUs, const std::string& why);
-    // ── FLV ──
+    bool aviWholeChainScanAffordable(const char* why) const;
+
     bool flvLike_ = false;                           // flv / live_flv
     bool flvExplosionTried_ = false;
     spresil::FlvAvcScanState flvAvcState_;

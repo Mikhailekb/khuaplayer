@@ -226,12 +226,26 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         activeGrantedSubtitleURL = nil
     }
 
+    private var failedDocumentGrantURL: URL?
+
+    private func retainFailedDocumentGrant() {
+        releaseFailedDocumentGrant()
+        failedDocumentGrantURL = activeGrantedDocumentURL
+        activeGrantedDocumentURL = nil
+    }
+
+    private func releaseFailedDocumentGrant() {
+        failedDocumentGrantURL?.stopAccessingSecurityScopedResource()
+        failedDocumentGrantURL = nil
+    }
+
 #endif
 
     deinit {
 #if SP_APP_STORE
         activeGrantedDocumentURL?.stopAccessingSecurityScopedResource()
         activeGrantedSubtitleURL?.stopAccessingSecurityScopedResource()
+        failedDocumentGrantURL?.stopAccessingSecurityScopedResource()
 #endif
         for token in observerTokens {
             NotificationCenter.default.removeObserver(token)
@@ -346,6 +360,30 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private var chromeInstalled = false
+
+    private var chromeInstallPending = false
+    static let chromeInstallFallback: TimeInterval = 0.3
+
+    private func scheduleChromeInstallAfterFirstFrame() {
+        guard !chromeInstalled else { return }
+        chromeInstallPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.chromeInstallFallback) { [weak self] in
+            self?.installPendingChrome()
+        }
+    }
+
+    private func installPendingChromeSoon() {
+        guard chromeInstallPending else { return }
+        DispatchQueue.main.async { [weak self] in self?.installPendingChrome() }
+    }
+
+    private func installPendingChrome() {
+        guard chromeInstallPending else { return }
+        chromeInstallPending = false
+        installChromeIfNeeded()
+        (NSApp.delegate as? AppDelegate)?.ensureMainMenu()
+    }
+
     private func installChromeIfNeeded() {
         guard !chromeInstalled, view.window != nil else { return }
         chromeInstalled = true
@@ -1236,7 +1274,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         return
 #else
         // Reset automatic prefetch priority for each welcome presentation.
-        if attempt == 0 { RecentPlaysWarmer.beginAutoWarmCycle() }
+        if attempt == 0 {
+            RecentPlaysWarmer.beginAutoWarmCycle()
+
+            RecentPlaysWarmer.registerWelcomeHeartbeat(owner: self) { [weak self] in
+                self?.welcomeHeartbeatState() ?? .gone
+            }
+        }
         DispatchQueue.main.asyncAfter(
             deadline: .now() + (attempt == 0 ? 0.15 : 1.2)) { [weak self] in
             guard let self, !self.hasMediaSession, !self.windowDestructionPending,
@@ -1267,6 +1311,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
 #endif
     }
+
+#if !SP_APP_STORE
+
+    private func welcomeHeartbeatState() -> WelcomeHeartbeatState {
+        guard !hasMediaSession, !windowDestructionPending,
+              let welcome, !welcome.isHidden, let window = view.window else { return .gone }
+        if window.isMiniaturized || NSApp.isHidden || !window.isVisible { return .paused }
+        return .active
+    }
+#endif
 
     /// Evaluate the default-player offer after the welcome window is visible.
     private func scheduleSetDefaultOfferEvaluation() {
@@ -1318,6 +1372,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var recentOpenToken = 0
 
     private static var recentExistsProbesInFlight = Set<String>()
+
+    private struct RecentProbeRequester {
+        weak var controller: PlayerViewController?
+        let token: Int
+    }
+    private static var recentProbeRequesters: [String: RecentProbeRequester] = [:]
     private var recentOpenSettled = 0
 
     func openRecentEntry(path: String) {
@@ -1326,6 +1386,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         // Yield speculative reads before the existence check and actual open,
         // covering the interval before the playback state changes to opening.
         SPBackgroundStorageGate.noteForegroundActivity()
+        RecentPlaysWarmer.noteForegroundOpen(path: path)
         recentOpenToken &+= 1
         let token = recentOpenToken
         if spDebugEnabled {
@@ -1337,12 +1398,34 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             view.window?.makeKeyAndOrderFront(nil)
         }
 
+        Self.recentProbeRequesters[path] = RecentProbeRequester(controller: self, token: token)
         if Self.recentExistsProbesInFlight.insert(path).inserted {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let exists = FileManager.default.fileExists(atPath: path)
+        DispatchQueue.global(qos: .userInitiated).async {
+#if SP_APP_STORE
 
-            let parentExists = exists || FileManager.default.fileExists(
-                atPath: (path as NSString).deletingLastPathComponent)
+            var grantedURL: URL?
+            var accessible = true
+            var volumeUnavailable = false
+            switch SPRecentBookmarks.resolveStartingAccess(path: path) {
+            case .granted(let url):
+                grantedURL = url
+            case .volumeUnavailable:
+                volumeUnavailable = true
+            case .unavailable:
+                accessible = SPFolderGrants.ensureAccess(path: path)
+            }
+            let targetPath = grantedURL?.path ?? path
+#else
+            let grantedURL: URL? = nil
+            let accessible = true
+            let volumeUnavailable = false
+            let targetPath = path
+#endif
+            let probe = accessible && !volumeUnavailable
+            let exists = probe && FileManager.default.fileExists(atPath: targetPath)
+
+            let parentExists = exists || (probe && FileManager.default.fileExists(
+                atPath: (targetPath as NSString).deletingLastPathComponent))
             if spDebugEnabled {
                 NSLog("[RecentOpen] window=%ld token=%ld probe completed +%.0fms exists=%d parentExists=%d",
                       diagnosticWindow, token,
@@ -1351,17 +1434,40 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             }
             DispatchQueue.main.async {
                 Self.recentExistsProbesInFlight.remove(path)
+                let requester = Self.recentProbeRequesters.removeValue(forKey: path)
 
-                guard let self, token == self.recentOpenToken,
-                      self.recentOpenSettled < token else { return }
-                self.recentOpenSettled = token
-                if exists {
+                guard let requester, let self = requester.controller,
+                      requester.token == self.recentOpenToken,
+                      self.recentOpenSettled < requester.token else {
+                    if let grantedURL { spReleaseSecurityScopedGrant(grantedURL) }
+                    return
+                }
+                self.recentOpenSettled = requester.token
+                if !accessible {
+#if SP_APP_STORE
+                    self.requestRecentReauthorization(path: path)
+#endif
+                } else if exists {
                     // Avoid an implicit filesystem probe on the main thread.
-                    self.open(url: URL(fileURLWithPath: path, isDirectory: false),
-                              incomingSecurityScopedGrant: false)
+                    if let grantedURL {
+#if SP_APP_STORE
+                        if URL(fileURLWithPath: path).standardizedFileURL.path
+                            != grantedURL.standardizedFileURL.path {
+                            self.openMovedRecent(grantedURL, recordedPath: path,
+                                                 token: requester.token)
+                            return
+                        }
+#endif
+                        self.open(url: grantedURL, incomingSecurityScopedGrant: true)
+                    } else {
+                        self.open(url: URL(fileURLWithPath: targetPath, isDirectory: false),
+                                  incomingSecurityScopedGrant: false)
+                    }
                 } else if !parentExists {
+                    if let grantedURL { spReleaseSecurityScopedGrant(grantedURL) }
                     self.welcome?.showTransientNotice(L("welcome.volumeUnavailable"))
                 } else {
+                    if let grantedURL { spReleaseSecurityScopedGrant(grantedURL) }
                     Self.resumeSaveQueue.async {
                         RecentPlays.remove(path: path)
                         DispatchQueue.main.async { [weak self] in
@@ -1373,6 +1479,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             }
         }
         }
+#if !SP_APP_STORE
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self, token == self.recentOpenToken,
                   self.recentOpenSettled < token else { return }
@@ -1386,7 +1494,54 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             self.open(url: URL(fileURLWithPath: path, isDirectory: false),
                       incomingSecurityScopedGrant: false)
         }
+#endif
     }
+
+#if SP_APP_STORE
+
+    private func openMovedRecent(_ url: URL, recordedPath: String, token: Int) {
+        let newPath = url.path
+        if let pending = Self.pendingResumeByPath.removeValue(forKey: recordedPath) {
+            Self.pendingResumeByPath[newPath] = pending
+        }
+        Self.resumeSaveQueue.async {
+            RecentPlays.rename(from: recordedPath, to: newPath, title: url.lastPathComponent)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.recentOpenToken == token else {
+                    spReleaseSecurityScopedGrant(url)
+                    return
+                }
+                self.open(url: url, incomingSecurityScopedGrant: true)
+            }
+        }
+    }
+
+    private func requestRecentReauthorization(path: String) {
+        let url = URL(fileURLWithPath: path, isDirectory: false)
+        let token = recentOpenToken
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = url.deletingLastPathComponent()
+        panel.message = String(format: L("access.recent.reauthorizeFmt"),
+                               url.lastPathComponent)
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let picked = panel.url else { return }
+
+            guard let self, self.recentOpenToken == token else {
+                spReleaseSecurityScopedGrant(picked)
+                return
+            }
+            self.open(url: picked, incomingSecurityScopedGrant: true)
+        }
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            finish(panel.runModal())
+        }
+    }
+#endif
 
     private func dismissFailurePresentation() {
         core?.cancelIndexWait()
@@ -1394,6 +1549,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         failureTracker.reset()
         lastFailedOpenURL = nil
         welcome?.hideFailureNotice()
+#if SP_APP_STORE
+        releaseFailedDocumentGrant()
+#endif
     }
 
     func open(url: URL, incomingSecurityScopedGrant: Bool = true) {
@@ -1425,6 +1583,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func performOpenRequest(url: URL, incomingSecurityScopedGrant: Bool) {
         SPBackgroundStorageGate.noteForegroundActivity() // Includes drag-and-drop and menu opens.
+        RecentPlaysWarmer.noteForegroundOpen(path: url.path)
         recentOpenToken &+= 1
         recentOpenSettled = recentOpenToken
         SPMainThreadSentinel.phase("open.ensureCore") {
@@ -1447,15 +1606,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 }
             } else {
                 if incomingSecurityScopedGrant { spReleaseSecurityScopedGrant(url) }
-                let alert = NSAlert()
-                alert.alertStyle = .informational
-                alert.messageText = L("subtitle.load.noVideo")
-                alert.addButton(withTitle: L("privacy.summary.ok"))
-                if let window = view.window {
-                    alert.beginSheetModal(for: window)
-                } else {
-                    _ = alert.runModal()
-                }
+
+                showTransientNotice(L("subtitle.load.noVideo"))
             }
             return
         }
@@ -1498,9 +1650,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             dismissEmptyStateForOpening()
         }
 
-        DispatchQueue.main.async { [weak self] in
-            self?.installChromeIfNeeded()
-        }
+        scheduleChromeInstallAfterFirstFrame()
 
         currentForcedAspectTag = 0
         currentCropTag = 0
@@ -1580,9 +1730,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         // session can now relinquish its grants without breaking rollback.
         releaseActiveSubtitleGrant()
         releaseActiveDocumentGrant()
-        // Plain-path recent entries currently have no bookmark-backed grant.
         // Never manufacture a future stopAccessing call for a grant we did not own.
         activeGrantedDocumentURL = incomingSecurityScopedGrant ? url : nil
+
+        SPRecentBookmarks.remember(url)
 #endif
         playlistScanGeneration &+= 1
 
@@ -1597,11 +1748,32 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         userTouchedSubtitleSelection = false
 
         captionsMediaWillClose(unregisterCore: false)
-#if !SP_APP_STORE
-        SPMainThreadSentinel.phase("open.configureDirectory") {
-            configureDirectorySnapshot(for: url)
-        }
+
+        if SPFileAccess.mayScanAfterOpen(directory: url.deletingLastPathComponent()) {
+            SPMainThreadSentinel.phase("open.configureDirectory") {
+                configureDirectorySnapshot(for: url)
+            }
+        } else {
+#if SP_APP_STORE
+
+            let generation = playlistScanGeneration
+            let directory = url.deletingLastPathComponent().path
+            SPFolderGrants.checkAccess(path: directory) { [weak self] accessible in
+                guard accessible, let self, self.hasMediaSession,
+                      self.playlistScanGeneration == generation else {
+                    if spDebugEnabled { NSLog("[FileAccess] 无授权，跳过同目录扫描: %@", directory) }
+                    return
+                }
+                self.configureDirectorySnapshot(for: url)
+                self.runPendingDirectoryScanWhenFirstFramePresented()
+            }
+#else
+            if spDebugEnabled {
+                NSLog("[FileAccess] 无授权，跳过同目录扫描: %@",
+                      url.deletingLastPathComponent().path)
+            }
 #endif
+        }
     }
 
     @discardableResult
@@ -1948,6 +2120,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         directoryScanPollSequence &+= 1
         directoryScanPollAttempt = 0
         directoryScanNotBefore = 0
+        if spDebugEnabled {
+            NSLog("[SubScan] 同目录扫描放行: %@",
+                  request.mediaURL.deletingLastPathComponent().lastPathComponent)
+        }
         directorySnapshotRequest = SPDirectoryMediaIndex.shared.requestSnapshot(
             for: request.mediaURL.deletingLastPathComponent(),
             mediaExtensions: Self.mediaExtensions,
@@ -1957,6 +2133,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                   self.playlistScanGeneration == request.generation else { return }
             self.directorySnapshotRequest = nil
             self.pendingDirectoryScan = nil
+            if spDebugEnabled {
+                NSLog("[SubScan] 目录列举完成: 媒体 %d 字幕 %d", snapshot?.mediaFiles.count ?? -1,
+                      snapshot?.subtitleFileNames.count ?? -1)
+            }
             guard let snapshot else { return }
             self.applyDirectorySnapshot(snapshot, for: request.mediaURL,
                                         generation: request.generation,
@@ -2096,18 +2276,86 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     func playNextMedia() {
+#if SP_APP_STORE
+        if requestPlaylistFolderAccessIfNeeded() { return }
+#endif
         guard mediaList.count > 1 else { return }
         let next = (currentMediaIndex + 1) % mediaList.count
         open(url: mediaList[next])
     }
 
     func playPreviousMedia() {
+#if SP_APP_STORE
+        if requestPlaylistFolderAccessIfNeeded() { return }
+#endif
         guard mediaList.count > 1 else { return }
         let prev = (currentMediaIndex - 1 + mediaList.count) % mediaList.count
         open(url: mediaList[prev])
     }
 
+    private var playlistFolderAccessRequestable: Bool {
+#if SP_APP_STORE
+        guard hasMediaSession, mediaList.count <= 1,
+              currentMediaIndex >= 0, currentMediaIndex < mediaList.count else { return false }
+        let directory = mediaList[currentMediaIndex].deletingLastPathComponent().path
+
+        return !Self.declinedPlaylistFolders.contains(directory)
+            && !SPFolderGrants.isCovered(path: directory)
+#else
+        return false
+#endif
+    }
+
+#if SP_APP_STORE
+
+    private static var declinedPlaylistFolders = Set<String>()
+    private var playlistFolderAccessCheckInFlight = false
+
+    private func requestPlaylistFolderAccessIfNeeded() -> Bool {
+        guard playlistFolderAccessRequestable else { return false }
+
+        guard view.window?.attachedSheet == nil else { return true }
+        guard !playlistFolderAccessCheckInFlight else { return true }
+        let mediaURL = mediaList[currentMediaIndex]
+        let directory = mediaURL.deletingLastPathComponent()
+        let generation = playlistScanGeneration
+        let scan = { [weak self] in
+            guard let self, self.hasMediaSession,
+                  self.playlistScanGeneration == generation else { return }
+
+            self.configureDirectorySnapshot(for: mediaURL)
+            self.runPendingDirectoryScanWhenFirstFramePresented()
+        }
+
+        playlistFolderAccessCheckInFlight = true
+        SPFolderGrants.checkAccess(path: directory.path) { [weak self] accessible in
+            guard let self else { return }
+            self.playlistFolderAccessCheckInFlight = false
+
+            guard self.hasMediaSession, self.playlistScanGeneration == generation else { return }
+            if accessible {
+                scan()
+                return
+            }
+            guard self.view.window?.attachedSheet == nil else { return }
+            SPFolderGrants.requestAccess(to: directory, message: L("access.folder.playlistMessage"),
+                                         window: self.view.window) { granted in
+                guard granted else {
+                    Self.declinedPlaylistFolders.insert(directory.path)
+                    return
+                }
+                scan()
+            }
+        }
+        return true
+    }
+#endif
+
     func playerCore(_ core: SPPlayerCore, didChange state: SPPlayerState) {
+
+        if state != .opening, state != .playing || core.audioOnlySession {
+            installPendingChromeSoon()
+        }
         playbackSleep.update(isPlaying: state == .playing, hasVideo: hasVideoSession)
         playbackCursor?.setHasVideo(hasVideoSession)
         WindowDragEffect.applyTestHookIfNeeded(core: core, state: state, view: playerView)
@@ -2159,7 +2407,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             core.frameInterpolationMode = .off
 #if SP_APP_STORE
             releaseActiveSubtitleGrant()
-            releaseActiveDocumentGrant()
+
+            retainFailedDocumentGrant()
 #endif
         }
         if (state == .idle || state == .failed), !hasMediaSession,
@@ -2275,6 +2524,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if pendingDirectoryScan != nil,
            core.hasEverPresentedThisSession || core.audioOnlySession {
             runPendingDirectoryScanWhenFirstFramePresented()
+        }
+        if chromeInstallPending, core.hasEverPresentedThisSession || core.audioOnlySession {
+            installPendingChromeSoon()
         }
         if !isScrubbing {
             transitionPresentation(.timelineChanged(
@@ -2453,6 +2705,14 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if spDebugEnabled {
             NSLog("[UI] emptyState retry file=%@", url.lastPathComponent)
         }
+#if SP_APP_STORE
+
+        if let grant = failedDocumentGrantURL {
+            failedDocumentGrantURL = nil
+            open(url: grant, incomingSecurityScopedGrant: true)
+            return
+        }
+#endif
         open(url: url, incomingSecurityScopedGrant: false)
     }
 
@@ -2569,7 +2829,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             duration: core.duration,
             volumePercent: Double(core.volume) * 100,
             volumeBoostUnlocked: volumeBoostUnlocked,
-            hasMultipleMedia: mediaList.count > 1,
+            hasMultipleMedia: mediaList.count > 1 || playlistFolderAccessRequestable,
 
             frameInterpolationAvailable: core.frameInterpolationAvailable && !core.frameInterpolationContentBypassed,
             frameInterpolationRequested: core.frameInterpolationMode.rawValue != 0,
@@ -2771,7 +3031,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         guard let info = core?.mediaInfo() else { return }
 
         let preferredOrder = [
-            L("media.codec"), L("media.resolution"), L("media.fps"), L("media.bitrate"),
+            L("media.codec"), L("media.resolution"), L("media.rotation"), L("media.fps"), L("media.bitrate"),
             L("media.duration"), L("media.primaries"), L("media.trc"), L("media.depth"),
             L("media.hdrFormat"), L("media.maxcll"), L("media.maxfall"),
             L("media.decoder"), L("media.container"), L("media.audio"),
@@ -3742,27 +4002,92 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func captureScreenshot() {
         guard let core, let fp = core.currentFilePath else { return }
         let name = ((fp as NSString).lastPathComponent as NSString).deletingPathExtension
+        let baseName = "\(name)_screenshot_\(Int(core.position))"
+        let mediaDirectory = (fp as NSString).deletingLastPathComponent
+
+        core.captureScreenshotPNG { [weak self] png in
+            guard let self else { return }
+            guard let png else {
+                self.noteScreenshotResult(ok: false, path: "")
+                return
+            }
+            self.saveScreenshot(png, baseName: baseName, mediaDirectory: mediaDirectory)
+        }
+    }
+
+    private func saveScreenshot(_ png: Data, baseName: String, mediaDirectory: String) {
 #if SP_APP_STORE
-        let filename = "\(name)_screenshot_\(Int(core.position)).png"
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let saved = SPFolderGrants.ensureAccess(path: mediaDirectory)
+                ? Self.writeScreenshot(png, directory: mediaDirectory, baseName: baseName)
+                : nil
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let saved {
+                    self.noteScreenshotResult(ok: true, path: saved)
+                } else {
+                    self.presentScreenshotSavePanel(png, filename: baseName + ".png")
+                }
+            }
+        }
+#else
+
+        var directories = [mediaDirectory]
+        if let pictures = FileManager.default.urls(for: .picturesDirectory,
+                                                   in: .userDomainMask).first?.path,
+           pictures != mediaDirectory {
+            directories.append(pictures)
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+
+            var saved: String?
+            for directory in directories {
+                saved = Self.writeScreenshot(png, directory: directory, baseName: baseName)
+                if saved != nil { break }
+            }
+            DispatchQueue.main.async {
+                self?.noteScreenshotResult(ok: saved != nil, path: saved ?? "")
+            }
+        }
+#endif
+    }
+
+    nonisolated private static func writeScreenshot(_ png: Data, directory: String,
+                                                    baseName: String) -> String? {
+        for serial in 1..<1000 {
+            let name = serial == 1 ? baseName + ".png" : "\(baseName)_\(serial).png"
+            let path = (directory as NSString).appendingPathComponent(name)
+            let fd = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
+            if fd < 0 {
+                if errno == EEXIST { continue }
+                return nil
+            }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            do {
+                try handle.write(contentsOf: png)
+                try handle.close()
+                return path
+            } catch {
+                try? handle.close()
+                unlink(path)
+                return nil
+            }
+        }
+        return nil
+    }
+
+#if SP_APP_STORE
+    private func presentScreenshotSavePanel(_ png: Data, filename: String) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png]
         panel.nameFieldStringValue = filename
-        let save: (URL) -> Void = { [weak self, weak core] url in
-            guard let self, let core else {
+        let save: (URL) -> Void = { [weak self] url in
+            DispatchQueue.global(qos: .utility).async {
+                let ok = (try? png.write(to: url, options: .atomic)) != nil
                 url.stopAccessingSecurityScopedResource()
-                return
-            }
-
-            core.captureScreenshot(toPath: url.path) { [weak self] ok in
-                url.stopAccessingSecurityScopedResource()
-                guard let self else { return }
-                if ok {
-                    self.showControlsTemporarily()
-                    self.presentNonBlockingAlert(message: L("alert.screenshotSaved"),
-                                                 informative: url.path)
-                } else {
-                    self.presentNonBlockingAlert(message: L("alert.screenshotFailed"),
-                                                 informative: url.path)
+                DispatchQueue.main.async {
+                    self?.noteScreenshotResult(ok: ok, path: url.path)
                 }
             }
         }
@@ -3774,16 +4099,18 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         } else if panel.runModal() == .OK, let url = panel.url {
             save(url)
         }
-#else
-        let dir = (fp as NSString).deletingLastPathComponent
-
-        let base = "\(dir)/\(name)_screenshot_\(Int(core.position)).png"
-        core.captureScreenshot(toPath: base, uniquify: true) { [weak self] ok, out in
-            guard let self, ok else { return }
-            self.showControlsTemporarily()
-            self.presentNonBlockingAlert(message: L("alert.screenshotSaved"), informative: out)
-        }
+    }
 #endif
+
+    private func noteScreenshotResult(ok: Bool, path: String) {
+        guard ok else {
+            playbackNoticeView().showTransient(L("alert.screenshotFailed"))
+            return
+        }
+        showControlsTemporarily()
+
+        let folder = ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent
+        playbackNoticeView().showTransient(String(format: L("screenshot.notice.savedToFmt"), folder))
     }
 
     private func toggleFullscreen() {
@@ -4103,6 +4430,17 @@ extension PlayerViewController {
                     self.captionsController().startAutomation(context: ctx, spec: item)
                 }
             }
+        }
+    }
+}
+
+extension PlayerViewController: SPTransientNoticePresenting {
+
+    func showTransientNotice(_ text: String) {
+        if let welcome, !welcome.isHidden {
+            welcome.showTransientNotice(text)
+        } else {
+            playbackNoticeView().showTransient(text)
         }
     }
 }

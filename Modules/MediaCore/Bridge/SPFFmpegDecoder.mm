@@ -2,6 +2,9 @@
 #include "SPAv1CatchUpSkip.hpp"
 #include "SPSoftwareDecodePolicy.hpp"
 #include "SPVideoColorMetadata.hpp"
+#include "SPDoviRPU.hpp"
+#include "../Core/SPDoviConfig.hpp"
+#import "SPDoviFrame.h"
 #import "SPPlanarPixelFormat.h"
 
 #import <IOSurface/IOSurface.h>
@@ -18,6 +21,7 @@ extern "C" {
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <vector>
 
 struct SPPendingSoftwareFrame {
@@ -78,6 +82,7 @@ struct SPDav1dSurface : SPDav1dAllocBase {
     bool held = false;
     bool locked = false;
     bool stale = false;
+    bool emitted = false;
     int64_t idleSinceUs = 0;
 };
 
@@ -201,6 +206,29 @@ struct SPDav1dSurfacePool {
         return IOSurfaceCreate((__bridge CFDictionaryRef)props);
     }
 
+    // Standalone copy of an output surface (never pooled). Same plane layout,
+    // so the whole allocation is copied in one pass. Returns +1 or NULL.
+    static CVPixelBufferRef cloneOutput(const SPDav1dSurface *e) {
+        const int w = (int)IOSurfaceGetWidth(e->surface), h = (int)IOSurfaceGetHeight(e->surface);
+        const bool ten = IOSurfaceGetBytesPerElementOfPlane(e->surface, 0) == 2;
+        IOSurfaceRef copy = createSurface(w, h, ten, e->format);
+        if (!copy) return NULL;
+        CVPixelBufferRef pb = NULL;
+        if (IOSurfaceGetAllocSize(copy) == IOSurfaceGetAllocSize(e->surface) &&
+            IOSurfaceLock(e->surface, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess) {
+            if (IOSurfaceLock(copy, 0, NULL) == kIOReturnSuccess) {
+                memcpy(IOSurfaceGetBaseAddress(copy), IOSurfaceGetBaseAddress(e->surface),
+                       IOSurfaceGetAllocSize(copy));
+                IOSurfaceUnlock(copy, 0, NULL);
+                if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, copy, NULL, &pb) != kCVReturnSuccess)
+                    pb = NULL;
+            }
+            IOSurfaceUnlock(e->surface, kIOSurfaceLockReadOnly, NULL);
+        }
+        CFRelease(copy);
+        return pb;
+    }
+
     SPDav1dSurface *acquire(int w, int h, bool ten) {
         std::lock_guard<std::mutex> lock(mtx);
         const OSType fmt = spPlanarPixelFormat(ten, fullRange);
@@ -217,6 +245,7 @@ struct SPDav1dSurfacePool {
         for (SPDav1dSurface *e : entries) {
             if (reusableLocked(e)) {
                 e->held = true;
+                e->emitted = false;
                 e->idleSinceUs = 0;
                 IOSurfaceLock(e->surface, 0, NULL);
                 e->locked = true;
@@ -376,7 +405,10 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
     AVPacket *_av1SubPkt;
     int64_t _av1DroppedFrames;
 
-    Dav1dContext *_dav1d;
+    Dav1dContext *_dav1d;           // direct AV1 decode; DV previews also use swscale
+    bool _dav1dScaledOutput;        // P10 preview only: default allocator → small NV12/P010
+    std::unique_ptr<sp::DoviParser> _pictureDoviParser;
+    SPDoviMetadataBytes _pictureDoviBytes;
     SPDav1dSurfacePool *_dav1dPool;
     bool _dav1dSeqChecked;
     AVCodecParameters *_dav1dPar;
@@ -424,7 +456,8 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
     return self;
 }
 
-- (BOOL)planarOutputActive { return _dav1d != nullptr; }
+- (BOOL)planarOutputActive { return _dav1d && !_dav1dScaledOutput; }
+- (BOOL)doviPictureMetadataActive { return _dav1d && _dav1dSeqChecked && _pictureDoviParser != nullptr; }
 
 - (void)dealloc {
     [self shutdown];
@@ -445,6 +478,13 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
     _av1SkipArmed = false;
     _av1KeySelfChecked = false;
     _av1DroppedFrames = 0;
+
+    if (par->codec_id == AV_CODEC_ID_AV1) {
+        const auto *cfg = sp::doviConfig(par);
+        if (cfg && cfg->dv_profile == 10 && !cfg->el_present_flag)
+            _pictureDoviParser = std::make_unique<sp::DoviParser>(10,
+                cfg->dv_bl_signal_compatibility_id, cfg->dv_md_compression);
+    }
 
     _tbNum = tbNum > 0 ? tbNum : 1;
     _tbDen = tbDen > 0 ? tbDen : 1;
@@ -530,23 +570,11 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
               par->width, par->height,
               spParIsProbably10Bit(par) ? "10bit" : "8bit");
     }
+    [self armAv1CatchUpSkip:par];
 
-    if (isAv1 && !self.singleFrameMode) {
-#if SP_APP_STORE
-        static const bool noNrDrop = false;
-#else
-        static const bool noNrDrop = getenv("SP_NO_NRDROP") != nullptr;
-#endif
-        _av1SkipArmed = !noNrDrop;
-
-        if (_av1SkipArmed && par->extradata && par->extradata_size > 4) {
-            spav1::parseAv1CodecConfigRecord(par->extradata, (size_t)par->extradata_size,
-                                             &_av1Seq);
-        }
-    }
-
-    if (isAv1 && self.planarOutputEnabled &&
-        !(self.outputWidthHint > 1 && self.outputHeightHint > 1)) {
+    const bool scaledOutput = isAv1 && self.outputWidthHint > 1 && self.outputHeightHint > 1;
+    const bool scaledDovi = _pictureDoviParser && scaledOutput;
+    if (isAv1 && ((self.planarOutputEnabled && !scaledOutput) || scaledDovi)) {
         const int delay = lowDelay ? 1 : av1Plan.maxFrameDelay;
 
         const AVPixFmtDescriptor *pdesc = av_pix_fmt_desc_get((AVPixelFormat)par->format);
@@ -554,11 +582,13 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
                      (pdesc && strncmp(pdesc->name, "yuvj", 4) == 0);
         _rangeAuthoritative = (par->color_range != AVCOL_RANGE_UNSPECIFIED) ||
                               (pdesc && strncmp(pdesc->name, "yuvj", 4) == 0);
-        if ([self setupDav1dWithParameters:par maxFrameDelay:delay] == 0) {
+        if ([self setupDav1dWithParameters:par maxFrameDelay:delay scaledOutput:scaledDovi] == 0) {
             avcodec_free_context(&_ctx);
             _is10Bit = spParIsProbably10Bit(par);
+            if (scaledDovi) _swsSrcFmt = AV_PIX_FMT_NONE; // rebuild on first picture, including reused instances
             if (spDebug()) {
-                SPLOG(@"[SW] AV1 dav1d 直出启用：%dx%d 帧延迟=%d 线程=%d range=%s%s",
+                SPLOG(@"[SW] AV1 dav1d %@：%dx%d 帧延迟=%d 线程=%d range=%s%s",
+                      scaledDovi ? @"DV 缩略图逐帧元数据" : @"直出启用",
                       par->width, par->height, _dav1dMaxFrameDelay,
                       self.singleFrameMode ? 4 : 0,
                       _fullRange ? "full" : "limited",
@@ -567,6 +597,13 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
             return 0;
         }
         if (spDebug()) SPLOG(@"[SW] AV1 dav1d 直出不可用，回落 avcodec+swscale");
+    }
+    // Picture-associated DV metadata exists only on dav1d pictures. On this
+    // avcodec path the DV wrapper parses temporal units instead, so catch-up
+    // may drop non-reference frames again.
+    if (_pictureDoviParser) {
+        _pictureDoviParser.reset();
+        [self armAv1CatchUpSkip:par];
     }
 
     if (lowDelay && !self.singleFrameMode) {
@@ -729,6 +766,10 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
 }
 
 - (SPDecodedVideoOutput)decodePacketOutput:(const AVPacket *)pkt {
+    if (pkt && _pictureDoviParser) {
+        size_t size = 0;
+        if (av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &size)) _pictureDoviParser->reset();
+    }
     if (_dav1d) return [self dav1dDecodePacketOutput:pkt];
     if (!_ctx || !_frame) return SPDecodedVideoOutputEmpty();
     _lastErr = 0;
@@ -934,10 +975,32 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
     setOrRemove(kCVImageBufferColorPrimariesKey, color.primaries);
     setOrRemove(kCVImageBufferTransferFunctionKey, color.transferFunction);
     setOrRemove(kCVImageBufferYCbCrMatrixKey, color.yCbCrMatrix);
+    if (_preserveChromaLocation) {
+        CFStringRef location = nullptr;
+        // Interleaving unscaled 4:2:0 leaves the decoded sample lattice intact.
+        // swscale's reduced previews/interlaced fields need a different model.
+        if (CVPixelBufferGetWidth(buf) == size_t(frame->width) &&
+            CVPixelBufferGetHeight(buf) == size_t(frame->height) &&
+            !(frame->flags & AV_FRAME_FLAG_INTERLACED)) {
+            switch (frame->chroma_location) {
+                case AVCHROMA_LOC_LEFT: location = kCVImageBufferChromaLocation_Left; break;
+                case AVCHROMA_LOC_CENTER: location = kCVImageBufferChromaLocation_Center; break;
+                case AVCHROMA_LOC_TOPLEFT: location = kCVImageBufferChromaLocation_TopLeft; break;
+                case AVCHROMA_LOC_TOP: location = kCVImageBufferChromaLocation_Top; break;
+                case AVCHROMA_LOC_BOTTOMLEFT: location = kCVImageBufferChromaLocation_BottomLeft; break;
+                case AVCHROMA_LOC_BOTTOM: location = kCVImageBufferChromaLocation_Bottom; break;
+                default: break;
+            }
+        }
+        setOrRemove(kCVImageBufferChromaLocationTopFieldKey, location);
+        setOrRemove(kCVImageBufferChromaLocationBottomFieldKey, location);
+    }
     return buf;
 }
 
 - (void)flush {
+    if (_pictureDoviParser) _pictureDoviParser->reset();
+    _pictureDoviBytes.reset();
     if (_ctx) avcodec_flush_buffers(_ctx);
     if (_dav1d) dav1d_flush(_dav1d);
     _eofFlushed = false;
@@ -950,6 +1013,8 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
 }
 
 - (void)shutdown {
+    _pictureDoviParser.reset();
+    _pictureDoviBytes.reset();
 
     spAv1CtxRelease(&_av1ClaimBytes);
     if (_av1SubPkt) av_packet_free(&_av1SubPkt);
@@ -971,6 +1036,7 @@ static void spDav1dDataFree(const uint8_t *data, void *cookie) {
     _dav1dPool = nullptr;
     if (_dav1dPar) avcodec_parameters_free(&_dav1dPar);
     _dav1dSeqChecked = false;
+    _dav1dScaledOutput = false;
     if (_sws) { sws_freeContext(_sws); _sws = nullptr; }
     if (_frame) { av_frame_free(&_frame); }
     if (_ctx) { avcodec_free_context(&_ctx); }
@@ -1004,16 +1070,17 @@ static int spDav1dSeqSupported(const uint8_t *buf, size_t size, Dav1dSequenceHea
 }
 
 - (int)setupDav1dWithParameters:(const AVCodecParameters *)par
-                  maxFrameDelay:(int)delay {
-    spRegisterPlanarPixelFormats();
+                  maxFrameDelay:(int)delay
+                   scaledOutput:(BOOL)scaledOutput {
+    if (!scaledOutput) spRegisterPlanarPixelFormats();
 
     Dav1dSequenceHeader seq;
     int supported = -1;
     if (par->extradata && par->extradata_size > 4) {
         supported = spDav1dSeqSupported(par->extradata + 4, (size_t)par->extradata_size - 4, &seq);
     }
-    if (supported == 0) return -1;
-    _dav1dSeqChecked = supported == 1;
+    if (supported == 0 && !scaledOutput) return -1;
+    _dav1dSeqChecked = supported >= 0;
     if (_dav1dSeqChecked && !_rangeAuthoritative) {
         _rangeAuthoritative = true;
         _fullRange = seq.color_range != 0;
@@ -1032,10 +1099,13 @@ static int spDav1dSeqSupported(const uint8_t *buf, size_t size, Dav1dSequenceHea
     st.all_layers = 0;
     st.operating_point = 0;
     st.strict_std_compliance = 0;
-    auto *pool = new SPDav1dSurfacePool;
-    st.allocator.cookie = pool;
-    st.allocator.alloc_picture_callback = spDav1dAllocPicture;
-    st.allocator.release_picture_callback = spDav1dReleasePicture;
+    SPDav1dSurfacePool *pool = nullptr;
+    if (!scaledOutput) {
+        pool = new SPDav1dSurfacePool;
+        st.allocator.cookie = pool;
+        st.allocator.alloc_picture_callback = spDav1dAllocPicture;
+        st.allocator.release_picture_callback = spDav1dReleasePicture;
+    }
     Dav1dContext *ctx = nullptr;
     if (dav1d_open(&ctx, &st) < 0 || !ctx) {
         delete pool;
@@ -1043,7 +1113,8 @@ static int spDav1dSeqSupported(const uint8_t *buf, size_t size, Dav1dSequenceHea
     }
     _dav1d = ctx;
     _dav1dPool = pool;
-    pool->fullRange = _fullRange;
+    _dav1dScaledOutput = scaledOutput;
+    if (pool) pool->fullRange = _fullRange;
     _dav1dMaxFrameDelay = st.max_frame_delay;
     if (!_dav1dSeqChecked) {
         _dav1dPar = avcodec_parameters_alloc();
@@ -1052,17 +1123,35 @@ static int spDav1dSeqSupported(const uint8_t *buf, size_t size, Dav1dSequenceHea
     return 0;
 }
 
+- (void)armAv1CatchUpSkip:(const AVCodecParameters *)par {
+    _av1SkipArmed = false;
+    if (par->codec_id != AV_CODEC_ID_AV1 || self.singleFrameMode) return;
+#if SP_APP_STORE
+    static const bool noNrDrop = false;
+#else
+    static const bool noNrDrop = getenv("SP_NO_NRDROP") != nullptr;
+#endif
+    // Even undisplayed DV pictures can update an RPU reference. Decode
+    // through catch-up, then discard pixels after processing metadata.
+    _av1SkipArmed = !noNrDrop && !_pictureDoviParser;
+
+    if (_av1SkipArmed && par->extradata && par->extradata_size > 4) {
+        spav1::parseAv1CodecConfigRecord(par->extradata, (size_t)par->extradata_size,
+                                         &_av1Seq);
+    }
+}
+
 - (BOOL)dav1dCheckFirstPacket:(const AVPacket *)pkt {
     if (_dav1dSeqChecked || !pkt || !pkt->data || pkt->size <= 0) return YES;
     Dav1dSequenceHeader seq;
     const int supported = spDav1dSeqSupported(pkt->data, (size_t)pkt->size, &seq);
     if (supported < 0) return YES;
     _dav1dSeqChecked = true;
-    if (supported == 1) {
+    if (supported == 1 || _dav1dScaledOutput) {
         if (!_rangeAuthoritative) {
             _rangeAuthoritative = true;
             _fullRange = seq.color_range != 0;
-            _dav1dPool->fullRange = _fullRange;
+            if (_dav1dPool) _dav1dPool->fullRange = _fullRange;
             if (spDebug()) SPLOG(@"[SW] 序列头 range=%s 补齐流级未声明", _fullRange ? "full" : "limited");
         }
         return YES;
@@ -1136,20 +1225,53 @@ static int spDav1dSeqSupported(const uint8_t *buf, size_t size, Dav1dSequenceHea
     Dav1dData d;
     memset(&d, 0, sizeof(d));
     int r = [self dav1dWrapPacket:sendPkt into:&d];
-    if (r < 0) { _lastErr = r; return [self popPendingOutput]; }
+    if (r < 0) { _lastErr = r; if (_pictureDoviParser) _pictureDoviParser->reset(); return [self popPendingOutput]; }
 
     for (int guard = 0; guard < 64; guard++) {
         r = dav1d_send_data(_dav1d, &d);
         if (r != DAV1D_ERR(EAGAIN)) break;
         [self dav1dReceiveWithCatchUp:cuTarget drain:false decodeStartUs:tStart];
     }
-    if (d.data) dav1d_data_unref(&d);
+    if (d.data) {
+        dav1d_data_unref(&d);
+        if (_pictureDoviParser) _pictureDoviParser->reset();
+    }
     if (r < 0 && r != DAV1D_ERR(EAGAIN)) {
         _lastErr = r;
+        if (_pictureDoviParser) _pictureDoviParser->reset();
         return [self popPendingOutput];
     }
     [self dav1dReceiveWithCatchUp:cuTarget drain:false decodeStartUs:tStart];
     return [self popPendingOutput];
+}
+
+// DV-only workspace: ordinary AV1 does not construct/clear a reshape result.
+// dav1d scopes T.35 to the selected picture, including reference updates on
+// catch-up drops. The returned CFData is borrowed until the next parser call.
+- (CFDataRef)dav1dDoviMetadataForPicture:(const Dav1dPicture *)pic discard:(bool)discard {
+    sp::DoviReshape dovi;
+    // dav1d reports the country code separately from the rest of the prefix.
+    const uint8_t *provider = sp::kDoviT35Prefix + 1;
+    constexpr size_t providerSize = sizeof(sp::kDoviT35Prefix) - 1;
+    for (size_t i = 0; i < pic->n_itut_t35; ++i) {
+        const auto& t = pic->itut_t35[i];
+        if (t.country_code != sp::kDoviT35Prefix[0] || t.payload_size < 2 ||
+            t.payload[0] != provider[0] || t.payload[1] != provider[1]) continue;
+        if (t.payload_size < providerSize) {
+            _pictureDoviParser->reset(); dovi = {}; continue;
+        }
+        if (memcmp(t.payload, provider, providerSize)) continue;
+        if (_pictureDoviParser->parseAV1EMDF(t.payload + providerSize,
+            t.payload_size - providerSize, dovi) != sp::DoviParser::Result::Valid) {
+            // Keep processing later RPUs: an independent mapping can recover
+            // within this picture; a dependent one still fails closed.
+            _pictureDoviParser->reset(); dovi = {};
+        }
+    }
+    if (discard || !dovi.valid) return nullptr;
+    SPDoviUniforms gpu; sp::doviToGpuFloats(dovi, gpu.values);
+    _pictureDoviBytes.update(gpu);
+    return _pictureDoviBytes.get();
 }
 
 - (void)dav1dReceiveWithCatchUp:(int64_t)cuTarget
@@ -1162,7 +1284,7 @@ static int spDav1dSeqSupported(const uint8_t *buf, size_t size, Dav1dSequenceHea
         memset(&pic, 0, sizeof(pic));
         const int r = dav1d_get_picture(_dav1d, &pic);
         if (r == DAV1D_ERR(EAGAIN)) break;
-        if (r < 0) { _lastErr = r; break; }
+        if (r < 0) { _lastErr = r; if (_pictureDoviParser) _pictureDoviParser->reset(); break; }
         int64_t ptsUs;
         if (pic.m.timestamp != INT64_MIN && pic.m.timestamp != AV_NOPTS_VALUE) {
             ptsUs = av_rescale_q(pic.m.timestamp, (AVRational){(int)_tbNum, (int)_tbDen},
@@ -1176,20 +1298,30 @@ static int spDav1dSeqSupported(const uint8_t *buf, size_t size, Dav1dSequenceHea
                 : 40000;
             _synthNextPtsUs = ptsUs + (durUs > 0 ? durUs : 40000);
         }
-        if (cuTarget > 0 && ptsUs + 40000 < cuTarget) {
+        const bool discard = cuTarget > 0 && ptsUs + 40000 < cuTarget;
+        CFDataRef doviBytes = _pictureDoviParser
+            ? [self dav1dDoviMetadataForPicture:&pic discard:discard] : nullptr;
+        if (discard) {
             dav1d_picture_unref(&pic);
             if (!drain) break;
             continue;
         }
         const int64_t tWrap = prof ? spNowUs() : 0;
-        CVPixelBufferRef buf = [self dav1dWrapPicture:&pic];
+        CVPixelBufferRef buf = _dav1dScaledOutput ? [self dav1dScalePicture:&pic]
+                                                : [self dav1dWrapPicture:&pic];
+        if (buf && _pictureDoviParser) {
+            CVBufferRemoveAttachment(buf, kSPDoviFrameMetadata);
+            CVBufferSetAttachment(buf, kSPDoviPictureMetadata, kCFBooleanTrue, kCVAttachmentMode_ShouldNotPropagate);
+            if (doviBytes) CVBufferSetAttachment(buf, kSPDoviFrameMetadata, doviBytes,
+                kCVAttachmentMode_ShouldNotPropagate);
+        }
         dav1d_picture_unref(&pic);
         if (prof) {
             const int64_t tNow = spNowUs();
             _statDecodeUs += tWrap - tDecodeStart;
             _statConvertUs += tNow - tWrap;
             _statFrames++;
-            if (_statFrames % 60 == 0) {
+            if (_statFrames % 60 == 0 && _dav1dPool) {
                 SPLOG(@"[SW] 剖析: 解码 %.3fms/帧  包装(零拷贝) %.3fms/帧  共 %d 帧  池建 %zu 复用 %zu  scratch建 %zu 复用 %zu  %@",
                       _statDecodeUs / 1000.0 / _statFrames,
                       _statConvertUs / 1000.0 / _statFrames, _statFrames,
@@ -1206,17 +1338,52 @@ static int spDav1dSeqSupported(const uint8_t *buf, size_t size, Dav1dSequenceHea
     }
 }
 
+// Borrow decoded planes only for the duration of swscale. No full-size CV
+// surface or pixel copy is created; the returned buffer owns the small image.
+- (CVPixelBufferRef)dav1dScalePicture:(Dav1dPicture *)pic {
+    static const AVPixelFormat formats[4][3] = {
+        {AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY10LE, AV_PIX_FMT_GRAY12LE},
+        {AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_YUV420P12LE},
+        {AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV422P12LE},
+        {AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV444P10LE, AV_PIX_FMT_YUV444P12LE},
+    };
+    if (unsigned(pic->p.layout) >= 4 || (pic->p.bpc != 8 && pic->p.bpc != 10 && pic->p.bpc != 12)) {
+        _lastErr = AVERROR(EINVAL); return nullptr;
+    }
+    AVFrame frame = {};
+    frame.width = pic->p.w; frame.height = pic->p.h;
+    frame.format = formats[pic->p.layout][(pic->p.bpc - 8) / 2];
+    for (int i=0; i<3; ++i) {
+        frame.data[i] = static_cast<uint8_t *>(pic->data[i]);
+        frame.linesize[i] = int(pic->stride[i != 0]);
+    }
+    const auto *seq = pic->seq_hdr;
+    frame.color_range = seq ? (seq->color_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG) : AVCOL_RANGE_UNSPECIFIED;
+    frame.color_primaries = seq ? AVColorPrimaries(seq->pri) : AVCOL_PRI_UNSPECIFIED;
+    frame.color_trc = seq ? AVColorTransferCharacteristic(seq->trc) : AVCOL_TRC_UNSPECIFIED;
+    frame.colorspace = seq ? AVColorSpace(seq->mtrx) : AVCOL_SPC_UNSPECIFIED;
+    return [self frameToPixelBuffer:&frame];
+}
+
 - (CVPixelBufferRef)dav1dWrapPicture:(Dav1dPicture *)pic {
     auto *base = static_cast<SPDav1dAllocBase *>(pic->allocator_data);
 
     if (!base || base->scratch) { _lastErr = AVERROR(EINVAL); return NULL; }
     auto *e = static_cast<SPDav1dSurface *>(base);
     if (!e->pixelBuffer) { _lastErr = AVERROR(EINVAL); return NULL; }
+    bool reshown;
     {
         std::lock_guard<std::mutex> lock(_dav1dPool->mtx);
         if (e->locked) { IOSurfaceUnlock(e->surface, 0, NULL); e->locked = false; }
+        reshown = e->emitted;
+        e->emitted = true;
     }
-    CVPixelBufferRef buf = CVPixelBufferRetain(e->pixelBuffer);
+    // show_existing_frame outputs the same reference surface again. Per-picture
+    // DV attachments are rewritten downstream while the earlier output may still
+    // be queued, so a reshown DV picture gets its own copy.
+    CVPixelBufferRef buf = _pictureDoviParser && reshown
+        ? SPDav1dSurfacePool::cloneOutput(e) : CVPixelBufferRetain(e->pixelBuffer);
+    if (!buf) { _lastErr = AVERROR(ENOMEM); return NULL; }
     const Dav1dSequenceHeader *seq = pic->seq_hdr;
 
     const sp::SPCVColorMetadata color = sp::spResolveCVColorMetadata(

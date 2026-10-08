@@ -37,9 +37,9 @@ typedef BOOL (^SPThumbSeekBusyProbe)(void);
             videoStreamIndex:(int)videoStreamIndex // Selected playback video stream; negative chooses the first video stream.
                videoStreamId:(int)videoStreamId // Selected AVStream.id, or zero if unknown. Validate identity when independent
                                         // stream ordering differs; disable if the chosen stream cannot be found.
-                     doviIPT:(BOOL)doviIPT // Dolby Vision Profile 5 conversion produces BT.2020 PQ thumbnails
-                                        // using the same per-frame metadata representation as video rendering.
-           doviNalLengthSize:(int)doviNalLengthSize // RPU NAL-length prefix width from hvcC; ignored for Annex-B data.
+                     doviIPT:(BOOL)doviIPT // Dolby Vision without a compatible base (P5 IPTPQc2, P10.0/P20.0): frames
+                                        // without an RPU still use the Metal conversion (fixed fallback mapping),
+                                        // never a YCbCr interpretation.
                    idleProbe:(SPThumbIdleProbe)idleProbe
                seekBusyProbe:(nullable SPThumbSeekBusyProbe)seekBusyProbe
                     onUpdate:(void (^)(void))onUpdate; // Main-thread notification that another preview is available.

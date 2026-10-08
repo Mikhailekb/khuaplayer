@@ -111,14 +111,26 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.video</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Used to find subtitles and the next episode in the folder of the video you open.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Used to find subtitles and the next episode in the folder of the video you open.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Used to find subtitles and the next episode in the folder of the video you open.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Khua contributors</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Used to find subtitles and the next episode in the folder of the video you open.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Used to find subtitles and the next episode in the folder of the video you open.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Khua generates subtitles from the audio of the media you open. Processing takes place on this Mac.</string>
 	<key>SPProductName</key>

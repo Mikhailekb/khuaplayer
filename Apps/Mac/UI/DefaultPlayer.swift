@@ -1,6 +1,13 @@
 import AppKit
 import UniformTypeIdentifiers
 
+/// A window content controller that can show a one-line, self-dismissing
+/// notice (welcome list or playback area) instead of a modal alert.
+@MainActor
+protocol SPTransientNoticePresenting: AnyObject {
+    func showTransientNotice(_ text: String)
+}
+
 // ── Set as Default Player (App-menu panel, no separate settings page) ──
 //
 // The selected formats are associated with this app one UTI at a time through
@@ -103,9 +110,17 @@ enum SPDefaultPlayer {
         defaults.set(picked.map { $0.exts[0] }, forKey: appliedExtsDefaultsKey)
     }
 
-    /// Completion alert shared by the panel and the first-run prompt.
+    /// Completion feedback shared by the panel and the first-run prompt. Full
+    /// success is a transient notice in the host window: the user just chose
+    /// this, an alert that only says "done" adds a click. Partial failure still
+    /// needs a readable alert.
     private static func presentCompletion(ok: Int, failed: Int,
                                           over window: NSWindow?) {
+        if failed == 0,
+           let presenter = window?.contentViewController as? SPTransientNoticePresenting {
+            presenter.showTransientNotice(L("defaultPlayer.done.message", ok))
+            return
+        }
         let done = NSAlert()
         done.alertStyle = failed == 0 ? .informational : .warning
         done.messageText = L("defaultPlayer.done.title")

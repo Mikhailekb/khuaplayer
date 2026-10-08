@@ -125,6 +125,7 @@ struct SPBudgetEmitStat { uint8_t covered = 0; uint8_t toggled = 0; float benefi
     double _bufferSecondsRequested;
     bool _bufferForced;
     uint64_t _bytesPerFrame;
+    uint64_t _doviEnhancementBytes; // retained FEL surface; monotonic within a media session
     size_t _ringCapacityBase;
     SPBudgetMemoryPressure _memoryPressure;
     dispatch_source_t _memorySource;
@@ -402,6 +403,7 @@ struct SPBudgetEmitStat { uint8_t covered = 0; uint8_t toggled = 0; float benefi
         std::lock_guard<std::mutex> lock(_mtx);
         _engineEpoch++;
         _bytesPerFrame = spBudgetBytesPerFrame((uint32_t)std::max(info.videoWidth, 1), (uint32_t)std::max(info.videoHeight, 1), 0);
+        _doviEnhancementBytes = 0;
         [self applyRingCapacityLocked];
         _chainEnded = false;
         _filledOnce = false;
@@ -695,6 +697,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
 
 - (void)ensureEngineForWidth:(uint32_t)width height:(uint32_t)height format:(OSType)format {
     uint64_t epoch = 0, buildSeq = 0;
+    BOOL reconstructDovi = NO;
     SPFRCEngine *old = nil;
     {
         std::lock_guard<std::mutex> lock(_mtx);
@@ -704,6 +707,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         _engineState = 1;
         _engineWidth = width; _engineHeight = height; _engineFormat = format;
         epoch = _engineEpoch;
+        reconstructDovi = _media.dynamicHDRRequiresMetadata;
         buildSeq = ++_engineBuildSeq;
         old = _engine; _engine = nil; _metal = nil;
         _probePool.clear(); _blockPool.clear();
@@ -728,6 +732,7 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         SPFrameBudgetMetal *metal = [[SPFrameBudgetMetal alloc] initWithDevice:self->_device library:nil
                                                                           width:width height:height
                                                                     pixelFormat:format error:&error];
+        if (metal && reconstructDovi && ![metal enableDoviReconstructionWithError:&error]) metal = nil;
         SPFRCEngine *engine = nil;
         unsigned sessions = self->_fixedSessions;
         NSString *key = spBudgetCalibDefaultsKey(width, height);
@@ -758,7 +763,8 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
             if (self->_engineEpoch != epoch) {
                 stale = YES;
             } else {
-                self->_bytesPerFrame = spBudgetBytesPerFrame(width, height, format);
+                self->_bytesPerFrame = spBudgetBytesPerFrame(width, height,
+                    reconstructDovi ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : format) + self->_doviEnhancementBytes;
                 self->_memoryDesiredSessions = sessions;
                 [self applyRingCapacityLocked];
                 if (self->_memoryCap > 0 && sessions > self->_memoryCap) {
@@ -835,7 +841,8 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     SPInterpolationRoutingContext rc;
     rc.requested = mode != SPFrameInterpolationModeOff;
     rc.apiAvailable = rc.requested && SPFRCEngine.isAvailable;
-    rc.dynamicHDRUnsafe = _media.dynamicHDRUnsafe;
+    rc.dynamicHDRUnsafe = _media.dynamicHDRUnsafe ||
+        (_media.dynamicHDRRequiresMetadata && !spMotionDoviFrameEligible(buffer));
     rc.interlaced = _media.interlaced || ctx.interlaced;
     rc.scanUnknown = ctx.scanUnknown;
     rc.playbackRate = _live.playbackRate->load();
@@ -850,6 +857,18 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
     bool memoryShort = false;
     if (policyActive) {
         std::lock_guard<std::mutex> lock(_mtx);
+        if (_media.dynamicHDRRequiresMetadata) {
+            if (auto el = spDoviEnhancementFrame(buffer)) {
+                uint64_t bytes=0;
+                for (size_t p=0;p<CVPixelBufferGetPlaneCount(el);++p)
+                    bytes += CVPixelBufferGetBytesPerRowOfPlane(el,p) * CVPixelBufferGetHeightOfPlane(el,p);
+                if (bytes > _doviEnhancementBytes) {
+                    _doviEnhancementBytes = bytes;
+                    _bytesPerFrame = spBudgetBytesPerFrame(width,height,kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) + bytes;
+                    [self applyRingCapacityLocked];
+                }
+            }
+        }
         memoryShort = !_memoryFits;
     }
     if (memoryShort) {
@@ -949,7 +968,8 @@ static inline bool spBudgetEntryMatches(const SPBudgetEntry &e, uint32_t width, 
         const bool compatible = prev.eligible && eligible && !prev.chainEnd && prev.generation == generation &&
             CVPixelBufferGetWidth(prev.buffer) == width && CVPixelBufferGetHeight(prev.buffer) == height &&
             CVPixelBufferGetPixelFormatType(prev.buffer) == format &&
-            spMotionPairCompatibility(prev.buffer, buffer) == SPMotionPairCompatibility::Compatible;
+            spMotionPairCompatibility(prev.buffer, buffer, _media.dynamicHDRRequiresMetadata) ==
+                SPMotionPairCompatibility::Compatible;
         if (compatible && validTiming && cadenceOK) {
             prev.pair = SPBudgetPair{};
             prev.pair.eligible = true;

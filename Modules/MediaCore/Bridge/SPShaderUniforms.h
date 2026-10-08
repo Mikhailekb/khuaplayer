@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include "SPDoviUniformLayout.hpp"
 
 struct SPColorUniforms {
     float uvals[32];
@@ -26,7 +27,10 @@ static_assert(sizeof(SPColorUniforms::uvals) == 32 * sizeof(float));
 static_assert(sizeof(SPColorUniforms) == 128,
               "Video.metal Uniforms layout mismatch");
 
-inline constexpr std::size_t kSPDoviUniformFloatCount = 232;
+// Keep the ABI bound explicit for the independent CPU/Metal layout checker.
+inline constexpr std::size_t kSPDoviUniformFloatCount = 992;
+static_assert(kSPDoviUniformFloatCount == sp::dovi_gpu::FloatCount,
+              "DV serialization and constant-buffer bounds differ");
 
 struct SPDoviUniforms {
     float values[kSPDoviUniformFloatCount];
@@ -35,8 +39,8 @@ struct SPDoviUniforms {
 static_assert(std::is_standard_layout_v<SPDoviUniforms>);
 static_assert(alignof(SPDoviUniforms) == alignof(float));
 static_assert(offsetof(SPDoviUniforms, values) == 0);
-static_assert(sizeof(SPDoviUniforms::values) == 232 * sizeof(float));
-static_assert(sizeof(SPDoviUniforms) == 928,
+static_assert(sizeof(SPDoviUniforms::values) == 992 * sizeof(float));
+static_assert(sizeof(SPDoviUniforms) == 3968,
               "Video.metal DoviUniforms layout mismatch");
 
 inline constexpr std::size_t kSPDragFxUniformFloatCount = 16;

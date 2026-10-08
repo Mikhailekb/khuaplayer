@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var pendingOpenURLs: [URL] = []
     private var cliOpenIssued = false
     private var didFinishLaunchingCompleted = false
+    private var launchOpensMedia = false
 #if SP_INTERNAL_BUILD && !SP_APP_STORE
     private var reopenTestClickDelay: Double?
     private var reopenTestUseMouse = false
@@ -112,6 +113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if !didFinishLaunchingCompleted {
             spLaunchMark("odoc 送达（文件路径此刻才可知）")
             recordLaunchKind(bare: false)
+
+            if urls.contains(where: { !SPSubtitleAutoload.isSubtitleFile($0) }) { launchOpensMedia = true }
         }
         if windowControllers.isEmpty {
             guard didFinishLaunchingCompleted else {
@@ -205,6 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationDidFinishLaunching(_ notification: Notification) {
         spLaunchMark("didFinishLaunching 入口")
         guard let wc = windowControllers.first else { return }
+        if cliOpenIssued { launchOpensMedia = true }
 
         if !pendingOpenURLs.isEmpty {
             let urls = pendingOpenURLs
@@ -248,13 +252,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 #endif
         installLaunchTestHooks()
 
-        DispatchQueue.main.async { [menuRouter] in
-            NSApp.mainMenu = MainMenuBuilder.build(trackMenuDelegate: menuRouter)
+        if launchOpensMedia {
+            DispatchQueue.main.asyncAfter(deadline: .now() + PlayerViewController.chromeInstallFallback) { [weak self] in
+                self?.ensureMainMenu()
+            }
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.ensureMainMenu() }
         }
         installMenuTestHooks()
     }
 
+    private var mainMenuInstalled = false
+    func ensureMainMenu() {
+        guard !mainMenuInstalled else { return }
+        mainMenuInstalled = true
+        NSApp.mainMenu = MainMenuBuilder.build(trackMenuDelegate: menuRouter)
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        RecentPlaysWarmer.noteAppTerminating()
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
 

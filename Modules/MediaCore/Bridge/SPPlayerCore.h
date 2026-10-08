@@ -264,6 +264,8 @@ NS_SWIFT_UI_ACTOR
                        uniquify:(BOOL)uniquify
                      completion:(void (^_Nullable)(BOOL ok, NSString *finalPath))completion;
 
+- (void)captureScreenshotPNGWithCompletion:(void (^_Nullable)(NSData *_Nullable png))completion;
+
 // On display changes, reselect the output mode and redraw using the new EDR capability.
 - (void)displayScreenChanged;
 // Resynchronize viewport and redraw paused content after layout; no-op during playback.
@@ -300,5 +302,27 @@ NS_SWIFT_UI_ACTOR
 // audio-only sessions use separate rules that can converge without video delivery.
 @property (nonatomic, readonly) BOOL backgroundDirectoryScanReady;
 @end
+
+// Welcome-page storage warming (implemented in Demuxer.cpp).
+#ifdef __cplusplus
+extern "C" {
+#endif
+/// One welcome-page heartbeat for a remote volume (same 2.5 s cadence and
+/// per-device single lane as the playback-session heartbeat): open, read 4 KB
+/// at a random offset, close. Returns 1 = reached the disk, 0 = another lane
+/// beat this device within the period, -1 = local volume (not applicable),
+/// -2 = currently unreachable. `devOut` receives the device number.
+int SPVolumeHeartbeatBeat(const char *path, int intervalMs, int64_t *_Nullable devOut);
+/// Speculative open for a recent MKV/MP4 entry: read the header, seek to the
+/// resume point (index), then read packets until `aheadSec` past it without
+/// decoding, leaving the bytes in the page cache for the real open. Returns the
+/// bytes read, -1 if the file cannot be opened, -3 for other containers.
+/// Aborts as soon as `shouldYield(ctx)` returns nonzero.
+int64_t SPSpeculativeOpenWarm(const char *path, double resumeSec, double aheadSec,
+                              int (*_Nullable shouldYield)(void *_Nullable),
+                              void *_Nullable ctx);
+#ifdef __cplusplus
+}
+#endif
 
 NS_ASSUME_NONNULL_END

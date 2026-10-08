@@ -33,6 +33,8 @@ final class CaptionTaskCenter {
         fileprivate(set) var error: Error?
         fileprivate(set) var hasStarted = false
         fileprivate(set) var completionMessage: String?
+        /// Set when Stop Previous displaced this task, so the stopped capsule can name the successor.
+        fileprivate(set) var supersededByName: String?
         var note: String?
         var preparationMessage: String?
         weak var presentationWindow: NSWindow?
@@ -121,13 +123,45 @@ final class CaptionTaskCenter {
 
     // MARK: - Submission and cancellation
 
-    /// Enqueue or start immediately. Reuse an existing task for the same media.
+    /// Enqueue; start immediately when idle. An existing task for the same media
+    /// is returned instead (the caller shows its status dialog). `ahead` means the
+    /// person chose Stop Previous: this request moves to the front and the running
+    /// task is stopped.
     @discardableResult
-    func submit(_ task: Task) -> Task {
-        if let existing = self.task(forMedia: task.mediaURL) { return existing }
+    func submit(_ task: Task, ahead: Bool = false) -> Task {
+        if let existing = self.task(forMedia: task.mediaURL) {
+            // Another window just queued the same file: the Stop Previous choice still applies to that request.
+            if ahead { jumpAhead(existing) }
+            return existing
+        }
         queue.append(task)
+        if ahead { jumpAhead(task) }
         startNextIfIdle()
         return task
+    }
+
+    /// Stop Previous: move the queued task to the front and stop the running one. The
+    /// slot is handed over only after it physically exits (same as `stop`). A running
+    /// task that is saving is never interrupted; the moved task starts once it finishes.
+    func jumpAhead(_ task: Task) {
+        guard !task.isFinished, !task.isRunning, let current = running, current.mediaKey != task.mediaKey else { return }
+        queue.removeAll { $0 === task }
+        queue.insert(task, at: 0)
+        guard current.canStop else { return }
+        current.supersededByName = task.mediaName
+        stop(current)
+    }
+
+    /// Whom a queued task waits for: the running task, otherwise the same-file save
+    /// cleanup blocking the head of the queue. Shared by the dialog fallback and the capsule.
+    var blockingTaskName: String { (running ?? savingRecovery)?.mediaName ?? "" }
+
+    /// Whether a new request should ask "stop previous or wait": another file is
+    /// running and can be stopped right now. Saving/stopping tasks yield within
+    /// seconds, so those requests queue silently.
+    func stoppablePredecessor(forMedia url: URL) -> Task? {
+        guard let current = running, current.mediaKey != Self.key(for: url), current.canStop else { return nil }
+        return current
     }
 
     /// Reflect stop immediately in the UI, but hold the slot until preparation
@@ -161,6 +195,8 @@ final class CaptionTaskCenter {
         task.hasStarted = true
         lastOutcome = nil
         notifyProgress(task)
+        // Queued capsules name the task they wait for: refresh them when the slot changes hands.
+        for queued in queue { notifyProgress(queued) }
         guard !task.isStopping else { finish(task, error: CancellationError()); return }
         guard let prepare = task.prepare else {
             startEngine(task)
@@ -466,6 +502,29 @@ final class CaptionTaskCenter {
         var primaryTitle: String
         var secondaryTitle: String?
         var secondaryEnabled: Bool
+        /// The secondary button discards another task's progress (Stop Previous): use the
+        /// system destructive style.
+        var secondaryDestructive = false
+    }
+
+    /// "Stop previous or wait for it": the same question before submitting a new
+    /// request and after it is queued; only the title differs. The two sentences of
+    /// the body map one-to-one onto the two buttons. `othersAhead` = other tasks are
+    /// queued ahead besides the running one: the predecessor's remaining time is not
+    /// this file's wait, so it is not shown.
+    func jumpAheadContent(predecessor: Task, queued: Bool, othersAhead: Bool = false) -> DialogContent {
+        let pct = Self.percentage(predecessor.progress)
+        let title = queued ? L("captions.dialog.behindTitle", predecessor.mediaName, pct)
+                           : L("captions.dialog.stillGeneratingTitle", predecessor.mediaName, pct)
+        let message: String
+        if !othersAhead, let eta = predecessor.eta, eta.isFinite, eta >= 60 {
+            message = L("captions.dialog.jumpAheadETA", Self.formatETA(eta))
+        } else {
+            message = L("captions.dialog.jumpAhead")
+        }
+        return DialogContent(title: title, message: message, primaryTitle: L("captions.button.waitForIt"),
+                             secondaryTitle: L("captions.button.stopPrevious"),
+                             secondaryEnabled: predecessor.canStop, secondaryDestructive: true)
     }
 
     /// The same value configures the live alert and is checked by state tests.
@@ -484,8 +543,15 @@ final class CaptionTaskCenter {
                                  secondaryTitle: nil, secondaryEnabled: false)
         }
         if !task.isRunning {
+            // Behind another file: ask "stop previous or wait for it". With nothing running
+            // (only blocked by the same file's save cleanup) fall back to Keep Waiting /
+            // Remove from Queue.
+            if let current = running, current.mediaKey != task.mediaKey {
+                return jumpAheadContent(predecessor: current, queued: true,
+                                        othersAhead: (queue.firstIndex { $0 === task } ?? 0) > 0)
+            }
             return DialogContent(title: L("captions.dialog.queuedTitle", task.mediaName),
-                                 message: L("captions.dialog.queued", running?.mediaName ?? ""),
+                                 message: L("captions.dialog.queued", blockingTaskName),
                                  primaryTitle: L("captions.button.keepWaiting"),
                                  secondaryTitle: L("captions.button.dequeue"), secondaryEnabled: task.canStop)
         }
@@ -542,6 +608,7 @@ final class CaptionTaskCenter {
             stop.title = content.secondaryTitle ?? ""
             stop.isEnabled = content.secondaryEnabled
             stop.isHidden = content.secondaryTitle == nil
+            stop.hasDestructiveAction = content.secondaryDestructive
             if previous != (alert.messageText, alert.informativeText, keep.title, stop.title) {
                 alert.layout()
             }
@@ -550,16 +617,59 @@ final class CaptionTaskCenter {
         // Keep an already-open dialog truthful across saving/completion as well
         // as rechecking cancellation atomically when the action is delivered.
         let observer = NSObject()
-        addListener(Listener(owner: observer, onEvents: { _ in }, onProgress: refresh,
-                             onFinished: { task, _ in refresh(task) }), to: task, owner: observer)
-        let handle: (NSApplication.ModalResponse) -> Void = { [weak self, weak task] resp in
+        let seenPredecessor = observeStatusDialog(for: task, owner: observer, refresh: refresh) { [weak alert] in
+            guard let alert else { return }
+            if let window { window.endSheet(alert.window, returnCode: .alertFirstButtonReturn) }
+            else { NSApp.abortModal() }
+        }
+        let handle: (NSApplication.ModalResponse) -> Void = { [weak self, weak task, weak seenPredecessor] resp in
             guard let self, let task else { return }
             self.removeListener(owner: observer, from: task)
+            if let seenPredecessor { self.removeListener(owner: observer, from: seenPredecessor) }
             guard resp == .alertSecondButtonReturn else { return }
-            self.stop(task)
+            self.performSecondaryAction(for: task, seenPredecessor: seenPredecessor)
         }
         if let window { alert.beginSheetModal(for: window, completionHandler: handle) }
         else { handle(alert.runModal()) }
+    }
+
+    /// Status dialog subscription (no UI, testable): changes to this task refresh the
+    /// content; when queued behind another file, that predecessor's progress refreshes
+    /// too and its end dismisses the dialog. The dialog answers a question about that
+    /// one task only; once it is gone the question is gone, and reopening the menu asks
+    /// about the new predecessor. Likewise, a dialog opened with no predecessor (blocked
+    /// only by save cleanup) is dismissed when one appears. Returns the predecessor seen
+    /// at open time (the secondary button acts only on it).
+    @discardableResult
+    func observeStatusDialog(for task: Task, owner: AnyObject, refresh: @escaping (Task) -> Void,
+                             dismiss: @escaping () -> Void) -> Task? {
+        let queuedWithoutPredecessor = !task.isRunning && !task.isFinished && running == nil
+        addListener(Listener(owner: owner, onEvents: { _ in }, onProgress: { [weak self] task in
+            if queuedWithoutPredecessor, let self, self.running != nil, !task.isRunning, !task.isFinished {
+                dismiss()
+                return
+            }
+            refresh(task)
+        }, onFinished: { task, _ in refresh(task) }), to: task, owner: owner)
+        guard !task.isRunning, !task.isFinished, let predecessor = running,
+              predecessor.mediaKey != task.mediaKey else { return nil }
+        addListener(Listener(owner: owner, onEvents: { _ in }, onProgress: { [weak task] _ in
+            if let task { refresh(task) }
+        }, onFinished: { _, _ in dismiss() }), to: predecessor, owner: owner)
+        return predecessor
+    }
+
+    /// The secondary button acts only on the task whose name the person saw: opened
+    /// behind `seenPredecessor`, it stops that task and moves ahead only while it is
+    /// still running, and does nothing once the slot changed hands. Opened for a running
+    /// task, or one blocked only by save cleanup, it stops or dequeues the task itself.
+    func performSecondaryAction(for task: Task, seenPredecessor: Task?) {
+        if let seenPredecessor {
+            guard running === seenPredecessor, !task.isRunning, !task.isFinished else { return }
+            jumpAhead(task)
+        } else {
+            stop(task)
+        }
     }
 
     /// Confirm quitting once while work remains. True permits termination.

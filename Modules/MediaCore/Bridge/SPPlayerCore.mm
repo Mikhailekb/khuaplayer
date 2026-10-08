@@ -45,7 +45,8 @@ static BOOL spPlanarOutputEnabled(void) {
 @end
 #import "BoundedQueue.hpp"
 #import "SeekTargets.hpp"
-#import "SPDoviRPU.hpp"
+#import "SPDoviDecoder.h"
+#include "SPDoviConfig.hpp"
 #import <VideoToolbox/VTErrors.h>
 
 #include <mach/mach.h>
@@ -157,7 +158,7 @@ static inline NSTimeInterval spUptimeSec() {
 
 static constexpr double kSPAudioClockHz = 48000.0;
 
-static constexpr size_t kSPRebufferExitPacketsBase = 12;
+static constexpr size_t kSPRebufferExitPacketsBase = 8;
 static constexpr size_t kSPRebufferExitPacketsBoosted = 32;
 
 // The audio-packet queue uses the same capacity during construction and prepare,
@@ -417,6 +418,7 @@ static const int kSPPrepErrZeroDimensions = -9102;
 static const int kSPPrepErrDecoderCreate  = -9103;
 static const int kSPPrepErrOpenCancelled  = -9104;
 static const int kSPPrepErrRetryAltVideo  = -9105;
+static const int kSPPrepErrDoviMetadata = kSPDoviMetadataUnsupportedError;
 
 @implementation SPProbeCancellationToken {
     std::atomic<bool> _cancelled;
@@ -562,7 +564,6 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     int _dbgEofLogs;
     int64_t _dbgFirstPktPts;
     int _dbgDrainFrames;
-    bool _dbgDoviRpuLogged;
     int _dbgBadFrames;
     int64_t _dbgFirstFrameUs;
     int64_t _dbgReanchorLogUs;
@@ -1005,8 +1006,9 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     int _preparedColorPrimaries, _preparedColorTrc, _preparedColorSpace, _preparedColorRange;
     float _preparedPeakNits;
     double _videoSar;
+    sp::VideoOrientation _videoOrientation; // container display matrix (identity = none)
+    BOOL _preparedDoviMapping; // frame-local RPU processing; also gates recovery/MEMC
     BOOL _preparedDoviIPT;
-    int _doviNalLengthSize;
     NSTimeInterval _lastPosNotify;
     double _pendingStartSeconds;
     double _requestedStartSeconds;
@@ -1032,6 +1034,7 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     bool _sessionRestampSeq;
     int64_t _restampNextPtsUs;
     bool _preludeSeekDone;
+    bool _preludeResumeOnKeyframe;
     double _preludeStartSeconds;
 
     std::mutex _renderMtx;
@@ -1105,6 +1108,12 @@ static int spDisplaySizeProbeInterrupt(void *opaque) {
                                                        : par->sample_aspect_ratio;
         if (s.num > 0 && s.den > 0) sar = (double)s.num / s.den;
         result = CGSizeMake(par->width * sar, par->height);
+        const AVPacketSideData *dm = av_packet_side_data_get(
+            par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+        if (sp::videoOrientationFromDisplayMatrixData(dm ? dm->data : nullptr, dm ? dm->size : 0)
+                .swapsAxes()) {
+            result = CGSizeMake(result.height, result.width); // upright size
+        }
         break;
     }
     avformat_close_input(&ctx);
@@ -1349,8 +1358,10 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         _catchUpTargetUs.clear();
         _seekBurstBaseGen = 0;
         _videoSar = 1.0;
+        _videoOrientation = sp::VideoOrientation{};
         _seekFlashDone = true;
         _preludeSeekDone = false;
+        _preludeResumeOnKeyframe = false;
         _seekDisplayTargetUs.clear();
         _seekDemuxDoneGen = 0;
 
@@ -1553,7 +1564,6 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     _dbgEofLogs = 0;
     _dbgFirstPktPts = -1;
     _dbgDrainFrames = 0;
-    _dbgDoviRpuLogged = false;
     _dbgBadFrames = 0;
     _dbgFirstFrameUs = 0;
 
@@ -1623,6 +1633,11 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     _audioDecoder = nil;
 
     _audioOnlySession.store(false);
+    // Per-file picture facts are written only by a video prepare: a pure-audio
+    // or failed open must not describe the previous file's video.
+    _preparedDoviMapping = NO;
+    _preparedDoviIPT = NO;
+    _videoOrientation = sp::VideoOrientation{};
 
     _videoPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
     _audioPackets->drain([](TaggedPacket t) { av_packet_free(&t.pkt); });
@@ -1736,6 +1751,12 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         return kSPPrepErrZeroDimensions;
     }
 
+    if (sp::doviRequiresUnsupportedMetadata(par)) {
+        SPLOG(@"[Core] P%d requires unsupported DV metadata configuration",sp::doviConfig(par)->dv_profile);
+        [self discardFailedPrepare];
+        return kSPPrepErrDoviMetadata;
+    }
+
     {
         std::string cn = _demuxer->containerName();
         _reorderContainerSuspect =
@@ -1793,66 +1814,35 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     _preparedColorTrc = vs.colorTrc;
     _preparedColorSpace = vs.colorSpace;
     _preparedColorRange = vs.colorRange;
+
+    if (vs.isDovi && sp::doviFillBaseColor(vs.doviProfile, vs.doviBlCompatId,
+            _preparedColorPrimaries, _preparedColorTrc, _preparedColorSpace, _preparedColorRange) &&
+        spDebug()) {
+        SPLOG(@"[Core] DoVi P%d VUI 缺失字段 → 按 bl_compat=%d 补全 (trc=%d pri=%d spc=%d range=%d)",
+              vs.doviProfile, vs.doviBlCompatId, _preparedColorTrc, _preparedColorPrimaries,
+              _preparedColorSpace, _preparedColorRange);
+    }
     _preparedPeakNits = (vs.maxCll > 0) ? vs.maxCll : 1000.0f;
     _videoSar = (vs.sampleAspect.num > 0 && vs.sampleAspect.den > 0)
                     ? av_q2d(vs.sampleAspect) : 1.0;
+    _videoOrientation = vs.orientation;
 
-    _preparedDoviIPT = (vs.isDovi && vs.doviProfile == 5);
-
-    _doviNalLengthSize = 4;
-    if (_preparedDoviIPT && _videoParCopy && _videoParCopy->extradata &&
-        _videoParCopy->extradata_size >= 23 && _videoParCopy->extradata[0] == 1) {
-        _doviNalLengthSize = (_videoParCopy->extradata[21] & 3) + 1;
-    }
-    // Per-frame Dolby Vision or HDR10+ dynamic metadata no longer describes a
-    // synthesized image. Static HDR10 (PQ) and HLG color remain safe to interpolate.
-    // Only DoVi P5/IPTPQc2 dynamic metadata currently enters the rendering path;
-    // HDR10+ and supported P8.x media render their HDR10/HLG/SDR base layer without
-    // consuming RPU or ST 2094-40 data. Unknown profiles and compatibility modes
-    // remain on the pass-through path unless their base-layer semantics are known.
-    const BOOL doviHasVerifiedBaseLayer =
-        vs.isDovi &&
-        ((vs.doviProfile == 8 &&
-          (vs.doviBlCompatId == 1 || vs.doviBlCompatId == 2 ||
-           vs.doviBlCompatId == 4)) ||
-         // P7 commonly uses compatibility id 6 and defines an HDR10 base layer.
-         // This renderer displays only that base layer and consumes neither EL nor
-         // RPU, so interpolating it has the same safety properties as HDR10.
-         vs.doviProfile == 7);
-    _interpolationDynamicHDRUnsafe = vs.isDovi && !doviHasVerifiedBaseLayer;
-
+    _preparedDoviIPT = (vs.isDovi && (vs.doviProfile == 5 ||
+        ((vs.doviProfile == 10 || vs.doviProfile == 20) && vs.doviBlCompatId == 0)));
+    _preparedDoviMapping = vs.isDovi;
+    // DV interpolation reconstructs both sources before FRC, including FEL.
+    // Missing metadata/EL and unequal display descriptions still reject a pair.
+    _interpolationDynamicHDRUnsafe = vs.isDovi && !sp::doviMappingSupported(par);
     _interpolationInterlaced = par->field_order != AV_FIELD_UNKNOWN &&
                                par->field_order != AV_FIELD_PROGRESSIVE;
     _interpolationCodedInterlacedSeen = NO;
-
-    if (vs.isDovi && vs.doviProfile == 8 &&
-        (vs.doviBlCompatId == 1 || vs.doviBlCompatId == 4)) {
-        BOOL filled = NO;
-        if (_preparedColorTrc == AVCOL_TRC_UNSPECIFIED) {
-            _preparedColorTrc = (vs.doviBlCompatId == 1) ? AVCOL_TRC_SMPTE2084
-                                                         : AVCOL_TRC_ARIB_STD_B67;
-            filled = YES;
-        }
-        if (_preparedColorPrimaries == AVCOL_PRI_UNSPECIFIED) {
-            _preparedColorPrimaries = AVCOL_PRI_BT2020;
-            filled = YES;
-        }
-        if (_preparedColorSpace == AVCOL_SPC_UNSPECIFIED) {
-            _preparedColorSpace = AVCOL_SPC_BT2020_NCL;
-            filled = YES;
-        }
-        if (filled && spDebug()) {
-            SPLOG(@"[Core] DoVi P8 VUI 缺失字段 → 按 bl_compat=%d 补全 (trc=%d pri=%d spc=%d)",
-                  vs.doviBlCompatId, _preparedColorTrc, _preparedColorPrimaries, _preparedColorSpace);
-        }
-    }
     if (spDebug() && vs.isDovi) {
         const char *compat = vs.doviBlCompatId == 1 ? "HDR10(2020 PQ)"
                            : vs.doviBlCompatId == 2 ? "SDR(709)"
                            : vs.doviBlCompatId == 4 ? "HLG" : "无(P5 IPT)";
         SPLOG(@"[Core] Dolby Vision Profile %d.%d 兼容层=%s → %@", vs.doviProfile,
               vs.doviBlCompatId, compat,
-              _preparedDoviIPT ? @"IPTPQc2 转换链" : @"基础层直播");
+              _preparedDoviIPT ? @"P5 RPU 映射" : @"逐帧 RPU / 兼容层回退");
     }
 
     if (_preparedColorSpace == AVCOL_SPC_UNSPECIFIED &&
@@ -1872,6 +1862,11 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     if (spDebug() && fabs(_videoSar - 1.0) > 0.001) {
         SPLOG(@"[Core] 变形内容 SAR=%.4f 显示比例=%.3f", _videoSar,
               (double)vs.width * _videoSar / MAX(vs.height, 1));
+    }
+    if (spDebug() && !_videoOrientation.isIdentity()) {
+        SPLOG(@"[Core] container orientation: %d deg clockwise%@",
+              sp::videoOrientationClockwiseDegrees(_videoOrientation),
+              _videoOrientation.hflip ? @" + mirror" : @"");
     }
 
     _audioStreamIndex = _demuxer->audioStream();
@@ -1920,6 +1915,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         }
         if (isolated) break;
     }
+    [self snapResumeToPreludeKeyframe];
 
     if ((par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_HEVC) && !_preludeVideoPkts.empty() &&
         _videoParCopy && _thumbVideoPar) {
@@ -2023,6 +2019,9 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
                                          range:_preparedColorRange
                                       peakNits:_preparedPeakNits];
         [_renderer setSampleAspect:(float)_videoSar];
+        [_renderer setStreamOrientationTurns:_videoOrientation.turnsCCW
+                                    mirrored:_videoOrientation.hflip];
+        [_renderer setDoviMappingEnabled:_preparedDoviMapping];
         [_renderer setDoviIPT:_preparedDoviIPT];
         [_renderer synchronizeOutputModeWithCompletion:^(BOOL ready) {
             // Completion is session-neutral at renderer level; bind publication
@@ -2060,6 +2059,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 
     __block SPVideoDecoder *vt = nil;
     __block int vtRet = -1;
+    __block SPDoviEnhancementPreparation *doviEnhancement = nil;
 
     NSData *firstPktHint = nil;
     if (!forceSW && par->codec_id == AV_CODEC_ID_HEVC && !_preludeVideoPkts.empty()) {
@@ -2082,6 +2082,20 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         });
     }
 
+    // OpenIssued: actual selected-file work, not speculative driver warm-up.
+    // Inspect only supported HEVC dual-layer inputs' first AU. FEL EL setup can
+    // overlap BL setup; MEL/ordinary sources allocate no enhancement decoder.
+    // The group owns par/packet lifetime. A superseded open neither starts new
+    // work nor publishes its completed preparation into the next session.
+    if (vs.isDovi && sp::doviHEVCDualLayerSupported(par) && !_preludeVideoPkts.empty()) {
+        const AVPacket *firstDoviPacket = _preludeVideoPkts.front();
+        dispatch_group_async(grp, bg, ^{
+            if (prepareSuperseded()) return;
+            auto *prepared = SPPrepareDoviEnhancement(par, firstDoviPacket, tbN, tbD, self->_spLogId);
+            if (!prepareSuperseded()) doviEnhancement = prepared;
+        });
+    }
+
     _vtWarmKey = spVtWarmKey(par);
     bool vtWarm = false;
     bool vtDriverProven = false;
@@ -2091,7 +2105,8 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     }
 
     vtDriverProven = SPVideoToolboxDriverLoaded();
-    bool resuming = _preludeStartSeconds > 0.5;
+
+    bool resuming = _preludeStartSeconds > 0.5 && !_preludeResumeOnKeyframe;
 
     const bool hopelessRace =
         vtDriverProven && !forceSW &&
@@ -2125,11 +2140,14 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             sw.singleFrameMode = YES;
             sw.rgbSourceMatrix = self->_preparedColorSpace;
             SPDecodedVideoOutput raceOutput = SPDecodedVideoOutputEmpty();
-            if ([sw setupWithCodecParameters:racePar timeBaseNumerator:tbN timeBaseDenominator:tbD] == 0) {
-                raceOutput = [sw decodePacketOutput:kfPkt];
-                if (!raceOutput.pixelBuffer) {
 
-                    raceOutput = [sw decodePacketOutput:NULL];
+            id<SPVideoDecoding> raceDecoder = sw;
+            if ([sw setupWithCodecParameters:racePar timeBaseNumerator:tbN timeBaseDenominator:tbD] == 0) {
+                raceDecoder = SPWrapDoviSpeculativeDecoder(sw, racePar, tbN, tbD);
+                if (raceDecoder) raceOutput = [raceDecoder decodePacketOutput:kfPkt];
+                if (raceDecoder && !raceOutput.pixelBuffer) {
+
+                    raceOutput = [raceDecoder decodePacketOutput:NULL];
                 }
             }
             AVPacket *tmp = kfPkt;
@@ -2142,7 +2160,10 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
                 // publication normally overlaps this decode.  The semaphore is
                 // always signalled (including cancellation/no renderer), and
                 // ensures the race never submits against the previous session.
+                const int64_t configWaitStarted = spDebug() ? spNowUs() : 0;
                 dispatch_semaphore_wait(rendererConfigGate, DISPATCH_TIME_FOREVER);
+                if (configWaitStarted) SPLOG(@"[RendererTiming] race config_wait_ms=%.3f decode_ms=%.3f",
+                    (spNowUs() - configWaitStarted) / 1000.0, (configWaitStarted - raceT0) / 1000.0);
 
                 if (self->_openGeneration.load(std::memory_order_acquire) == openGen &&
                     self->_rendererConfiguredOpenGeneration.load(
@@ -2183,7 +2204,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
                 }
                 CVPixelBufferRelease(b);
             }
-            [sw shutdown];
+            [raceDecoder shutdown];
         });
     }
 
@@ -2221,6 +2242,10 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         if (dret == 0) {
             _decoder = sw;
         }
+    }
+    if (_decoder && dret == 0) {
+        _decoder = SPWrapDoviDecoder(_decoder, par, vs.timeBase.num, vs.timeBase.den, doviEnhancement);
+        if (!_decoder) dret = AVERROR(ENOMEM);
     }
     if (spDebug()) {
         SPLOG(@"[Core] 打开: codec=%s %dx%d fps=%.3f 容器=%s 色彩(pri=%d trc=%d)",
@@ -2507,6 +2532,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         info.videoWidth = _videoWidth;
         info.videoHeight = _videoHeight;
         info.dynamicHDRUnsafe = _interpolationDynamicHDRUnsafe;
+        info.dynamicHDRRequiresMetadata = _preparedDoviMapping;
         info.interlaced = _interpolationInterlaced;
         [_generator resetForNewMediaWithInfo:info];
     }
@@ -2749,6 +2775,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         NSString *diagnosis = @"openFailed";
         if (prepErr == kSPPrepErrNoVideoStream)      { desc = NSLocalizedString(@"error.noPlayableTrack", nil); diagnosis = @"noPlayableTrack"; }
         else if (prepErr == kSPPrepErrDecoderCreate) { desc = NSLocalizedString(@"error.decoderCreateFailed", nil); diagnosis = @"decoderCreate"; }
+        else if (prepErr == kSPPrepErrDoviMetadata) { desc = NSLocalizedString(@"error.doviMetadataUnsupported", nil); diagnosis = @"doviMetadataUnsupported"; }
         else {
 
             switch ((spresil::OpenFailureHint)_openFailureHint.load()) {
@@ -3491,8 +3518,8 @@ static BOOL spThumbsEnabled(void) {
 }
 
 - (void)scheduleTimelineThumbnails {
-    if (spDebug() && _preparedDoviIPT && spThumbsEnabled() && !_previewMode) {
-        SPLOG(@"[Thumb] DoVi Profile 5（IPTPQc2）：缩略图走 Metal 转换核（RPU 逐图解析）");
+    if (spDebug() && _preparedDoviMapping && spThumbsEnabled() && !_previewMode) {
+        SPLOG(@"[Thumb] Dolby Vision：缩略图走 Metal 转换核（逐图 RPU 重建）");
     }
 
     if (![self timelinePreviewEligible] || _duration < 10.0) return;
@@ -3551,7 +3578,6 @@ static BOOL spThumbsEnabled(void) {
         videoStreamIndex:_videoStreamIndex
            videoStreamId:_thumbVideoStreamId
                  doviIPT:_preparedDoviIPT
-       doviNalLengthSize:_doviNalLengthSize
                idleProbe:probe
            seekBusyProbe:seekBusy
                 onUpdate:onUpdate];
@@ -4229,6 +4255,56 @@ static NSString *spClaimScreenshotPath(NSString *base) {
     return nil;
 }
 
+static CGImageRef spCreateScreenshotImage(CVPixelBufferRef snapshot, sp::VideoOrientation orient) {
+    static CIContext *sCtx;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ sCtx = [CIContext context]; });
+    CVPixelBufferRef ciSource = spCreateBiPlanarCopy(snapshot);
+    CIImage *ci = ciSource ? [CIImage imageWithCVPixelBuffer:ciSource] : nil;
+    if (ci && !orient.isIdentity()) {
+        int m[4]; // y-up, like Core Image space
+        sp::videoOrientationMatrix(orient, m);
+        ci = [ci imageByApplyingTransform:CGAffineTransformMake(m[0], m[2], m[1], m[3], 0, 0)];
+        ci = [ci imageByApplyingTransform:CGAffineTransformMakeTranslation(
+                 -ci.extent.origin.x, -ci.extent.origin.y)];
+    }
+    CGImageRef cg = ci ? [sCtx createCGImage:ci fromRect:ci.extent] : NULL;
+    if (ciSource) CVPixelBufferRelease(ciSource);
+    return cg;
+}
+
+- (void)captureScreenshotPNGWithCompletion:(void (^)(NSData *_Nullable png))completion {
+    if (!_lastFrameBuffer) {
+        if (completion) completion(nil);
+        return;
+    }
+
+    CVPixelBufferRef snapshot = CVPixelBufferRetain(_lastFrameBuffer);
+    const sp::VideoOrientation orient = _videoOrientation;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSMutableData *png = nil;
+        CGImageRef cg = spCreateScreenshotImage(snapshot, orient);
+        CVPixelBufferRelease(snapshot);
+        if (cg) {
+            png = [NSMutableData data];
+            CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+                (__bridge CFMutableDataRef)png, (__bridge CFStringRef)@"public.png", 1, NULL);
+            BOOL ok = NO;
+            if (dest) {
+                CGImageDestinationAddImage(dest, cg, NULL);
+                ok = CGImageDestinationFinalize(dest);
+                CFRelease(dest);
+            }
+            CGImageRelease(cg);
+            if (!ok) png = nil;
+        }
+        if (completion) {
+            NSData *result = [png copy];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(result); });
+        }
+    });
+}
+
 - (void)captureScreenshotToPath:(NSString *)path
                        uniquify:(BOOL)uniquify
                      completion:(void (^)(BOOL ok, NSString *finalPath))completion {
@@ -4237,11 +4313,9 @@ static NSString *spClaimScreenshotPath(NSString *base) {
         return;
     }
     CVPixelBufferRef snapshot = CVPixelBufferRetain(_lastFrameBuffer);
+    const sp::VideoOrientation orient = _videoOrientation;
     NSString *pathCopy = [path copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        static CIContext *sCtx;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{ sCtx = [CIContext context]; });
         BOOL ok = NO;
         NSString *target = pathCopy;
         BOOL claimed = NO;
@@ -4250,11 +4324,7 @@ static NSString *spClaimScreenshotPath(NSString *base) {
             claimed = target != nil;
         }
         if (target) {
-
-            CVPixelBufferRef ciSource = spCreateBiPlanarCopy(snapshot);
-            CIImage *ci = ciSource ? [CIImage imageWithCVPixelBuffer:ciSource] : nil;
-            CGImageRef cg = ci ? [sCtx createCGImage:ci fromRect:ci.extent] : NULL;
-            if (ciSource) CVPixelBufferRelease(ciSource);
+            CGImageRef cg = spCreateScreenshotImage(snapshot, orient);
             if (cg) {
                 NSURL *url = [NSURL fileURLWithPath:target];
                 CGImageDestinationRef dest = CGImageDestinationCreateWithURL(
@@ -4276,7 +4346,19 @@ static NSString *spClaimScreenshotPath(NSString *base) {
     });
 }
 
+- (NSString *)doviStatusDescription {
+    return _preparedDoviMapping ? [_renderer doviProcessingDescription] : nil;
+}
+
 - (NSDictionary *)mediaInfo {
+    if (_mediaInfoSnapshot.count) {
+        NSString *dovi = [self doviStatusDescription];
+        if (dovi) {
+            NSMutableDictionary *info = [_mediaInfoSnapshot mutableCopy];
+            info[NSLocalizedString(@"media.doviProcessing", nil)] = dovi;
+            return info;
+        }
+    }
     return _mediaInfoSnapshot ?: @{};
 }
 
@@ -4378,7 +4460,18 @@ static NSString *spCodecDisplayName(const std::string &name) {
     if (_videoStreamIndex < 0) return d;
     const sp::StreamInfo &vs = _demuxer->streams()[_videoStreamIndex];
     d[NSLocalizedString(@"media.codec", nil)] = [NSString stringWithUTF8String:vs.codecLongName.c_str()];
-    d[NSLocalizedString(@"media.resolution", nil)] = [NSString stringWithFormat:@"%d × %d", vs.width, vs.height];
+    // Resolution as displayed (upright); the container orientation gets its own row.
+    const int shownW = vs.orientation.swapsAxes() ? vs.height : vs.width;
+    const int shownH = vs.orientation.swapsAxes() ? vs.width : vs.height;
+    d[NSLocalizedString(@"media.resolution", nil)] = [NSString stringWithFormat:@"%d × %d", shownW, shownH];
+    if (!vs.orientation.isIdentity()) {
+        const int deg = sp::videoOrientationClockwiseDegrees(vs.orientation);
+        NSString *mirrored = NSLocalizedString(@"media.value.mirrored", nil);
+        NSString *rot = !vs.orientation.hflip ? [NSString stringWithFormat:@"%d°", deg]
+                      : deg == 0 ? mirrored
+                                 : [NSString stringWithFormat:@"%d° · %@", deg, mirrored];
+        d[NSLocalizedString(@"media.rotation", nil)] = rot;
+    }
     d[NSLocalizedString(@"media.fps", nil)] = [NSString stringWithFormat:@"%.2f fps", vs.fps];
     d[NSLocalizedString(@"media.bitrate", nil)] = vs.bitRate > 0 ? [NSString stringWithFormat:@"%.1f Mbps", vs.bitRate / 1e6]
                                 : NSLocalizedString(@"media.value.unknown", nil);
@@ -4421,7 +4514,7 @@ static NSString *spCodecDisplayName(const std::string &name) {
                 case 1: compat = NSLocalizedString(@"hdr.compat.hdr10Base", nil); break;
                 case 2: compat = NSLocalizedString(@"hdr.compat.sdrBase", nil); break;
                 case 4: compat = NSLocalizedString(@"hdr.compat.hlgBase", nil); break;
-                default: if (vs.doviProfile == 5) compat = NSLocalizedString(@"hdr.compat.iptNone", nil); break;
+                default: if (_preparedDoviIPT) compat = NSLocalizedString(@"hdr.compat.iptNone", nil); break;
             }
             if (compat) fmtLine = [NSString stringWithFormat:NSLocalizedString(@"hdr.formatCompatFmt", nil), hdrFmt, compat];
             if (vs.hasHdr10Plus) fmtLine = [fmtLine stringByAppendingString:NSLocalizedString(@"hdr.plusSuffix", nil)];
@@ -4434,7 +4527,7 @@ static NSString *spCodecDisplayName(const std::string &name) {
                    : [NSString stringWithFormat:@"%.3f fps", vs.fps])
             : NSLocalizedString(@"hdr.fpsUnknown", nil);
         [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"hdr.resolutionLineFmt", nil),
-                          vs.width, vs.height, fpsStr]];
+                          shownW, shownH, fpsStr]];
         NSString *gamut;
         switch (vs.colorPrimaries) {
             case AVCOL_PRI_BT2020:    gamut = @"BT.2020"; break;
@@ -4491,6 +4584,7 @@ static NSString *spCodecDisplayName(const std::string &name) {
 
 - (void)foldResumeSeekIntoPrepare {
     _preludeSeekDone = false;
+    _preludeResumeOnKeyframe = false;
     _preludeStartSeconds = 0;
     double startSec = _pendingStartSeconds;
     if (startSec > 0.5 && _duration > 0 && startSec < _duration - 1.0) {
@@ -4506,6 +4600,24 @@ static NSString *spCodecDisplayName(const std::string &name) {
             if (spDebug()) SPLOG(@"[Core] 续播 seek 失败 → 从头播放");
         }
     }
+}
+
+static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
+- (void)snapResumeToPreludeKeyframe {
+    if (!_preludeSeekDone || _preludeStartSeconds <= 0.5 || _preludeVideoPkts.empty() ||
+        _videoStreamIndex < 0 || _videoStreamIndex >= (int)_demuxer->streams().size()) return;
+    const AVPacket *kp = _preludeVideoPkts.front();
+    if (!(kp->flags & AV_PKT_FLAG_KEY)) return;
+    const int64_t pts = kp->pts != AV_NOPTS_VALUE ? kp->pts : kp->dts;
+    const AVRational tb = _demuxer->streams()[_videoStreamIndex].timeBase;
+    if (pts == AV_NOPTS_VALUE || tb.num <= 0 || tb.den <= 0) return;
+    const double kfSec = (av_rescale_q(pts, tb, AV_TIME_BASE_Q) - _demuxer->timelineOriginUs()) / 1e6;
+    const double target = _preludeStartSeconds;
+
+    if (kfSec > target || target - kfSec > kSPResumeKeyframeMaxBackSec) return;
+    _preludeStartSeconds = kfSec;
+    _preludeResumeOnKeyframe = true;
+    if (spDebug()) SPLOG(@"[Core] 续播对齐关键帧 %.2fs → %.2fs（早 %.2fs）", target, kfSec, target - kfSec);
 }
 
 - (CGSize)currentViewportPx {
@@ -4611,7 +4723,6 @@ static NSString *spCodecDisplayName(const std::string &name) {
         [_generator discardReturnedFrames];
         _subLoadGen.fetch_add(1);
         [_subtitleRenderer resetTrack];
-        [_renderer resetDoviSessionState];
         if (releaseAudioScratch) {
             [_audioOutput stop]; // also cancel a not-yet-ready unit's start request
             [_audioOutput releaseSessionScratch];
@@ -4711,8 +4822,6 @@ static NSString *spCodecDisplayName(const std::string &name) {
     _seekMailbox.invalidate();
     _subLoadGen.fetch_add(1);
     [_subtitleRenderer resetTrack];
-
-    [_renderer resetDoviSessionState];
 
     _renderer.subtitleTexture = nil;
 
@@ -4819,6 +4928,8 @@ static NSString *spLangDisplayName(const std::string &lang) {
     NSString *head = (_hdrCodecName && dec) ? [NSString stringWithFormat:@"%@ · %@", _hdrCodecName, dec]
                                             : (_hdrCodecName ?: dec);
     NSString *body = head ? [NSString stringWithFormat:@"%@\n%@", head, _hdrStaticDetail] : _hdrStaticDetail;
+    NSString *dovi = [self doviStatusDescription];
+    if (dovi) body = [body stringByAppendingFormat:@"\n%@: %@", NSLocalizedString(@"media.doviProcessing", nil), dovi];
     return [NSString stringWithFormat:NSLocalizedString(@"hdr.outputLineFmt", nil),
             body, [_renderer outputModeDescription]];
 }
@@ -6357,6 +6468,7 @@ static void spApplyDecodeQoS() {
 }
 
 - (void)decodeLoop {
+    int64_t doviFailureGeneration = -1;
 
     int64_t discardBelowUs = -1;
     int64_t videoEpochOffsetUs = 0;
@@ -6825,35 +6937,8 @@ static void spApplyDecodeQoS() {
         }
         if (!laneRetained && _laneArmed) [self laneRetainPacket:pkt];
 
-        if (_preparedDoviIPT && pkt->data && pkt->size > 8) {
-            bool annexB = pkt->size > 4 && pkt->data[0] == 0 && pkt->data[1] == 0 &&
-                          (pkt->data[2] == 1 || (pkt->data[2] == 0 && pkt->data[3] == 1));
-            sp::DoviReshape rp;
-            if (sp::doviParseRPUFromPacket(pkt->data, (size_t)pkt->size, annexB, rp,
-                                           _doviNalLengthSize) &&
-                rp.valid && !rp.usePrev) {
-                float g[sp::kDoviGpuFloats];
-                sp::doviToGpuFloats(rp, g);
-
-                int64_t rpuPtsUs = pkt->pts != AV_NOPTS_VALUE
-                    ? av_rescale_q(pkt->pts, _videoTimeBase, AV_TIME_BASE_Q) : -1;
-                [_renderer queueDoviReshapeFloats:g ptsUs:rpuPtsUs];
-                if (spDebug()) {
-                    if (!_dbgDoviRpuLogged) {
-                        _dbgDoviRpuLogged = true;
-                        SPLOG(@"[DoVi] RPU: ycc[1]=%.6f ycc[2]=%.6f lms[0]=%.6f off=[%.2f %.2f %.2f] "
-                              @"fullRange=%d minPq=%.0f maxPq=%.0f(≈%.0fnits) 曲线=%d 段数=[%d %d %d]",
-                              rp.yccToRgb[1], rp.yccToRgb[2], rp.rgbToLms[0],
-                              rp.yccOffset[0], rp.yccOffset[1], rp.yccOffset[2],
-                              (int)rp.signalFullRange, rp.minPqNorm * 4095, rp.maxPqNorm * 4095,
-                              10000 * pow(fmax((pow(rp.maxPqNorm, 1 / 78.84375) - 0.8359375), 0) /
-                                          (18.8515625 - 18.6875 * pow(rp.maxPqNorm, 1 / 78.84375)), 1 / 0.1593017578125),
-                              (int)rp.hasCurves,
-                              rp.comps[0].numPieces, rp.comps[1].numPieces, rp.comps[2].numPieces);
-                    }
-                }
-            }
-        }
+        // DV parsing and BL/EL pairing live in the decoder decorator. Metadata
+        // is attached to each decoded CVPixelBuffer, not a future global slot.
 
         int64_t cuT = _catchUpTargetUs.us();
         bool showPending = !_seekFlashDone.load() ||
@@ -6873,10 +6958,35 @@ static void spApplyDecodeQoS() {
             _decoder.decodingBackend == SPVideoDecodingBackendVideoToolbox) {
             _laneKeyDecodedOnVT = YES;
         }
+        if (_preparedDoviMapping && SPConsumeDoviDecoderChange(_decoder))
+            [self publishReplacedDecoderName:_decoder];
         CVPixelBufferRef &buf = decoded.pixelBuffer;
         int64_t &ptsUs = decoded.ptsUs;
 
         if (!buf && _decoder.lastError != 0) {
+            if (_decoder.lastError == kSPDoviMetadataUnsupportedError) {
+                // This is a required metadata capability failure. Do not mark
+                // healthy video damaged or retry the same unsupported RPU on
+                // another video backend. Seek/open supersedes the notification.
+                if (doviFailureGeneration != gen) {
+                    doviFailureGeneration = gen;
+                    const int64_t openGen = _openGeneration.load();
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (self->_openGeneration.load() != openGen || self->_generation.load() != gen) return;
+                        NSError *error = [self makeErrorWithDomain:@"SPDecodeError"
+                            code:kSPDoviMetadataUnsupportedError
+                            description:NSLocalizedString(@"error.doviMetadataUnsupported", nil)
+                            phase:@"decode" diagnosis:@"doviMetadataUnsupported" terminal:YES];
+                        SPLOG(@"[Core] required DV metadata is unsupported (P3 / compressed P20.0)");
+                        [self stop];
+                        [self setState:SPPlayerStateFailed];
+                        if ([self->_delegate respondsToSelector:@selector(playerCore:didFailWithError:)])
+                            [self->_delegate playerCore:self didFailWithError:error];
+                    });
+                }
+                av_packet_free(&pkt);
+                continue;
+            }
             if (spDebug()) {
                 if (++_dbgBadFrames <= 3) SPLOG(@"[Core] 解码失败帧#%d size=%d err=%d", _dbgBadFrames, pkt->size, _decoder.lastError);
             }
@@ -6971,11 +7081,15 @@ static void spApplyDecodeQoS() {
                                                codecParameters:rpar];
                             }
 
+                            id<SPVideoDecoding> dvCandidate = SPWrapDoviDecoder(
+                                vt2, rpar, _videoTimeBase.num, _videoTimeBase.den);
                             SPDecodedVideoOutput candidate =
-                                [vt2 decodePacketOutput:pkt];
+                                dvCandidate ? [dvCandidate decodePacketOutput:pkt] : SPDecodedVideoOutputEmpty();
                             if (candidate.pixelBuffer) {
-                                nd = vt2;
+                                nd = dvCandidate;
                                 decoded = candidate;
+                            } else if (dvCandidate) {
+                                [dvCandidate shutdown];
                             } else {
                                 [vt2 shutdown];
                             }
@@ -6995,13 +7109,16 @@ static void spApplyDecodeQoS() {
                         if ([sw2 setupWithCodecParameters:rpar
                                         timeBaseNumerator:_videoTimeBase.num
                                       timeBaseDenominator:_videoTimeBase.den] == 0) {
+                            id<SPVideoDecoding> dvCandidate = SPWrapDoviDecoder(
+                                sw2, rpar, _videoTimeBase.num, _videoTimeBase.den);
                             SPDecodedVideoOutput candidate =
-                                [sw2 decodePacketOutput:pkt];
-                            if (candidate.pixelBuffer || sw2.lastError == 0) {
-                                nd = sw2;
+                                dvCandidate ? [dvCandidate decodePacketOutput:pkt] : SPDecodedVideoOutputEmpty();
+                            // The DV wrapper reports its own metadata failures.
+                            if (dvCandidate && (candidate.pixelBuffer || dvCandidate.lastError == 0)) {
+                                nd = dvCandidate;
                                 decoded = candidate;
                             } else {
-                                [sw2 shutdown];
+                                if (dvCandidate) [dvCandidate shutdown]; else [sw2 shutdown];
                             }
                         } else {
                             [sw2 shutdown];
@@ -7151,10 +7268,6 @@ static void spApplyDecodeQoS() {
         [self syncCompareSourceForSynthetic:frame.synthetic gen:frame.gen];
     }
     [self updateSubtitleTextureForTime:frame.ptsUs];
-
-    if (_preparedDoviIPT) {
-        [_renderer bindDoviReshapeForPtsUs:frame.ptsUs frameIntervalUs:_frameIntervalUs];
-    }
     BOOL submitted = [_renderer renderPixelBuffer:frame.buffer];
     _presentRetryPending = !submitted;
     if (submitted && frame.synthetic) _generator.counters->presented.fetch_add(1);
@@ -9021,8 +9134,6 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     [self drainSessionQueuesForSeek];
 
     _audioFlushPending.store(true);
-
-    if (_preparedDoviIPT) [_renderer clearDoviReshapeQueue];
     _audioRingStartPtsUs.store(-1);
     _audioRingEndPtsUs.store(-1);
 
@@ -9490,11 +9601,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 
 - (void)laneRetainPacket:(AVPacket *)pkt {
     if (!_laneArmed || _laneGopOverflow || _resilientDryRun.load(std::memory_order_relaxed)) return;
-    size_t packetBytes = pkt->size >= 0 ? (size_t)pkt->size : SIZE_MAX;
-    for (int i = 0; i < pkt->side_data_elems && packetBytes != SIZE_MAX; ++i) {
-        const size_t n = pkt->side_data[i].size;
-        packetBytes = n <= SIZE_MAX - packetBytes ? packetBytes + n : SIZE_MAX;
-    }
+    const size_t packetBytes = sp::doviReferencedPacketBytes(pkt);
     if (!sp::appendGopReplayPacket(_laneGop, _laneGopBytes, packetBytes,
             [&] { return av_packet_clone(pkt); },
             [](AVPacket* packet) { av_packet_free(&packet); })) {
@@ -9847,7 +9954,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     if ([self laneCanReplayGop]) return [self laneSwitchToSoftwareWithReplayGeneration:gen];
     if (_laneReadbackAttempted || _laneReadbackAttempts >= 4 || !_laneReadbackEpochValid ||
         _laneReadbackConfigRevision != _laneConfigRevision || !_laneReadbackContainer ||
-        !_laneReadbackKey.valid() || !raw.valid() || _preparedDoviIPT || !_videoParCopy ||
+        !_laneReadbackKey.valid() || !raw.valid() || _preparedDoviMapping || !_videoParCopy ||
         _laneOnSW || ![_decoder isKindOfClass:[SPVideoDecoder class]] ||
         _decoder.decodingBackend != SPVideoDecodingBackendVideoToolbox ||
         _videoLayout.kind != spresil::Bitstream::LengthPrefixed ||
@@ -9919,7 +10026,8 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 
 - (BOOL)laneSwitchToSoftwareWithReplayGeneration:(int64_t)gen {
     const int64_t t0 = spNowUs();
-    SPFFmpegDecoder *sw = [self laneMakeSoftwareCandidate];
+    id<SPVideoDecoding> sw = SPWrapDoviDecoder([self laneMakeSoftwareCandidate],
+        _videoParCopy, _videoTimeBase.num, _videoTimeBase.den);
     if (!sw) {
         _laneReplayFailures++;
         [self resilientLog:@"区间软解候选建不出来"];
@@ -10019,12 +10127,16 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
     if (_frameInterpolationCommittedModeValue.load() == SPFrameInterpolationModeDoubleRate) {
         [vt setInterpolationScanEnabled:!_interpolationCodedInterlacedSeen codecParameters:_videoParCopy];
     }
-    SPDecodedVideoOutput candidate = [vt decodePacketOutput:pkt];
-    if (!candidate.pixelBuffer && vt.lastError != 0) {
-        [vt shutdown];
+    id<SPVideoDecoding> dvCandidate = SPWrapDoviDecoder(vt, _videoParCopy,
+        _videoTimeBase.num, _videoTimeBase.den);
+    SPDecodedVideoOutput candidate = dvCandidate ? [dvCandidate decodePacketOutput:pkt] : SPDecodedVideoOutputEmpty();
+    // The DV wrapper reports its own metadata failures.
+    if (!dvCandidate || (!candidate.pixelBuffer && dvCandidate.lastError != 0)) {
+        const int err = dvCandidate ? dvCandidate.lastError : vt.lastError;
+        if (dvCandidate) [dvCandidate shutdown]; else [vt shutdown];
         _laneReturnFailures++;
         SP_RESLOG(@"切回 VT：关键帧 %.3fs 试解失败 err=%d（保留软解，第 %d 次）",
-                            _laneGopKeyPtsUs / 1e6, vt.lastError, _laneReturnFailures);
+                            _laneGopKeyPtsUs / 1e6, err, _laneReturnFailures);
         return NO;
     }
 
@@ -10034,12 +10146,12 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 
     if (!_running.load() || gen != _generation.load() || _flushPending.load()) {
         if (candidate.pixelBuffer) CVPixelBufferRelease(candidate.pixelBuffer);
-        [vt shutdown];
+        [dvCandidate shutdown];
         return NO;
     }
     [_decoder shutdown];
-    _decoder = vt;
-    [self publishReplacedDecoderName:vt];
+    _decoder = dvCandidate;
+    [self publishReplacedDecoderName:dvCandidate];
     _laneOnSW = NO;
     _laneKeyDecodedOnVT = YES;
     _laneReturnPendingVerify = acceptedOnly;
@@ -10190,6 +10302,7 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 
     info.width = (int)llround(_videoWidth * (_videoSar > 0 ? _videoSar : 1.0));
     info.height = _videoHeight;
+    if (_videoOrientation.swapsAxes()) std::swap(info.width, info.height); // upright size
     info.fps = _videoFps;
     info.duration = _duration;
     info.hasAudio = _hasAudio ? 1 : 0;

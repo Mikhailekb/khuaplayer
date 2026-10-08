@@ -29,6 +29,7 @@ static NSError *SPBudgetMetalError(NSInteger code, NSString *message) {
     id<MTLComputePipelineState> _toRGBA;
     id<MTLComputePipelineState> _toRGBAPlanar;
     id<MTLComputePipelineState> _fromRGBA;
+    id<MTLComputePipelineState> _doviToRGBA;
     CVMetalTextureCacheRef _textureCache;
     std::mutex _cacheMtx;
     SPBudgetColorCPU _color;
@@ -146,8 +147,27 @@ static NSError *SPBudgetMetalError(NSInteger code, NSString *message) {
     else if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4) ||
              CFEqual(matrix, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995)) { _color.kr = 0.299f; _color.kb = 0.114f; }
     CFRelease(matrix);
-    _colorOut.kr = _color.kr;
-    _colorOut.kb = _color.kb;
+    if (!_doviReconstruction) {
+        _colorOut.kr = _color.kr;
+        _colorOut.kb = _color.kb;
+    }
+}
+
+- (BOOL)enableDoviReconstructionWithError:(NSError **)error {
+    if (_doviReconstruction) return YES;
+    NSURL *url = [[NSBundle bundleForClass:self.class] URLForResource:@"default" withExtension:@"metallib"];
+    id<MTLLibrary> library = url ? [_device newLibraryWithURL:url error:error] : nil;
+    id<MTLFunction> fn = [library newFunctionWithName:@"doviFrameToRGBA"];
+    _doviToRGBA = fn ? [_device newComputePipelineStateWithFunction:fn error:error] : nil;
+    if (!_doviToRGBA) {
+        if (error && !*error) *error = SPBudgetMetalError(6, @"DV reconstruction pipeline");
+        return NO;
+    }
+    _doviReconstruction = YES;
+    _outputPixelFormat = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    _colorOut = {65535.f/(64.f*876.f), -64.f/876.f,
+                 65535.f/(64.f*896.f), -512.f/896.f, .2627f, .0593f, 1, 0};
+    return YES;
 }
 
 #pragma mark - Textures
@@ -299,6 +319,32 @@ static NSError *SPBudgetMetalError(NSInteger code, NSString *message) {
     id<MTLTexture> chromaV = planar ? [self textureForPlane:2 ofFrame:frame format:lumaFmt owners:owners] : nil;
     id<MTLTexture> out = [self textureForPlane:0 ofFrame:rgba format:MTLPixelFormatRGBA16Float owners:owners];
     if (!luma || !chroma || !out || (planar && !chromaV)) return NO;
+    if (_doviReconstruction) {
+        if (!sp::spMotionDoviFrameEligible(frame)) return NO;
+        // Eligibility guarantees an EL exactly when the RPU needs one.
+        CVPixelBufferRef el = spDoviEnhancementFrame(frame);
+        SPDoviUniforms snapshot;
+        spDoviPrepareDrawSnapshot(snapshot, *spDoviFrameUniforms(frame), frame, el, false);
+        id<MTLTexture> elY = luma, elUV = chroma;
+        if (el) {
+            const bool el10 = spDoviEnhancementBits(el) == 10;
+            elY = [self textureForPlane:0 ofFrame:el format:el10 ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm owners:owners];
+            elUV = [self textureForPlane:1 ofFrame:el format:el10 ? MTLPixelFormatRG16Unorm : MTLPixelFormatRG8Unorm owners:owners];
+            if (!elY || !elUV) return NO;
+        }
+        id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
+        if (!enc) return NO;
+        [enc setComputePipelineState:_doviToRGBA];
+        [enc setTexture:luma atIndex:0]; [enc setTexture:chroma atIndex:1];
+        [enc setTexture:elY atIndex:2]; [enc setTexture:elUV atIndex:3];
+        [enc setTexture:chromaV ?: chroma atIndex:4]; [enc setTexture:out atIndex:5];
+        const int32_t meta[4] = {_tenBit ? 10 : 8, (int32_t)out.width, (int32_t)out.height, planar};
+        [enc setBytes:&snapshot length:sizeof(snapshot) atIndex:0];
+        [enc setBytes:meta length:sizeof(meta) atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(out.width, out.height, 1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+        [enc endEncoding];
+        return YES;
+    }
     id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
     [enc setComputePipelineState:planar ? _toRGBAPlanar : _toRGBA];
     [enc setTexture:luma atIndex:0];
@@ -317,10 +363,10 @@ static NSError *SPBudgetMetalError(NSInteger code, NSString *message) {
                    owners:(NSMutableArray *)owners {
     id<MTLTexture> in = [self textureForPlane:0 ofFrame:rgba format:MTLPixelFormatRGBA16Float owners:owners];
     id<MTLTexture> luma = [self textureForPlane:0 ofFrame:frame
-                                         format:_tenBit ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm
+                                         format:(_tenBit || _doviReconstruction) ? MTLPixelFormatR16Unorm : MTLPixelFormatR8Unorm
                                          owners:owners];
     id<MTLTexture> chroma = [self textureForPlane:1 ofFrame:frame
-                                           format:_tenBit ? MTLPixelFormatRG16Unorm : MTLPixelFormatRG8Unorm
+                                           format:(_tenBit || _doviReconstruction) ? MTLPixelFormatRG16Unorm : MTLPixelFormatRG8Unorm
                                            owners:owners];
     if (!in || !luma || !chroma) return NO;
     id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];

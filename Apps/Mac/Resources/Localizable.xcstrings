@@ -319,112 +319,6 @@
         }
       }
     },
-    "alert.screenshotSaved": {
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Schnappschuss gesichert"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Screenshot Saved"
-          }
-        },
-        "es": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Captura guardada"
-          }
-        },
-        "fr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Capture d’écran enregistrée"
-          }
-        },
-        "id": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Jepretan layar disimpan"
-          }
-        },
-        "it": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Istantanea salvata"
-          }
-        },
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "スクリーンショットを保存しました"
-          }
-        },
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "스크린샷 저장됨"
-          }
-        },
-        "nl": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Schermafbeelding bewaard"
-          }
-        },
-        "pl": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Zapisano zrzut ekranu"
-          }
-        },
-        "pt": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Captura de tela salva"
-          }
-        },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Снимок сохранён"
-          }
-        },
-        "th": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "บันทึกภาพหน้าจอแล้ว"
-          }
-        },
-        "tr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Ekran görüntüsü kaydedildi"
-          }
-        },
-        "vi": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Đã lưu ảnh chụp"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "已保存截图"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "已儲存截圖"
-          }
-        }
-      }
-    },
     "app.displayName": {
       "localizations": {
         "de": {
@@ -1697,6 +1591,112 @@
         }
       }
     },
+    "captions.button.stopPrevious": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorherigen stoppen"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stop Previous"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Detener el anterior"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Arrêter le précédent"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hentikan yang Sebelumnya"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Interrompi il precedente"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "前の動画を停止"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이전 작업 중지"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorige stoppen"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zatrzymaj poprzedni"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Interromper o anterior"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Остановить предыдущее"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "หยุดวิดีโอก่อนหน้า"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Öncekini Durdur"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dừng video trước"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止上一部"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止上一部"
+          }
+        }
+      }
+    },
     "captions.button.useExisting": {
       "localizations": {
         "de": {
@@ -1803,6 +1803,218 @@
         }
       }
     },
+    "captions.button.waitForIt": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abwarten"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wait for It"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esperar a que termine"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Attendre la fin"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tunggu Selesai"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Attendi la fine"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "完了を待つ"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "완료까지 기다리기"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wachten tot klaar"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Poczekaj na koniec"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aguardar terminar"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Дождаться"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "รอให้เสร็จ"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bitmesini Bekle"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chờ hoàn tất"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等它完成"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等它完成"
+          }
+        }
+      }
+    },
+    "captions.dialog.behindTitle": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wartet auf „%1$@“, wird noch erstellt, %2$d %%"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for “%1$@”, still generating, %2$d%%"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esperando a «%1$@», aún generando, %2$d %%"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "En attente de « %1$@ », toujours en cours, %2$d %%"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Menunggu “%1$@”, masih dibuat, %2$d%%"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "In attesa di “%1$@”, ancora in corso, %2$d%%"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「%1$@」の後に待機中、まだ生成中（%2$d%%）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "“%1$@” 뒤에서 대기 중, 아직 생성 중 %2$d%%"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wacht op “%1$@”, nog bezig, %2$d%%"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Czeka na „%1$@”, nadal w toku, %2$d%%"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aguardando “%1$@”, ainda gerando, %2$d%%"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ожидание «%1$@», ещё создаётся, %2$d%%"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "รอ “%1$@” อยู่ ยังสร้างไม่เสร็จ %2$d%%"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "“%1$@” bekleniyor, hâlâ oluşturuluyor, %%%2$d"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Đang chờ “%1$@”, vẫn đang tạo, %2$d%%"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "这部排在「%1$@」后面，它还在生成，%2$d%%"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "這部排在「%1$@」後面，它還在產生，%2$d%%"
+          }
+        }
+      }
+    },
     "captions.dialog.eta": {
       "localizations": {
         "de": {
@@ -1905,6 +2117,218 @@
           "stringUnit": {
             "state": "translated",
             "value": "，剩餘約 %@"
+          }
+        }
+      }
+    },
+    "captions.dialog.jumpAhead": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorherigen stoppen: Dieses Video startet sofort, die bisher erstellten Untertitel des vorherigen werden verworfen.\nAbwarten: Dieses Video startet automatisch, sobald das vorherige fertig ist."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stop previous: this video starts now, and what the previous one generated is discarded.\nWait: this video starts automatically when it finishes."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Detener el anterior: este vídeo empieza ahora y se descarta lo generado del anterior.\nEsperar: este vídeo empieza automáticamente cuando el anterior termine."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Arrêter le précédent : cette vidéo démarre tout de suite et les sous-titres déjà générés pour la précédente sont perdus.\nAttendre : cette vidéo démarre automatiquement une fois la précédente terminée."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hentikan yang sebelumnya: video ini langsung dimulai, hasil subtitle video sebelumnya dibuang.\nTunggu: video ini otomatis dimulai setelah yang sebelumnya selesai."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Interrompi il precedente: questo video inizia subito e i sottotitoli già generati per il precedente vengono eliminati.\nAttendi: questo video inizia automaticamente quando il precedente è completato."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "前の動画を停止：この動画をすぐに開始し、前の動画で生成済みの内容は破棄されます。\n完了を待つ：前の動画が完了すると、この動画を自動的に開始します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이전 작업 중지: 이 영상을 바로 시작하고, 이전 영상에서 생성된 내용은 삭제됩니다.\n기다리기: 이전 영상이 완료되면 이 영상이 자동으로 시작됩니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorige stoppen: deze video begint meteen, de al gegenereerde ondertitels van de vorige gaan verloren.\nWachten: deze video begint automatisch zodra de vorige klaar is."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zatrzymaj poprzedni: ten film zacznie się od razu, a napisy wygenerowane dotąd dla poprzedniego zostaną odrzucone.\nPoczekaj: ten film zacznie się automatycznie po ukończeniu poprzedniego."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Interromper o anterior: este vídeo começa agora e o que foi gerado do anterior é descartado.\nAguardar: este vídeo começa automaticamente quando o anterior terminar."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Остановить предыдущее: это видео начнётся сразу, а уже созданные субтитры предыдущего будут потеряны.\nДождаться: это видео начнётся автоматически после завершения предыдущего."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "หยุดวิดีโอก่อนหน้า: วิดีโอนี้จะเริ่มทันที และคำบรรยายที่สร้างไว้ของวิดีโอก่อนหน้าจะถูกทิ้ง\nรอให้เสร็จ: วิดีโอนี้จะเริ่มโดยอัตโนมัติเมื่อวิดีโอก่อนหน้าเสร็จ"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Öncekini durdur: Bu video hemen başlar, önceki video için oluşturulan altyazılar silinir.\nBekle: Önceki video bitince bu video otomatik olarak başlar."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dừng video trước: video này bắt đầu ngay, phụ đề đã tạo của video trước sẽ bị hủy.\nChờ: video này tự động bắt đầu khi video trước hoàn tất."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止上一部：这部马上开始，上一部已生成的内容丢弃。\n等它完成：这部自动开始。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止上一部：這部馬上開始，上一部已產生的內容會捨棄。\n等它完成：這部自動開始。"
+          }
+        }
+      }
+    },
+    "captions.dialog.jumpAheadETA": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorherigen stoppen: Dieses Video startet sofort, die bisher erstellten Untertitel des vorherigen werden verworfen.\nAbwarten: Dieses Video startet automatisch, sobald das vorherige fertig ist, noch etwa %@."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stop previous: this video starts now, and what the previous one generated is discarded.\nWait: this video starts automatically when it finishes, about %@ left."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Detener el anterior: este vídeo empieza ahora y se descarta lo generado del anterior.\nEsperar: este vídeo empieza automáticamente cuando el anterior termine, quedan unos %@."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Arrêter le précédent : cette vidéo démarre tout de suite et les sous-titres déjà générés pour la précédente sont perdus.\nAttendre : cette vidéo démarre automatiquement une fois la précédente terminée, encore %@ environ."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hentikan yang sebelumnya: video ini langsung dimulai, hasil subtitle video sebelumnya dibuang.\nTunggu: video ini otomatis dimulai setelah yang sebelumnya selesai, sekitar %@ lagi."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Interrompi il precedente: questo video inizia subito e i sottotitoli già generati per il precedente vengono eliminati.\nAttendi: questo video inizia automaticamente quando il precedente è completato, circa %@ rimanenti."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "前の動画を停止：この動画をすぐに開始し、前の動画で生成済みの内容は破棄されます。\n完了を待つ：前の動画が完了すると、この動画を自動的に開始します。残り約 %@。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이전 작업 중지: 이 영상을 바로 시작하고, 이전 영상에서 생성된 내용은 삭제됩니다.\n기다리기: 이전 영상이 완료되면 이 영상이 자동으로 시작됩니다. 약 %@ 남음."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorige stoppen: deze video begint meteen, de al gegenereerde ondertitels van de vorige gaan verloren.\nWachten: deze video begint automatisch zodra de vorige klaar is, nog ongeveer %@."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zatrzymaj poprzedni: ten film zacznie się od razu, a napisy wygenerowane dotąd dla poprzedniego zostaną odrzucone.\nPoczekaj: ten film zacznie się automatycznie po ukończeniu poprzedniego, pozostało około %@."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Interromper o anterior: este vídeo começa agora e o que foi gerado do anterior é descartado.\nAguardar: este vídeo começa automaticamente quando o anterior terminar, cerca de %@ restantes."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Остановить предыдущее: это видео начнётся сразу, а уже созданные субтитры предыдущего будут потеряны.\nДождаться: это видео начнётся автоматически после завершения предыдущего, осталось около %@."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "หยุดวิดีโอก่อนหน้า: วิดีโอนี้จะเริ่มทันที และคำบรรยายที่สร้างไว้ของวิดีโอก่อนหน้าจะถูกทิ้ง\nรอให้เสร็จ: วิดีโอนี้จะเริ่มโดยอัตโนมัติเมื่อวิดีโอก่อนหน้าเสร็จ เหลืออีกประมาณ %@"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Öncekini durdur: Bu video hemen başlar, önceki video için oluşturulan altyazılar silinir.\nBekle: Önceki video bitince bu video otomatik olarak başlar, yaklaşık %@ kaldı."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dừng video trước: video này bắt đầu ngay, phụ đề đã tạo của video trước sẽ bị hủy.\nChờ: video này tự động bắt đầu khi video trước hoàn tất, còn khoảng %@."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止上一部：这部马上开始，上一部已生成的内容丢弃。\n等它完成：这部自动开始，剩余约 %@。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止上一部：這部馬上開始，上一部已產生的內容會捨棄。\n等它完成：這部自動開始，剩餘約 %@。"
           }
         }
       }
@@ -2329,6 +2753,112 @@
           "stringUnit": {
             "state": "translated",
             "value": "正在產生「%@」的字幕"
+          }
+        }
+      }
+    },
+    "captions.dialog.stillGeneratingTitle": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Untertitel für „%1$@“ werden noch erstellt, %2$d %%"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "“%1$@” is still generating subtitles, %2$d%%"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "«%1$@» aún está generando subtítulos, %2$d %%"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Les sous-titres de « %1$@ » sont encore en cours, %2$d %%"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Subtitle “%1$@” masih dibuat, %2$d%%"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "I sottotitoli di “%1$@” sono ancora in corso, %2$d%%"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「%1$@」の字幕はまだ生成中です（%2$d%%）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "“%1$@” 자막이 아직 생성 중입니다, %2$d%%"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ondertitels voor “%1$@” worden nog gegenereerd, %2$d%%"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Napisy do „%1$@” są nadal generowane, %2$d%%"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "“%1$@” ainda está gerando legendas, %2$d%%"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Субтитры для «%1$@» ещё создаются, %2$d%%"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "คำบรรยายของ “%1$@” ยังสร้างไม่เสร็จ %2$d%%"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "“%1$@” için altyazı hâlâ oluşturuluyor, %%%2$d"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Phụ đề của “%1$@” vẫn đang được tạo, %2$d%%"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「%1$@」的字幕还在生成，%2$d%%"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「%1$@」的字幕還在產生，%2$d%%"
           }
         }
       }
@@ -8280,7 +8810,7 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Queued, waiting for %@ to finish"
+            "value": "Waiting for “%@” to finish"
           }
         },
         "es": {
@@ -8364,7 +8894,7 @@
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "排队中，等 %@ 完成"
+            "value": "排队中，等「%@」完成"
           }
         },
         "zh-Hant": {
@@ -8901,6 +9431,112 @@
           "stringUnit": {
             "state": "translated",
             "value": "這份字幕已是%@，不需要翻譯。"
+          }
+        }
+      }
+    },
+    "captions.status.supersededBy": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gestoppt. Stattdessen wird „%@“ erstellt"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stopped. Generating “%@” instead"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Detenido. Ahora se genera «%@»"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Arrêté. Génération de « %@ » à la place"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dihentikan. Sekarang membuat “%@”"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Interrotto. Ora viene generato “%@”"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止しました。代わりに「%@」を生成します"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "중지됨. 대신 “%@” 자막을 생성합니다"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gestopt. In plaats daarvan wordt “%@” gegenereerd"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zatrzymano. Zamiast tego generowane są napisy do „%@”"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Interrompido. Gerando “%@” em vez disso"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Остановлено. Вместо этого создаются субтитры для «%@»"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "หยุดแล้ว เปลี่ยนไปสร้างคำบรรยายของ “%@” แทน"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Durduruldu. Bunun yerine “%@” oluşturuluyor"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Đã dừng. Chuyển sang tạo phụ đề cho “%@”"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已停止，改为生成「%@」"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已停止，改為產生「%@」"
           }
         }
       }
@@ -23321,6 +23957,112 @@
         }
       }
     },
+    "media.rotation": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Drehen"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rotation"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rotación"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rotation"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rotasi"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rotazione"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "回転"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "회전"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rotatie"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Obrót"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rotação"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Поворот"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "หมุนภาพ"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Döndürme"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Xoay"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "旋转"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "旋轉"
+          }
+        }
+      }
+    },
     "media.trc": {
       "localizations": {
         "de": {
@@ -24483,6 +25225,112 @@
           "stringUnit": {
             "state": "translated",
             "value": "未知"
+          }
+        }
+      }
+    },
+    "media.value.mirrored": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gespiegelt"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mirrored"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reflejado"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "En miroir"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dicerminkan"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Specchiato"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ミラー反転"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "미러링됨"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gespiegeld"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Odbicie lustrzane"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Espelhado"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Зеркально"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "สะท้อนแบบกระจก"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aynalanmış"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lật gương"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "镜像"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "鏡像"
           }
         }
       }
@@ -36567,6 +37415,1596 @@
           "stringUnit": {
             "state": "translated",
             "value": "你的媒體與播放記錄只留在這部 Mac。現有的更新檢查會向 khua.app 傳送一個隨機產生的安裝識別碼和 App 版本，用於統計活躍安裝數。不會增加請求，也不傳送硬體識別碼或播放資料。安裝層級的記錄保留最近 30 個 UTC 日期的資料，彙總數字可能保留更久。你可以在 App 選單中關閉自動檢查更新；手動檢查更新時仍會傳送這些資訊。"
+          }
+        }
+      }
+    },
+    "screenshot.notice.savedToFmt": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Schnappschuss in „%@“ gesichert"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Screenshot saved to “%@”"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Captura guardada en «%@»"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Capture d’écran enregistrée dans « %@ »"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Jepretan layar disimpan ke “%@”"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Istantanea salvata in “%@”"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "スクリーンショットを「%@」に保存しました"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "스크린샷을 ‘%@’에 저장했습니다"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Schermafbeelding bewaard in ‘%@’"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zapisano zrzut ekranu w „%@”"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Captura de tela salva em “%@”"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Снимок сохранён в «%@»"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "บันทึกภาพหน้าจอไว้ที่ “%@” แล้ว"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ekran görüntüsü “%@” klasörüne kaydedildi"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Đã lưu ảnh chụp vào “%@”"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "截图已保存到「%@」"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "截圖已儲存到「%@」"
+          }
+        }
+      }
+    },
+    "access.folder.grantButton": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zugriff erlauben"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Grant Access"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permitir acceso"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Autoriser l’accès"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Izinkan Akses"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Consenti accesso"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アクセスを許可"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "접근 허용"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Toegang geven"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zezwól na dostęp"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permitir acesso"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Разрешить доступ"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "อนุญาตการเข้าถึง"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erişime izin ver"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cho phép truy cập"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "允许访问"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "允許存取"
+          }
+        }
+      }
+    },
+    "access.folder.captionsMessage": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erzeugte Untertitel werden neben dem Video gesichert. Erlaube den Zugriff auf diesen Ordner, dann wirst du hier nicht erneut gefragt."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Generated subtitles are saved next to the video. Allow access to this folder and you won’t be asked again when generating subtitles here."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Los subtítulos generados se guardan junto al vídeo. Permite el acceso a esta carpeta y no se te volverá a preguntar aquí."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Les sous-titres générés sont enregistrés à côté de la vidéo. Autorisez l’accès à ce dossier pour ne plus avoir à confirmer ici."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Subtitel yang dibuat disimpan di sebelah video. Izinkan akses ke folder ini agar tidak ditanya lagi saat membuat subtitel di sini."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "I sottotitoli generati vengono salvati accanto al video. Consenti l’accesso a questa cartella e non ti verrà più chiesto qui."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "生成した字幕はビデオと同じ場所に保存されます。このフォルダへのアクセスを許可すると、以後ここで字幕を生成するときに確認されません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "생성된 자막은 동영상 옆에 저장됩니다. 이 폴더에 대한 접근을 허용하면 이후 여기에서 자막을 생성할 때 다시 묻지 않습니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gegenereerde ondertitels worden naast de video bewaard. Geef toegang tot deze map, dan wordt het hier niet opnieuw gevraagd."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wygenerowane napisy są zapisywane obok wideo. Zezwól na dostęp do tego folderu, a pytanie nie pojawi się tu ponownie."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "As legendas geradas são salvas ao lado do vídeo. Permita o acesso a esta pasta e isso não será perguntado novamente aqui."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Созданные субтитры сохраняются рядом с видео. Разрешите доступ к этой папке, и здесь больше не будет запросов."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "คำบรรยายที่สร้างจะถูกบันทึกไว้ข้างวิดีโอ อนุญาตให้เข้าถึงโฟลเดอร์นี้แล้วจะไม่ถามอีกเมื่อสร้างคำบรรยายที่นี่"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Oluşturulan altyazılar videonun yanına kaydedilir. Bu klasöre erişim izni verin; burada bir daha sorulmaz."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Phụ đề được tạo sẽ lưu cạnh video. Hãy cho phép truy cập thư mục này để không bị hỏi lại khi tạo phụ đề tại đây."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "生成的字幕会保存在视频旁边。允许访问这个文件夹后，以后在这里生成字幕不再询问。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "產生的字幕會儲存在影片旁邊。允許存取這個資料夾後，之後在這裡產生字幕將不再詢問。"
+          }
+        }
+      }
+    },
+    "access.folder.playlistMessage": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erlaube den Zugriff auf diesen Ordner, um die nächste Folge abzuspielen und Untertitel daraus automatisch zu laden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Allow access to this folder to play the next episode and load subtitles from it automatically."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permite el acceso a esta carpeta para reproducir el siguiente episodio y cargar sus subtítulos automáticamente."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Autorisez l’accès à ce dossier pour lire l’épisode suivant et charger automatiquement ses sous-titres."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Izinkan akses ke folder ini untuk memutar episode berikutnya dan memuat subtitel secara otomatis."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Consenti l’accesso a questa cartella per riprodurre l’episodio successivo e caricarne automaticamente i sottotitoli."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このフォルダへのアクセスを許可すると、同じフォルダ内の次のエピソードの再生や字幕の自動読み込みができます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 폴더에 대한 접근을 허용하면 같은 폴더의 다음 에피소드를 재생하고 자막을 자동으로 불러올 수 있습니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Geef toegang tot deze map om de volgende aflevering af te spelen en ondertitels automatisch te laden."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zezwól na dostęp do tego folderu, aby odtwarzać następny odcinek i automatycznie wczytywać napisy."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permita o acesso a esta pasta para reproduzir o próximo episódio e carregar legendas automaticamente."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Разрешите доступ к этой папке, чтобы воспроизводить следующую серию и автоматически загружать субтитры."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "อนุญาตให้เข้าถึงโฟลเดอร์นี้เพื่อเล่นตอนถัดไปและโหลดคำบรรยายโดยอัตโนมัติ"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sonraki bölümü oynatmak ve altyazıları otomatik yüklemek için bu klasöre erişim izni verin."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cho phép truy cập thư mục này để phát tập tiếp theo và tự động tải phụ đề."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "允许访问这个文件夹后，可以播放同一文件夹里的下一集，并自动加载字幕。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "允許存取這個資料夾後，即可播放同一資料夾中的下一集，並自動載入字幕。"
+          }
+        }
+      }
+    },
+    "access.recent.reauthorizeFmt": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wähle „%@“ erneut aus, um den Zugriff wiederherzustellen."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Select “%@” again to restore access."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vuelve a seleccionar «%@» para restaurar el acceso."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sélectionnez à nouveau « %@ » pour rétablir l’accès."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pilih “%@” lagi untuk memulihkan akses."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seleziona di nuovo “%@” per ripristinare l’accesso."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アクセスを復元するには「%@」をもう一度選択してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "접근 권한을 복원하려면 ‘%@’을(를) 다시 선택하세요."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Selecteer ‘%@’ opnieuw om de toegang te herstellen."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wybierz ponownie „%@”, aby przywrócić dostęp."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Selecione “%@” novamente para restaurar o acesso."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Выберите «%@» ещё раз, чтобы восстановить доступ."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "เลือก “%@” อีกครั้งเพื่อกู้คืนการเข้าถึง"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erişimi geri yüklemek için “%@” öğesini yeniden seçin."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chọn lại “%@” để khôi phục quyền truy cập."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请再选择一次「%@」以恢复访问。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "請再選擇一次「%@」以恢復存取。"
+          }
+        }
+      }
+    },
+    "access.folder.wrongFolderFmt": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Der ausgewählte Ordner enthält dieses Video nicht. Wähle den Ordner „%@“ oder einen übergeordneten Ordner."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The selected folder doesn’t contain this video. Choose the “%@” folder or a folder that contains it."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "La carpeta seleccionada no contiene este vídeo. Elige la carpeta «%@» o una carpeta que la contenga."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Le dossier sélectionné ne contient pas cette vidéo. Choisissez le dossier « %@ » ou un dossier qui le contient."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Folder yang dipilih tidak berisi video ini. Pilih folder “%@” atau folder yang memuatnya."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "La cartella selezionata non contiene questo video. Scegli la cartella “%@” o una cartella che la contiene."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "選択したフォルダにはこのビデオが含まれていません。「%@」フォルダ、またはその上位のフォルダを選択してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "선택한 폴더에 이 동영상이 없습니다. ‘%@’ 폴더 또는 그 상위 폴더를 선택하세요."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "De gekozen map bevat deze video niet. Kies de map ‘%@’ of een map waarin deze staat."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wybrany folder nie zawiera tego wideo. Wybierz folder „%@” lub folder nadrzędny."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A pasta selecionada não contém este vídeo. Escolha a pasta “%@” ou uma pasta que a contenha."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Выбранная папка не содержит это видео. Выберите папку «%@» или папку, в которой она находится."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "โฟลเดอร์ที่เลือกไม่มีวิดีโอนี้ โปรดเลือกโฟลเดอร์ “%@” หรือโฟลเดอร์ที่อยู่เหนือขึ้นไป"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seçilen klasör bu videoyu içermiyor. “%@” klasörünü veya onu içeren bir klasörü seçin."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Thư mục đã chọn không chứa video này. Hãy chọn thư mục “%@” hoặc thư mục chứa nó."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "所选文件夹不包含这个视频。请选择「%@」文件夹或它的上级文件夹。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "所選資料夾不包含這部影片。請選擇「%@」資料夾或其上層資料夾。"
+          }
+        }
+      }
+    },
+    "dovi.status.base": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kompatible Basisebene (RPU nicht verfügbar)"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Compatible base layer (RPU unavailable)"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Capa base compatible (RPU no disponible)"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couche de base compatible (RPU indisponible)"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lapisan dasar kompatibel (RPU tidak tersedia)"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Livello base compatibile (RPU non disponibile)"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "互換ベースレイヤー（RPUを利用できません）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "호환 기본 레이어(RPU 사용 불가)"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Compatibele basislaag (RPU niet beschikbaar)"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zgodna warstwa bazowa (RPU niedostępne)"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Camada base compatível (RPU indisponível)"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Совместимый базовый слой (RPU недоступны)"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "เลเยอร์พื้นฐานที่เข้ากันได้ (RPU ไม่พร้อมใช้งาน)"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uyumlu temel katman (RPU kullanılamıyor)"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lớp cơ sở tương thích (RPU không khả dụng)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "兼容基础层（RPU 不可用）"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "相容基礎層（RPU 無法使用）"
+          }
+        }
+      }
+    },
+    "dovi.status.cm4Basic": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4-Basismapping (L3 + L8)"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Basic CM4 mapping (L3 + L8)"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mapeo CM4 básico (L3 + L8)"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mappage CM4 de base (L3 + L8)"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pemetaan CM4 dasar (L3 + L8)"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mappatura CM4 di base (L3 + L8)"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4基本マッピング（L3 + L8）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 기본 매핑(L3 + L8)"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Basis-CM4-mapping (L3 + L8)"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Podstawowe mapowanie CM4 (L3 + L8)"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mapeamento CM4 básico (L3 + L8)"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Базовое отображение CM4 (L3 + L8)"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "การแมป CM4 พื้นฐาน (L3 + L8)"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Temel CM4 eşlemesi (L3 + L8)"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ánh xạ CM4 cơ bản (L3 + L8)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 基础映射（L3 + L8）"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 基礎映射（L3 + L8）"
+          }
+        }
+      }
+    },
+    "dovi.status.fixed": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Feste IPT-Konvertierung (RPU nicht verfügbar)"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fixed IPT conversion (RPU unavailable)"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conversión IPT fija (RPU no disponible)"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conversion IPT fixe (RPU indisponible)"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Konversi IPT tetap (RPU tidak tersedia)"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conversione IPT fissa (RPU non disponibile)"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "固定IPT変換（RPUを利用できません）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "고정 IPT 변환(RPU 사용 불가)"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vaste IPT-conversie (RPU niet beschikbaar)"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stała konwersja IPT (RPU niedostępne)"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conversão IPT fixa (RPU indisponível)"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Фиксированное преобразование IPT (RPU недоступны)"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "การแปลง IPT แบบคงที่ (RPU ไม่พร้อมใช้งาน)"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sabit IPT dönüşümü (RPU kullanılamıyor)"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chuyển đổi IPT cố định (RPU không khả dụng)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "固定 IPT 转换（RPU 不可用）"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "固定 IPT 轉換（RPU 無法使用）"
+          }
+        }
+      }
+    },
+    "dovi.status.invalidCM4": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 nicht verfügbar; Basismapping"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 unavailable; base mapping"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 no disponible; mapeo base"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 indisponible ; mappage de base"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 tidak tersedia; pemetaan dasar"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 non disponibile; mappatura di base"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4を利用できないため基本マッピングを使用"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 사용 불가, 기본 매핑 적용"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 niet beschikbaar; basismapping"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 niedostępne; mapowanie bazowe"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 indisponível; mapeamento base"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 недоступен; базовое отображение"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 ไม่พร้อมใช้งาน ใช้การแมปพื้นฐาน"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 kullanılamıyor; temel eşleme"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 không khả dụng; dùng ánh xạ cơ sở"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 不可用，使用基础映射"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CM4 無法使用，使用基礎映射"
+          }
+        }
+      }
+    },
+    "dovi.status.missingEL": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kompatible Basisebene (EL nicht verfügbar)"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Compatible base layer (EL unavailable)"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Capa base compatible (EL no disponible)"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couche de base compatible (EL indisponible)"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lapisan dasar kompatibel (EL tidak tersedia)"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Livello base compatibile (EL non disponibile)"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "互換ベースレイヤー（ELを利用できません）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "호환 기본 레이어(EL 사용 불가)"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Compatibele basislaag (EL niet beschikbaar)"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zgodna warstwa bazowa (EL niedostępna)"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Camada base compatível (EL indisponível)"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Совместимый базовый слой (EL недоступен)"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "เลเยอร์พื้นฐานที่เข้ากันได้ (EL ไม่พร้อมใช้งาน)"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uyumlu temel katman (EL kullanılamıyor)"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lớp cơ sở tương thích (EL không khả dụng)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "兼容基础层（EL 不可用）"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "相容基礎層（EL 無法使用）"
+          }
+        }
+      }
+    },
+    "dovi.status.pending": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Warten auf ein dekodiertes Bild"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for a decoded frame"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esperando un fotograma decodificado"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "En attente d’une image décodée"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Menunggu bingkai yang didekode"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "In attesa di un fotogramma decodificato"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "デコード済みフレームを待機中"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "디코딩된 프레임 대기 중"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wachten op een gedecodeerd frame"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Oczekiwanie na zdekodowaną klatkę"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aguardando um quadro decodificado"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ожидание декодированного кадра"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "กำลังรอเฟรมที่ถอดรหัสแล้ว"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Çözülmüş kare bekleniyor"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Đang chờ khung hình đã giải mã"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等待解码帧"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "等待解碼影格"
+          }
+        }
+      }
+    },
+    "dovi.status.unavailableTarget": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zielanpassung nicht verfügbar; Basismapping"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Target trim unavailable; base mapping"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajuste de destino no disponible; mapeo base"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajustement cible indisponible ; mappage de base"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Penyesuaian target tidak tersedia; pemetaan dasar"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Regolazione di destinazione non disponibile; mappatura di base"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ターゲットトリムを利用できないため基本マッピングを使用"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "대상 트림 사용 불가, 기본 매핑 적용"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Doelcorrectie niet beschikbaar; basismapping"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Korekcja docelowa niedostępna; mapowanie bazowe"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajuste de destino indisponível; mapeamento base"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Целевая коррекция недоступна; базовое отображение"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "การปรับแต่งเป้าหมายไม่พร้อมใช้งาน ใช้การแมปพื้นฐาน"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hedef ayarı kullanılamıyor; temel eşleme"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tinh chỉnh đích không khả dụng; dùng ánh xạ cơ sở"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "目标微调不可用，使用基础映射"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "目標微調無法使用，使用基礎映射"
+          }
+        }
+      }
+    },
+    "error.doviMetadataUnsupported": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diese Dolby Vision-Datei verwendet ein nicht unterstütztes Metadatenformat und hat keine kompatible Basisschicht."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This Dolby Vision file requires an unsupported metadata format and has no compatible base layer."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Este archivo Dolby Vision usa un formato de metadatos no compatible y no tiene una capa base compatible."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ce fichier Dolby Vision utilise un format de métadonnées non pris en charge et ne possède aucune couche de base compatible."
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "File Dolby Vision ini menggunakan format metadata yang belum didukung dan tidak memiliki lapisan dasar yang kompatibel."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Questo file Dolby Vision usa un formato di metadati non supportato e non dispone di un livello base compatibile."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このDolby Visionファイルは未対応のメタデータ形式を使用しており、互換性のあるベースレイヤーもありません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 Dolby Vision 파일은 지원되지 않는 메타데이터 형식을 사용하며 호환되는 기본 레이어가 없습니다."
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dit Dolby Vision-bestand gebruikt een niet-ondersteunde metadata-indeling en heeft geen compatibele basislaag."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ten plik Dolby Vision używa nieobsługiwanego formatu metadanych i nie ma zgodnej warstwy bazowej."
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Este ficheiro Dolby Vision utiliza um formato de metadados não suportado e não tem uma camada base compatível."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Этот файл Dolby Vision использует неподдерживаемый формат метаданных и не содержит совместимого базового слоя."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ไฟล์ Dolby Vision นี้ใช้รูปแบบข้อมูลเมตาที่ยังไม่รองรับ และไม่มีเลเยอร์พื้นฐานที่เข้ากันได้"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bu Dolby Vision dosyası desteklenmeyen bir meta veri biçimi kullanıyor ve uyumlu bir temel katmanı yok."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tệp Dolby Vision này sử dụng định dạng siêu dữ liệu chưa được hỗ trợ và không có lớp cơ sở tương thích."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此 Dolby Vision 文件使用了暂不支持的元数据格式，且没有可兼容播放的基础层。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此 Dolby Vision 檔案使用尚未支援的中繼資料格式，且沒有相容的基礎層可供播放。"
+          }
+        }
+      }
+    },
+    "media.doviProcessing": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aktuelle DV-Verarbeitung"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Current DV processing"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Procesamiento DV actual"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Traitement DV actuel"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pemrosesan DV saat ini"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Elaborazione DV attuale"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "現在のDV処理"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "현재 DV 처리"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Huidige DV-verwerking"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bieżące przetwarzanie DV"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Processamento DV atual"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Текущая обработка DV"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "การประมวลผล DV ปัจจุบัน"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Geçerli DV işleme"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Xử lý DV hiện tại"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "当前 DV 处理"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "目前 DV 處理"
           }
         }
       }

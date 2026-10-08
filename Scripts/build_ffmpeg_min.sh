@@ -29,6 +29,7 @@ PATCH="$SP_ROOT/$PATCH_REL"
 SPEEX_PATCH="$SP_ROOT/$(sp_lock_get "$NAME" patches 1 path)"
 ANNEXB_PATCH="$SP_ROOT/$(sp_lock_get "$NAME" patches 2 path)"
 ANNEXB_SEEK_PATCH="$SP_ROOT/$(sp_lock_get "$NAME" patches 3 path)"
+DOVI_PATCH="$SP_ROOT/$(sp_lock_get "$NAME" patches 4 path)"
 PREFIX="$SP_THIRDPARTY/ffmpeg-min"
 STAMP="$PREFIX/.build-stamp.json"
 REQUIRED_OUTPUTS=(
@@ -40,6 +41,7 @@ REQUIRED_OUTPUTS=(
   "$PREFIX/lib/pkgconfig/libavformat.pc"
   "$PREFIX/include/libavformat/avformat.h"
   "$PREFIX/include/libavcodec/avcodec.h"
+  "$PREFIX/include/libavcodec/sp_dovi_rpu.h"
   "$PREFIX/include/libavutil/avutil.h"
   "$PREFIX/share/ffmpeg-capabilities.json"
 )
@@ -55,6 +57,7 @@ JOBS="$(sysctl -n hw.ncpu)"
 [ "$(sp_sha256 "$SPEEX_PATCH")" = "$(sp_lock_get "$NAME" patches 1 sha256)" ] || sp_die "FFmpeg Speex patch SHA-256 does not match the lock"
 [ "$(sp_sha256 "$ANNEXB_PATCH")" = "$(sp_lock_get "$NAME" patches 2 sha256)" ] || sp_die "FFmpeg Annex-B patch SHA-256 does not match the lock"
 [ "$(sp_sha256 "$ANNEXB_SEEK_PATCH")" = "$(sp_lock_get "$NAME" patches 3 sha256)" ] || sp_die "FFmpeg Annex-B seek patch SHA-256 does not match the lock"
+[ "$(sp_sha256 "$DOVI_PATCH")" = "$(sp_lock_get "$NAME" patches 4 sha256)" ] || sp_die "FFmpeg Dolby Vision patch SHA-256 does not match the lock"
 [ -f "$DAV1D_PREFIX/lib/pkgconfig/dav1d.pc" ] || sp_die "dav1d installation is incomplete"
 [ -f "$DAV1D_STAMP" ] || sp_die "dav1d build stamp is missing"
 
@@ -64,10 +67,13 @@ RECIPE_ARGS=(
   --input "$SP_ROOT/Scripts/lib/build_common.sh"
   --input "$SP_ROOT/Scripts/lib/deps_lock.py"
   --input "$SP_ROOT/Scripts/lib/ffmpeg_capabilities.c"
+  --input "$SP_ROOT/Scripts/lib/sp_dovi_rpu.c"
+  --input "$SP_ROOT/Scripts/lib/sp_dovi_rpu.h"
   --input "$PATCH"
   --input "$SPEEX_PATCH"
   --input "$ANNEXB_PATCH"
   --input "$ANNEXB_SEEK_PATCH"
+  --input "$DOVI_PATCH"
   --stamp "$DAV1D_STAMP"
   --stamp "$SPEEX_PREFIX/.build-stamp.json"
   --tool "ar=$AR"
@@ -104,6 +110,7 @@ echo "==> Applying the locked MOV multi-stsd seek patch"
 (cd "$SOURCE" && patch --batch -F 0 -p1 < "$SPEEX_PATCH")
 (cd "$SOURCE" && patch --batch -F 0 -p1 < "$ANNEXB_PATCH")
 (cd "$SOURCE" && patch --batch -F 0 -p1 < "$ANNEXB_SEEK_PATCH")
+(cd "$SOURCE" && patch --batch -F 0 -p1 < "$DOVI_PATCH")
 
 # GitHub tag archives lack the release VERSION file. Without it FFmpeg may
 # embed the enclosing checkout's Git identity instead of the locked version.
@@ -170,12 +177,20 @@ if ! "$MAKE" -j"$JOBS" >"$WORK/make.log" 2>&1; then
   tail -50 "$WORK/make.log" >&2
   exit 1
 fi
+# Build against the pinned parser internals without exposing them in the app ABI.
+"$CC" -std=c11 -O2 -isysroot "$SDKROOT" -arch arm64 \
+  -mmacosx-version-min="$MACOSX_DEPLOYMENT_TARGET" \
+  -I "$SOURCE" -I "$SP_ROOT/Scripts/lib" \
+  -c "$SP_ROOT/Scripts/lib/sp_dovi_rpu.c" -o "$WORK/sp_dovi_rpu.o"
+"$AR" r libavcodec/libavcodec.a "$WORK/sp_dovi_rpu.o"
+"$RANLIB" libavcodec/libavcodec.a
 if ! "$MAKE" DESTDIR="$DESTDIR" install >"$WORK/install.log" 2>&1; then
   tail -50 "$WORK/install.log" >&2
   exit 1
 fi
 
 STAGED_PREFIX="$DESTDIR$PREFIX"
+cp "$SP_ROOT/Scripts/lib/sp_dovi_rpu.h" "$STAGED_PREFIX/include/libavcodec/sp_dovi_rpu.h"
 # Check actual registration, not only configure's accepted component names.
 "$CC" -std=c11 -Wall -Wextra -Werror -isysroot "$SDKROOT" -arch arm64 \
   -mmacosx-version-min="$MACOSX_DEPLOYMENT_TARGET" \

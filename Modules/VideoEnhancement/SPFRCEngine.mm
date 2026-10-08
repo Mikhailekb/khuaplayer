@@ -15,14 +15,29 @@ static NSError *SPFRCError(NSInteger code, NSString *message) {
                            userInfo:@{NSLocalizedDescriptionKey: message ?: @""}];
 }
 
-static void SPFRCCopyStaticAttachments(CVPixelBufferRef source, CVPixelBufferRef destination) {
+// Display metadata stays immutable. Reconstruction has already consumed any EL.
+static void SPFRCCopyStaticAttachments(CVPixelBufferRef source, CVPixelBufferRef destination, bool reconstructed) {
+    // Each engine owns its output pool and fixed reconstruction mode. Ordinary
+    // engines never attach DV data, so their outputs need no DV pool cleanup.
+    if (reconstructed) sp::spMotionCopyDoviMetadata(source, destination);
     for (size_t i = 0; i < sp::kMotionStaticImageAttachmentKeyCount; ++i) {
         CFStringRef key = sp::kMotionStaticImageAttachmentKeys[i];
         CVAttachmentMode mode = kCVAttachmentMode_ShouldNotPropagate;
         CFTypeRef value = CVBufferCopyAttachment(source, key, &mode);
-        if (!value) continue;
+        if (!value) { CVBufferRemoveAttachment(destination, key); continue; }
         CVBufferSetAttachment(destination, key, value, mode);
         CFRelease(value);
+    }
+    if (reconstructed) {
+        CVBufferSetAttachment(destination, kSPDoviReconstructedFrame, kCFBooleanTrue, kCVAttachmentMode_ShouldNotPropagate);
+        CVBufferSetAttachment(destination, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(destination, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(destination, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(destination, kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Center, kCVAttachmentMode_ShouldPropagate);
+        CVBufferRemoveAttachment(destination, kCVImageBufferChromaLocationBottomFieldKey);
+        CVBufferRemoveAttachment(destination, kCVImageBufferCGColorSpaceKey);
+        CVBufferRemoveAttachment(destination, kCVImageBufferICCProfileKey);
+        CVBufferRemoveAttachment(destination, kCVImageBufferGammaLevelKey);
     }
 }
 
@@ -443,7 +458,7 @@ static void SPFRCReleaseSlotBuffers(SPFRCSlot &s) {
         [self completeToken:token output:nullptr error:SPFRCError(11, @"output conversion encode")];
         return;
     }
-    SPFRCCopyStaticAttachments(slot.sourceA, out);
+    SPFRCCopyStaticAttachments(slot.sourceA, out, _metal.doviReconstruction);
     SPFRCEngine *s = self;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         (void)owners;

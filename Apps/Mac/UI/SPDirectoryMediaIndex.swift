@@ -350,8 +350,24 @@ final class SPDirectoryMediaIndex {
         defer { ioPolicy.restore() }
         guard SPBackgroundStorageGate.waitUntilAllowed(
             shouldCancel: { cancellation.isCancelled }) else { return nil }
-        guard let dir = opendir(directory.path) else { return nil }
+#if SP_APP_STORE
+
+        guard SPFolderGrants.ensureAccess(path: directory.path) else {
+            if spDebugEnabled { NSLog("[FileAccess] 授权失效，放弃列目录: %@", directory.path) }
+            return nil
+        }
+#endif
+        guard let dir = opendir(directory.path) else {
+            let code = errno
+            SPFileAccess.noteDirectoryListing(directory, error: code)
+            if spDebugEnabled {
+                NSLog("[FileAccess] 列目录失败 errno=%d: %@", code, directory.path)
+            }
+            return nil
+        }
         defer { closedir(dir) }
+
+        SPFileAccess.noteDirectoryListing(directory, error: nil)
 
         var mediaFiles: [URL] = []
         var subtitleFileNames: [String] = []
@@ -367,7 +383,12 @@ final class SPDirectoryMediaIndex {
             // Foundation/String work below is allowed to touch thread errno.
             errno = 0
             guard let entry = readdir(dir) else {
-                if errno != 0 { return nil }
+                if errno != 0 {
+                    if spDebugEnabled {
+                        NSLog("[FileAccess] 读目录中断 errno=%d: %@", errno, directory.path)
+                    }
+                    return nil
+                }
                 break
             }
             if cancellation.isCancelled { return nil }

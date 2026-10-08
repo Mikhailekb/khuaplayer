@@ -353,6 +353,45 @@ static uint64_t spBytesFp(const uint8_t *data, size_t size) {
     return fp;
 }
 
+// Both inputs are normalized Annex B parameter sets. An AU may repeat only
+// its PPS (common in P7 MEL); that is not a new configuration when every
+// repeated NAL is byte-identical to one already retained by the parser.
+static bool spScanParameterSetsRepeatSubset(const std::vector<uint8_t> &incoming,
+                                            const std::vector<uint8_t> &known) {
+    if (incoming.empty() || known.empty()) return false;
+    size_t pos = 0;
+    while (pos < incoming.size()) {
+        const size_t start = spFindStartCodePos(incoming.data(), incoming.size(), pos);
+        if (start == SIZE_MAX) return false;
+        const size_t nal = start + (incoming[start + 2] == 1 ? 3 : 4);
+        const size_t next = spFindStartCodePos(incoming.data(), incoming.size(), nal);
+        size_t end = next == SIZE_MAX ? incoming.size() : next;
+        while (end > nal && incoming[end - 1] == 0) --end;
+        if (end <= nal) return false;
+        bool found = false;
+        size_t knownPos = 0;
+        while (knownPos < known.size()) {
+            const size_t ks = spFindStartCodePos(known.data(), known.size(), knownPos);
+            if (ks == SIZE_MAX) break;
+            const size_t kn = ks + (known[ks + 2] == 1 ? 3 : 4);
+            const size_t kNext = spFindStartCodePos(known.data(), known.size(), kn);
+            size_t ke = kNext == SIZE_MAX ? known.size() : kNext;
+            while (ke > kn && known[ke - 1] == 0) --ke;
+            if (ke - kn == end - nal &&
+                memcmp(known.data() + kn, incoming.data() + nal, end - nal) == 0) {
+                found = true;
+                break;
+            }
+            if (kNext == SIZE_MAX) break;
+            knownPos = kNext;
+        }
+        if (!found) return false;
+        if (next == SIZE_MAX) break;
+        pos = next;
+    }
+    return true;
+}
+
 // Fingerprint only the sequence parameter set(s). PPS/VPS order or subset
 // differences may require a parser rebuild, but they do not by themselves
 // prove that the coded scan type changed. Keeping this evidence separate avoids
@@ -660,6 +699,9 @@ private:
     AVCodecParameters *interpolationScanParameters_;
     uint64_t interpolationScanParameterSetFp_;
     uint64_t interpolationScanExtradataFp_;
+    // Last AU parameter sets proven a byte-identical repeat (P7 MEL repeats
+    // its PPS in every AU), keyed by both fingerprints: skips the re-proof.
+    uint64_t scanRepeatPacketFp_, scanRepeatRetainedFp_;
     int interpolationScanNALLengthSize_;
     bool interpolationScanKnown_;
     bool interpolationScanInterlaced_;
@@ -1111,6 +1153,25 @@ static bool spCodecIsProgressiveOnlyForMEMC(AVCodecID codec) {
             fp != 0 && fp != previousParameterSetFp;
         bool rawExtradataChanged =
             rawExtraFp != 0 && rawExtraFp != interpolationScanExtradataFp_;
+        if (hevc && parameterSetsChanged && !rawExtradataChanged &&
+            configurationEvidenceValidForCurrentAU && !codedConfigTainted_ &&
+            packetFp != 0 && packetSPSFp == 0) {
+            const uint8_t *retainedData = interpolationScanParameters_->extradata;
+            const size_t retainedSize = (size_t)MAX(interpolationScanParameters_->extradata_size, 0);
+            const uint64_t retainedFp = spBytesFp(retainedData, retainedSize);
+            if (packetFp == scanRepeatPacketFp_ && retainedFp == scanRepeatRetainedFp_) {
+                parameterSetsChanged = false;
+            } else {
+                const auto retained = spNormalizedScanParameterSets(retainedData, retainedSize,
+                    true, SPScanDataKind::Extradata, interpolationScanNALLengthSize_);
+                if (retained.valid &&
+                    spScanParameterSetsRepeatSubset(packetSets.bytes, retained.bytes)) {
+                    parameterSetsChanged = false;
+                    scanRepeatPacketFp_ = packetFp;
+                    scanRepeatRetainedFp_ = retainedFp;
+                }
+            }
+        }
         if (configurationEvidenceValidForCurrentAU &&
             (parameterSetsChanged || rawExtradataChanged)) {
             interpolationScanKnown_ = false;

@@ -205,6 +205,9 @@ enum RecentPlays {
             }
             save(list, defaults: defaults)
         }
+#if SP_APP_STORE
+        SPRecentBookmarks.rename(from: old, to: new)
+#endif
         let oldKey = SPResumePositionIndex.positionPrefix + old
         if let pos = defaults.object(forKey: oldKey) {
             defaults.set(pos, forKey: SPResumePositionIndex.positionPrefix + new)
@@ -216,12 +219,18 @@ enum RecentPlays {
 
     static func remove(path: String, defaults: UserDefaults = .standard) {
         save(load(defaults: defaults).filter { $0.path != path }, defaults: defaults)
+#if SP_APP_STORE
+        SPRecentBookmarks.forget(path: path)
+#endif
     }
 
     /// Clear the ledger and notify every window. Callers use the same serialized
     /// queue as record so storage and visible lists remain consistently ordered.
     static func clear(defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: key)
+#if SP_APP_STORE
+        SPRecentBookmarks.clear()
+#endif
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: .spRecentPlaysChanged, object: nil)
         }

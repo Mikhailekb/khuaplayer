@@ -95,6 +95,8 @@ enum OpenPanelWarmer {
                 performedWork = false
                 return
             }
+
+            guard SPFileAccess.mayWarm(path: url.path) else { return }
             let t0 = ProcessInfo.processInfo.systemUptime
             var count = 0
             var wokeDisk = false
@@ -190,6 +192,8 @@ enum OpenPanelWarmer {
                     forKeys: [.volumeIsInternalKey, .volumeIsRootFileSystemKey])
                 if vals?.volumeIsRootFileSystem == true { continue }
                 if vals?.volumeIsInternal == true { continue }
+
+                guard SPFileAccess.mayWarm(path: vol.path) else { continue }
                 candidates.append(vol)
             }
             guard !candidates.isEmpty else {

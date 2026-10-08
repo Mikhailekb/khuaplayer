@@ -1,5 +1,7 @@
-import Foundation
+import AppKit
 import Darwin
+
+enum WelcomeHeartbeatState { case active, paused, gone }
 
 #if SP_APP_STORE
 // Recent paths alone do not grant sandbox access. Match OpenPanelWarmer's no-op
@@ -9,6 +11,11 @@ enum RecentPlaysWarmer {
     static func warmEntryIntent(path: String) {}
     static func beginAutoWarmCycle() {}
     static func warmEntryAutoIntent(path: String) {}
+    @MainActor static func wakeRecentVolumesAtLaunch() {}
+    static func noteForegroundOpen(path: String) {}
+    static func noteAppTerminating() {}
+    @MainActor static func registerWelcomeHeartbeat(
+        owner: AnyObject, state: @escaping @MainActor () -> WelcomeHeartbeatState) {}
 }
 #else
 
@@ -100,6 +107,8 @@ enum RecentPlaysWarmer {
         for entry in entries {
             let path = entry.path
             let fraction = entry.resumeFraction
+
+            guard SPFileAccess.mayWarm(path: path) else { continue }
             lock.lock()
             let claimed = ledger.claimPath(path)
             lock.unlock()
@@ -211,6 +220,8 @@ enum RecentPlaysWarmer {
     }
 
     static func warmEntryIntent(path: String, isAutoIntent: Bool = false) {
+
+        guard SPFileAccess.mayWarm(path: path) else { return }
         lock.lock()
         if !isAutoIntent { realHoverSeen = true }
         // Workers query this latest sequence when claiming or registering, so
@@ -319,6 +330,21 @@ enum RecentPlaysWarmer {
             guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG,
                   st.st_size > 0 else { return }
             let size = st.st_size
+
+            if let resume = beginSpeculativeOpen(path: path) {
+                let box = SpecWarmYield(path: path, volumeKey: key)
+                let r = path.withCString { cPath in
+                    withExtendedLifetime(box) {
+                        SPSpeculativeOpenWarm(cPath, resume, specWarmAheadSec, specWarmYieldFn,
+                                              Unmanaged.passUnretained(box).toOpaque())
+                    }
+                }
+                endSpeculativeOpen(path: path)
+                if r != -3 {
+                    performedWork = !box.didYield
+                    return
+                }
+            }
             var buf = [UInt8](repeating: 0, count: chunkSize)
             var warmedBytes = 0
             // Read the head first for common container headers and track data.
@@ -352,6 +378,201 @@ enum RecentPlaysWarmer {
                 NSLog("[UI] Recent-file read-ahead: %@ · %dKB · %.0fms",
                       (path as NSString).lastPathComponent, warmedBytes >> 10,
                       (ProcessInfo.processInfo.systemUptime - t0) * 1000)
+            }
+        }
+    }
+
+    // MARK: - Speculative open (MKV/MP4)
+
+    private static let specWarmAheadSec = 3.0
+
+    private static let specWarmInFlightKey = "sp.warm.inFlight"
+    private static let specWarmBlockedKey = "sp.warm.blocked"
+
+    nonisolated(unsafe) private static var specWarmLedgerChecked = false
+    nonisolated(unsafe) private static var specWarmActive: [String] = []
+    nonisolated(unsafe) private static var foregroundOpenPath: String?
+
+    static func noteForegroundOpen(path: String) {
+        lock.lock()
+        foregroundOpenPath = path
+        lock.unlock()
+    }
+
+    static func noteAppTerminating() {
+        lock.lock()
+        specWarmActive.removeAll()
+        lock.unlock()
+        UserDefaults.standard.removeObject(forKey: specWarmInFlightKey)
+    }
+
+    private final class SpecWarmYield {
+        let path: String
+        let volumeKey: String
+        var didYield = false
+        init(path: String, volumeKey: String) { self.path = path; self.volumeKey = volumeKey }
+    }
+
+    private static let specWarmYieldFn: @convention(c) (UnsafeMutableRawPointer?) -> Int32 = { ctx in
+        guard let ctx else { return 1 }
+        let box = Unmanaged<SpecWarmYield>.fromOpaque(ctx).takeUnretainedValue()
+        lock.lock()
+        let newer = ledger.hasNewerCandidate(key: box.volumeKey, than: box.path)
+        let openingThis = foregroundOpenPath == box.path
+        lock.unlock()
+        let yield = newer || (OpenPanelWarmer.foregroundIOActive && !openingThis)
+        if yield { box.didYield = true }
+        return yield ? 1 : 0
+    }
+
+    private static func beginSpeculativeOpen(path: String) -> Double? {
+        let defaults = UserDefaults.standard
+        lock.lock()
+        defer { lock.unlock() }
+        if !specWarmLedgerChecked {
+            specWarmLedgerChecked = true
+            let leftovers = defaults.stringArray(forKey: specWarmInFlightKey) ?? []
+            if !leftovers.isEmpty {
+                var blocked = defaults.stringArray(forKey: specWarmBlockedKey) ?? []
+                blocked.append(contentsOf: leftovers.filter { !blocked.contains($0) })
+                defaults.set(Array(blocked.suffix(20)), forKey: specWarmBlockedKey)
+                defaults.removeObject(forKey: specWarmInFlightKey)
+            }
+        }
+        if (defaults.stringArray(forKey: specWarmBlockedKey) ?? []).contains(path) { return nil }
+        specWarmActive.append(path)
+        defaults.set(specWarmActive, forKey: specWarmInFlightKey)
+        return SPResumePolicy.startPosition(
+            path: path, pending: nil,
+            storedPosition: defaults.object(forKey: "sp.pos." + path) as? Double,
+            recents: RecentPlays.load()) ?? 0
+    }
+
+    private static func endSpeculativeOpen(path: String) {
+        lock.lock()
+        if let i = specWarmActive.firstIndex(of: path) { specWarmActive.remove(at: i) }
+        let remaining = specWarmActive
+        lock.unlock()
+        if remaining.isEmpty {
+            UserDefaults.standard.removeObject(forKey: specWarmInFlightKey)
+        } else {
+            UserDefaults.standard.set(remaining, forKey: specWarmInFlightKey)
+        }
+    }
+
+    // MARK: - Welcome-page volume heartbeat
+
+    private static let heartbeatInterval: TimeInterval = 2.5
+
+    nonisolated(unsafe) private static var heartbeatInFlight = Set<String>()
+    nonisolated(unsafe) private static var heartbeatDevByPath: [String: Int64] = [:]
+    nonisolated(unsafe) private static var heartbeatNonRemote = Set<String>()
+
+    @MainActor private static var heartbeatOwners:
+        [(owner: () -> AnyObject?, state: () -> WelcomeHeartbeatState)] = []
+    @MainActor private static var heartbeatTimer: Timer?
+
+    @MainActor private static var userAway = false
+    @MainActor private static var presenceObservers: [NSObjectProtocol] = []
+
+    @MainActor private static func observePresenceIfNeeded() {
+        guard presenceObservers.isEmpty else { return }
+        let ws = NSWorkspace.shared.notificationCenter
+        let dnc = DistributedNotificationCenter.default()
+        let away: @Sendable (Notification) -> Void = { _ in
+            MainActor.assumeIsolated { userAway = true }
+        }
+        let back: @Sendable (Notification) -> Void = { _ in
+            MainActor.assumeIsolated {
+                userAway = false
+                if !heartbeatOwners.isEmpty { heartbeatTick() }
+            }
+        }
+        presenceObservers = [
+            ws.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main, using: away),
+            ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main, using: back),
+            dnc.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main, using: away),
+            dnc.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main, using: back),
+        ]
+    }
+
+    @MainActor static func wakeRecentVolumesAtLaunch() {
+        let count = WelcomeView.visibleEntryCount
+        DispatchQueue.global(qos: .utility).async {
+            beatRecentVolumes(RecentPlays.load().prefix(count).map(\.path))
+        }
+    }
+
+    @MainActor static func registerWelcomeHeartbeat(
+        owner: AnyObject, state: @escaping @MainActor () -> WelcomeHeartbeatState) {
+        observePresenceIfNeeded()
+        heartbeatOwners.removeAll { $0.owner() == nil || $0.owner() === owner }
+        heartbeatOwners.append((owner: { [weak owner] in owner }, state: state))
+        heartbeatTick()
+        if heartbeatTimer == nil {
+            let timer = Timer(timeInterval: heartbeatInterval, repeats: true) { _ in
+                MainActor.assumeIsolated { heartbeatTick() }
+            }
+            timer.tolerance = 0.3
+            RunLoop.main.add(timer, forMode: .common)
+            heartbeatTimer = timer
+        }
+    }
+
+    @MainActor private static func heartbeatTick() {
+        var active = false
+        heartbeatOwners.removeAll { entry in
+            guard entry.owner() != nil else { return true }
+            switch entry.state() {
+            case .gone: return true
+            case .paused: return false
+            case .active: active = true; return false
+            }
+        }
+        if heartbeatOwners.isEmpty {
+            heartbeatTimer?.invalidate()
+            heartbeatTimer = nil
+            return
+        }
+        guard active, !userAway, !OpenPanelWarmer.foregroundIOActive else { return }
+        let paths = RecentPlays.load().prefix(WelcomeView.visibleEntryCount).map(\.path)
+        DispatchQueue.global(qos: .utility).async { beatRecentVolumes(paths) }
+    }
+
+    private static func beatRecentVolumes(_ paths: [String]) {
+        var chosenDevs = Set<Int64>()
+        var targets: [String] = []
+        lock.lock()
+        for path in paths where !heartbeatNonRemote.contains(path) {
+
+            if let key = ledger.volumeKey(forPath: path), ledger.isVolumeReadInFlight(key: key) { continue }
+            if let dev = heartbeatDevByPath[path] {
+                guard chosenDevs.insert(dev).inserted else { continue }
+            }
+            guard !heartbeatInFlight.contains(path) else { continue }
+            targets.append(path)
+        }
+        lock.unlock()
+        for path in targets {
+
+            guard SPFileAccess.mayWarm(path: path) else { continue }
+            lock.lock()
+            let claimed = heartbeatInFlight.insert(path).inserted
+            lock.unlock()
+            guard claimed else { continue }
+            DispatchQueue.global(qos: .utility).async {
+                var dev: Int64 = 0
+                let r = path.withCString { SPVolumeHeartbeatBeat($0, Int32(heartbeatInterval * 1000), &dev) }
+                lock.lock()
+                heartbeatInFlight.remove(path)
+                if r == -1 {
+                    heartbeatNonRemote.insert(path)
+                } else if dev != 0 {
+                    heartbeatDevByPath[path] = dev
+                }
+                if heartbeatDevByPath.count > 64 { heartbeatDevByPath.removeAll() }
+                if heartbeatNonRemote.count > 64 { heartbeatNonRemote.removeAll() }
+                lock.unlock()
             }
         }
     }
