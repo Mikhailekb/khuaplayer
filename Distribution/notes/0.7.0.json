@@ -1,0 +1,14 @@
+{
+  "en": [
+    "Improved Dolby Vision playback, thumbnails, and Motion+ compatibility.",
+    "Faster video opening and more reliable playback from network drives.",
+    "Fixed incorrect orientation in some videos.",
+    "More control over subtitle generation: wait for the current task or stop it when switching videos."
+  ],
+  "zh": [
+    "改进 Dolby Vision 播放、缩略图及 Motion+ 兼容性。",
+    "视频打开更快，网络硬盘播放更稳定。",
+    "修复部分视频方向不正确的问题。",
+    "生成新视频的字幕时，可选择等待或停止上一项任务。"
+  ]
+}

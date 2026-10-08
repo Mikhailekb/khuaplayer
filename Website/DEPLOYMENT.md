@@ -107,8 +107,11 @@ the key can prevent existing installations from accepting future releases.
 Never put the private key in frontend environment variables or Wrangler vars.
 
 Write release notes in `Distribution/notes/<version>.json` with `en` and `zh`
-arrays. Version, build, minimum macOS, size, hashes, and signatures come from
-the verified artifact, not from those notes. For example, from `Website/`:
+arrays. Sparkle uses only the English notes; the Chinese notes are for the
+website catalog, not a separate localized updater changelog. Reuse the English
+notes for GitHub Releases. Version, build, minimum macOS, size, hashes, and
+signatures come from the verified artifact, not from those notes. For example,
+from `Website/`:
 
 ```sh
 npm run release:prepare -- \
