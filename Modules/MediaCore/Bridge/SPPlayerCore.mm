@@ -2895,6 +2895,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 
     if (spAutomation() && getenv("SP_TEST_CROP")) [self setCropAspect:atof(getenv("SP_TEST_CROP"))];
     if (spAutomation() && getenv("SP_TEST_ASPECT")) [self setForcedAspect:atof(getenv("SP_TEST_ASPECT"))];
+    if (spAutomation() && getenv("SP_TEST_HUE")) [self setHue:atof(getenv("SP_TEST_HUE"))];
 
     if (spAutomation() && getenv("SP_PICTEST")) {
         [self setAspectMode:4];
@@ -4170,6 +4171,7 @@ static BOOL spThumbsEnabled(void) {
 - (void)setContrast:(float)v { [_renderer setContrast:v]; [self refreshSubtitleDisplay]; }
 - (void)setSaturation:(float)v { [_renderer setSaturation:v]; [self refreshSubtitleDisplay]; }
 - (void)setGamma:(float)v { [_renderer setGamma:v]; [self refreshSubtitleDisplay]; }
+- (void)setHue:(float)v { [_renderer setHue:v]; [self refreshSubtitleDisplay]; }
 
 - (void)applyDisplayLinkRate {
     if (!_displayLink) return;

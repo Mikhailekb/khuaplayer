@@ -2,9 +2,9 @@
 using namespace metal;
 
 struct Uniforms {
-    float uvals[32];
+    float uvals[40];
 };
-static_assert(sizeof(Uniforms) == 128, "CPU Uniforms size mismatch");
+static_assert(sizeof(Uniforms) == 160, "CPU Uniforms size mismatch");
 static_assert(alignof(Uniforms) == 4, "CPU Uniforms alignment mismatch");
 static_assert(__builtin_offsetof(Uniforms, uvals) == 0,
               "CPU Uniforms field offset mismatch");
@@ -618,10 +618,19 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
         out = rgbEnc;
     }
 
-    if (u.uvals[20] != 0.0 || u.uvals[21] != 1.0 || u.uvals[22] != 1.0 || u.uvals[23] != 1.0) {
+    if (u.uvals[20] != 0.0 || u.uvals[21] != 1.0 || u.uvals[22] != 1.0
+        || u.uvals[23] != 1.0 || u.uvals[32] != 0.0) {
         out += float3(u.uvals[20]);
         out = (out - 0.5) * u.uvals[21] + 0.5;
-        float luma = dot(out, float3(0.2126, 0.7152, 0.0722));
+        // Hue rotates chroma around the luma axis (Rodrigues rotation about
+        // the normalized weights). Neutral pixels, luma, and chroma magnitude
+        // are preserved exactly, matching how the other controls behave.
+        const float3 lumaAxis = normalize(float3(0.2126, 0.7152, 0.0722));
+        const float luma = dot(out, float3(0.2126, 0.7152, 0.0722));
+        const float3 chroma = out - float3(luma);
+        const float hueA = radians(u.uvals[32]);
+        out = float3(luma) + chroma * cos(hueA)
+            + cross(lumaAxis, chroma) * sin(hueA);
         out = mix(float3(luma), out, u.uvals[22]);
         out = pow(max(out, 0.0), float3(1.0 / max(u.uvals[23], 0.1)));
     }

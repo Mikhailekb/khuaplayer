@@ -125,6 +125,7 @@
 - (void)setContrast:(float)v;      // 0.5~2
 - (void)setSaturation:(float)v;    // 0~2
 - (void)setGamma:(float)v;         // 0.5~2
+- (void)setHue:(float)v;           // -180~180 degrees
 
 // Main-thread depth-effect setters, sampled during encoding. Zero blur and
 // color strengths write directly to the drawable; otherwise use an intermediate

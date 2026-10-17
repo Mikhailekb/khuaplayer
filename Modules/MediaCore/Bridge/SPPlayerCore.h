@@ -255,6 +255,7 @@ NS_SWIFT_UI_ACTOR
 - (void)setContrast:(float)v;           // 0.5~2
 - (void)setSaturation:(float)v;         // 0~2
 - (void)setGamma:(float)v;              // Range: 0.5...2.
+- (void)setHue:(float)v;                // Range: -180...180 degrees.
 // Encode and write the current frame as PNG off the main thread; completion returns to main.
 - (void)captureScreenshotToPath:(NSString *)path completion:(void (^_Nullable)(BOOL ok))completion;
 // When uniquify is enabled, reserve an unused numbered path with exclusive

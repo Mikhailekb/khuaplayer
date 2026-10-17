@@ -178,6 +178,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var turboTimer: Timer?
     private var turboHUD: SPTurboHUDView?
     private var playbackNotice: SPPlaybackNoticeView?
+    private var colorPanel: SPColorPanelView?
+    private(set) var isColorPanelShown = false
     private var fullscreenApplied = false
     private var hideControlsTimer: Timer?
     private var playbackCursor: SPPlaybackCursorController?
@@ -368,6 +370,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         core = c
 
         if view.window != nil { c.displayScreenChanged() }
+        // New cores start at engine defaults; only push non-neutral shared
+        // adjustments so automation hooks keep full control until the user
+        // touches the panel.
+        if !SPColorAdjustStore.current.isDefault { applyColorAdjust(nil) }
         if Self.dbg {
             NSLog("[UI] SPPlayerCore 创建耗时 %.1fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
         }
@@ -503,6 +509,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func installWindowObservers(_ win: NSWindow) {
         observerTokens.append(NotificationCenter.default.addObserver(
+            forName: SPColorAdjustStore.changed, object: nil, queue: .main
+        ) { [weak self] note in
+            let field = SPColorAdjustStore.changedField(of: note)
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.applyColorAdjust(field)
+                self.colorPanel?.configure(with: SPColorAdjustStore.current)
+            }
+        })
+        observerTokens.append(NotificationCenter.default.addObserver(
             forName: SPPlaybackGestureSettings.changed, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -612,6 +628,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if let overlay = compareOverlay, !overlay.isHidden { layoutCompareOverlay() }
         if let hud = turboHUD, !hud.isHidden { layoutTurboHUD() }
         if let notice = playbackNotice, !notice.isHidden { layoutPlaybackNotice() }
+        if let panel = colorPanel, !panel.isHidden { layoutColorPanel() }
 
         core?.notePausedLayoutChange()
     }
@@ -2284,6 +2301,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             return
         }
         cancelTransientInteractions()
+        setColorPanelShown(false)
         directorySnapshot = nil
         mediaList.removeAll(keepingCapacity: false)
         currentMediaIndex = -1
@@ -2436,6 +2454,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         if state == .failed {
             cancelTransientInteractions()
+            setColorPanelShown(false)
 
             hasMediaSession = false
             playbackCursor?.setHasVideo(false)
@@ -3533,6 +3552,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
            menuItem.action == #selector(cropAspectAction(_:)) {
             return hasVideoSession
         }
+        if menuItem.action == #selector(toggleColorAdjustPanelAction(_:)) {
+            return hasVideoSession
+        }
         if let action = menuItem.action { return responds(to: action) }
         return false
     }
@@ -3967,6 +3989,72 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         playbackNotice = notice
         layoutPlaybackNotice()
         return notice
+    }
+
+    @discardableResult
+    private func colorPanelView() -> SPColorPanelView {
+        if let panel = colorPanel { return panel }
+        let panel = SPColorPanelView(frame: .zero)
+        panel.setHueAvailable(engineSupportsHue)
+        panel.onChange = { field, percent in
+            SPColorAdjustStore.update(field, toPercent: percent)
+        }
+        panel.onResetField = { field in
+            SPColorAdjustStore.reset(field)
+        }
+        panel.onResetAll = {
+            SPColorAdjustStore.resetAll()
+        }
+        panel.configure(with: SPColorAdjustStore.current)
+        view.addSubview(panel, positioned: .above, relativeTo: playerView)
+        colorPanel = panel
+        layoutColorPanel()
+        return panel
+    }
+
+    private func layoutColorPanel() {
+        colorPanel?.place(in: view.bounds)
+    }
+
+    @objc func toggleColorAdjustPanelAction(_ sender: Any?) {
+        setColorPanelShown(!isColorPanelShown)
+    }
+
+    private func setColorPanelShown(_ shown: Bool) {
+        guard isColorPanelShown != shown else { return }
+        isColorPanelShown = shown
+        if shown {
+            applyColorAdjust(nil)
+            colorPanelView().setVisible(true)
+        } else {
+            colorPanel?.setVisible(false)
+        }
+    }
+
+    /// True when the linked engine implements the hue setter. Swap-builds
+    /// against an older prebuilt framework come back false here.
+    private var engineSupportsHue: Bool {
+        core?.responds(to: Selector(("setHue:"))) ?? false
+    }
+
+    /// Push the shared adjustment state into this window's engine. A nil field
+    /// re-applies everything (panel opening, reset all, new core); a specific
+    /// field re-applies just that engine property while its slider moves.
+    private func applyColorAdjust(_ field: SPColorAdjust.Field?) {
+        guard let core else { return }
+        let value = SPColorAdjustStore.current
+        switch field {
+        case .brightness, nil:
+            core.setBrightness(Float(value.engineBrightness))
+        case .contrast, nil:
+            core.setContrast(Float(value.engineContrast))
+        case .saturation, nil:
+            core.setSaturation(Float(value.engineSaturation))
+        case .gamma, nil:
+            core.setGamma(Float(value.engineGamma))
+        case .hue, nil:
+            if engineSupportsHue { core.setHue(Float(value.engineHueDegrees)) }
+        }
     }
 
     private func layoutPlaybackNotice() {
@@ -4452,6 +4540,11 @@ final class ScrubSlider: NSSlider {
 extension PlayerViewController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         switch menu.identifier?.rawValue {
+        case "sp.viewMenu":
+            for item in menu.items
+            where item.identifier?.rawValue == "sp.imageAdjust" {
+                item.state = isColorPanelShown ? .on : .off
+            }
         case "sp.audioTracks":
             menu.removeAllItems()
             let tracks = core?.audioTrackList ?? []

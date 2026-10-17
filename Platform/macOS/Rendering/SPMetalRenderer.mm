@@ -303,7 +303,7 @@ enum class SPDoviFrameMode : uint8_t {
     CGRect _subtitleRect;
     int _aspectMode, _rotation, _mirror;
     sp::VideoOrientation _streamOrientation; // container display matrix; _rotation/_mirror act on top
-    float _brightness, _contrast, _saturation, _gamma;
+    float _brightness, _contrast, _saturation, _gamma, _hue;
 
     float _fxStrength;
     float _fxColorStrength;
@@ -566,7 +566,7 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
         _forcedAspect = 0.0f;
         _cropAspect = 0.0f;
         _aspectMode = 0; _rotation = 0; _mirror = 0;
-        _brightness = 0; _contrast = 1; _saturation = 1; _gamma = 1;
+        _brightness = 0; _contrast = 1; _saturation = 1; _gamma = 1; _hue = 0;
         _specPipelineKey = UINT32_MAX;
         _specBuilding.store(false);
         _specFailedKey.store(UINT32_MAX);
@@ -1016,6 +1016,7 @@ static bool spRenderInlineMode(void) {
 - (void)setContrast:(float)v { std::lock_guard<std::mutex> lock(_cfgMtx); _contrast = v; }
 - (void)setSaturation:(float)v { std::lock_guard<std::mutex> lock(_cfgMtx); _saturation = v; }
 - (void)setGamma:(float)v { std::lock_guard<std::mutex> lock(_cfgMtx); _gamma = v; }
+- (void)setHue:(float)v { std::lock_guard<std::mutex> lock(_cfgMtx); _hue = v; }
 
 - (void)warmUpGPU {
 
@@ -2019,6 +2020,7 @@ static bool spRenderInlineMode(void) {
     uniforms.uvals[21] = _contrast;
     uniforms.uvals[22] = _saturation;
     uniforms.uvals[23] = _gamma;
+    uniforms.uvals[32] = _hue;
     uniforms.uvals[24] = _displayPeakNits;
     uniforms.uvals[25] = _outputMode;
     uniforms.uvals[26] = frameDovi ? sp::kSPGamutBT2020 : _sourceGamut;

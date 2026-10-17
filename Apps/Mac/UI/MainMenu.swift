@@ -318,6 +318,18 @@ enum MainMenuBuilder {
         mirrorItem.submenu = mirrorMenu
         viewMenu.addItem(mirrorItem)
 
+        viewMenu.addItem(.separator())
+        let imageAdjustItem = NSMenuItem(
+            title: L("menu.imageAdjust"),
+            action: #selector(PlayerViewController.toggleColorAdjustPanelAction(_:)),
+            keyEquivalent: "c")
+        imageAdjustItem.keyEquivalentModifierMask = [.command, .option]
+        imageAdjustItem.identifier = NSUserInterfaceItemIdentifier("sp.imageAdjust")
+        viewMenu.addItem(imageAdjustItem)
+        // Sync the panel checkmark with the key window's state.
+        viewMenu.identifier = NSUserInterfaceItemIdentifier("sp.viewMenu")
+        viewMenu.delegate = trackMenuDelegate
+
         return mainMenu
     }
 }

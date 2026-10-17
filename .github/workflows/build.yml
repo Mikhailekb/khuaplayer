@@ -47,6 +47,9 @@ jobs:
       - name: Check playback gestures
         run: ./Scripts/test_playback_gestures.sh
 
+      - name: Check picture adjustments
+        run: ./Scripts/test_color_adjust.sh
+
       - name: Check public repository boundary
         run: ./Scripts/check_public_repo.sh
 

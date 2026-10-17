@@ -17,14 +17,14 @@
 #include "SPDoviUniformLayout.hpp"
 
 struct SPColorUniforms {
-    float uvals[32];
+    float uvals[40];
 };
 
 static_assert(std::is_standard_layout_v<SPColorUniforms>);
 static_assert(alignof(SPColorUniforms) == alignof(float));
 static_assert(offsetof(SPColorUniforms, uvals) == 0);
-static_assert(sizeof(SPColorUniforms::uvals) == 32 * sizeof(float));
-static_assert(sizeof(SPColorUniforms) == 128,
+static_assert(sizeof(SPColorUniforms::uvals) == 40 * sizeof(float));
+static_assert(sizeof(SPColorUniforms) == 160,
               "Video.metal Uniforms layout mismatch");
 
 // Keep the ABI bound explicit for the independent CPU/Metal layout checker.
