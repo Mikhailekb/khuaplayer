@@ -92,3 +92,36 @@ jobs:
 
       - name: Compile and inspect unsigned App Store archive
         run: ./Scripts/smoke_app_store_unsigned.sh
+
+      - name: Package verified Release download
+        if: success()
+        run: ./Scripts/package_release_artifact.sh "$RUNNER_TEMP/kinolet-release"
+
+      - name: Package matching release sources
+        if: success()
+        run: |
+          RELEASE_DIRECTORY="$RUNNER_TEMP/kinolet-release"
+          SOURCE_ARCHIVE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_archive"])' "$RELEASE_DIRECTORY/build-info.json")"
+          python3 Scripts/package_release_sources.py --output "$RELEASE_DIRECTORY/$SOURCE_ARCHIVE" --require-build-metadata
+          python3 Scripts/package_release_sources.py --verify "$RELEASE_DIRECTORY/$SOURCE_ARCHIVE"
+          python3 - "$RELEASE_DIRECTORY" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          directory = Path(sys.argv[1])
+          files = sorted(path for path in directory.iterdir() if path.name != 'SHA256SUMS')
+          assert files and all(path.is_file() and not path.is_symlink() for path in files)
+          (directory / 'SHA256SUMS').write_text(''.join(
+              hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n'
+              for path in files))
+          PY
+
+      - name: Retain verified Release download
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kinolet-release-macos-arm64
+          path: ${{ runner.temp }}/kinolet-release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
