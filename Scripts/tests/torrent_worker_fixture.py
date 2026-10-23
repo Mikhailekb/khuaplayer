@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import signal
+import socketserver
 import sys
 import threading
 import time
@@ -225,8 +226,15 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-server = ThreadingHTTPServer((args.ip, args.port), Handler)
-audit('listening', port=args.port)
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves getfqdn(host) after binding. This protocol fixture
+        # has a numeric loopback address and must not depend on the host's DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+server = LoopbackHTTPServer((args.ip, args.port), Handler)
+audit('listening', port=server.server_port)
 server.daemon_threads = True
 def stop():
     delay = args.path.parent / 'termination-delay-ms'

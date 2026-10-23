@@ -32,6 +32,8 @@ wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' -u '
 wrapper.chmod(0o700)
 print('Torrent fixture Python:', sys.version.split()[0], sys.executable, flush=True)
 PY
+python3 "$ROOT/Scripts/tests/torrent_fixture_startup.py" \
+  "$ROOT/Scripts/tests/torrent_worker_fixture.py"
 xcrun swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library \
   "$ROOT/Apps/Mac/UI/TorrentModels.swift" \
   "$ROOT/Apps/Mac/UI/TorrentPreferences.swift" \
