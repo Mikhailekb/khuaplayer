@@ -244,6 +244,7 @@ enum class SPDoviFrameMode : uint8_t {
     CGFloat _displayCurrentEDR;
 
     BOOL _sdrBoostRequested;
+    BOOL _hdrShadowLiftEnabled;
 
     float _xdrHeadroomSmoothed;
     int64_t _xdrHeadroomAtUs;
@@ -528,6 +529,7 @@ static_assert(kSPDragFxNearLevel <= kSPDragFxFarLevel);
         _displayEdrCapable = (potEDR > 1.01);
         _displayCurrentEDR = maxEDR;
         _sdrBoostRequested = NO;
+        _hdrShadowLiftEnabled = NO;
         _xdrHeadroomSmoothed = 0.0f;
         _xdrHeadroomAtUs = 0;
 
@@ -1010,6 +1012,8 @@ static bool spRenderInlineMode(void) {
     [self applyOutputMode];
 }
 - (BOOL)sdrBoostEnabled { std::lock_guard<std::mutex> lock(_cfgMtx); return _sdrBoostRequested; }
+- (void)setHdrShadowLiftEnabled:(BOOL)enabled { std::lock_guard<std::mutex> lock(_cfgMtx); _hdrShadowLiftEnabled = enabled; }
+- (BOOL)hdrShadowLiftEnabled { std::lock_guard<std::mutex> lock(_cfgMtx); return _hdrShadowLiftEnabled; }
 - (BOOL)displayEdrCapable { std::lock_guard<std::mutex> lock(_cfgMtx); return _displayEdrCapable; }
 - (CGFloat)displayEDRHeadroom { std::lock_guard<std::mutex> lock(_cfgMtx); return MAX(_displayCurrentEDR, 1.0); }
 - (void)setBrightness:(float)v { std::lock_guard<std::mutex> lock(_cfgMtx); _brightness = v; }
@@ -2021,6 +2025,7 @@ static bool spRenderInlineMode(void) {
     uniforms.uvals[22] = _saturation;
     uniforms.uvals[23] = _gamma;
     uniforms.uvals[32] = _hue;
+    uniforms.uvals[33] = _hdrShadowLiftEnabled ? 1.0f : 0.0f;
     uniforms.uvals[24] = _displayPeakNits;
     uniforms.uvals[25] = _outputMode;
     uniforms.uvals[26] = frameDovi ? sp::kSPGamutBT2020 : _sourceGamut;

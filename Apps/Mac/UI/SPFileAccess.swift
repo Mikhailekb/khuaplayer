@@ -328,7 +328,7 @@ enum SPFolderGrants {
         }
     }
 
-    private static func remember(folder url: URL) {
+    static func remember(folder url: URL) {
         let path = spAccessPath(url.path)
         guard url.startAccessingSecurityScopedResource() else { return }
         let bookmark = try? url.bookmarkData(options: .withSecurityScope,

@@ -1,89 +1,106 @@
-# Privacy policy
+# Privacy policy for Кинолёт
 
-Effective date: September 28, 2026
+Effective date: October 23, 2026
 
-Khua does not use advertising SDKs or accounts and does not collect playback
-analytics. It does not transmit playback files, playback history, subtitles,
-or language preferences to Khua. Its runtime media stack is built without
-network protocol support. Runtime network activity includes system-managed
-language-model downloads and the channel-specific update checks described below.
-Starting with version 0.6.1, the official direct-download build also measures
-update-check activity through those existing requests.
+Кинолёт is an independent fork of Khua Player. This policy describes this
+fork, including its local playlists and torrent playback. It does not describe
+Khua's separate website, update service, or official releases.
 
-Media files are opened only after an explicit user action, such as selecting a
-file, dropping a file onto the app, or opening it from Finder. Playback resume
-positions and language preference are stored locally in macOS user defaults.
-Screenshots are written only to a location explicitly selected in the system
-Save panel. The Mac App Store build uses App Sandbox access limited to files
-selected through system Open and Save panels.
-The **Clear All History** command removes playback positions and recent-file
-history managed by the app and the system.
+The application has no account system, advertising SDK, or playback analytics
+service. It does not upload your local videos, playback history, picture
+settings, or subtitle text to a Kinolet server. Torrent playback makes network
+connections as described below.
+
+## Local files and preferences
+
+Files are opened after a user action, such as choosing a file or folder,
+dropping it into the app, or opening it from Finder. A selected folder may be
+scanned and monitored to update its playlist and find nearby subtitles.
+Folder scanning reads names and file metadata; it does not upload the folder
+contents. Access to a mounted network folder uses that filesystem's normal
+network connection.
+
+The application stores recent items, playback positions, selected folders,
+file-access bookmarks, language preferences, and playback settings locally.
+A folder playlist can retain its picture settings, Motion+ preference, and
+preferred audio voice for other episodes. These records may contain local
+paths and media titles.
+
+On the first launch of this renamed fork, missing preferences and torrent
+resume metadata are copied from its earlier SidebarDev development build.
+Existing Kinolet values and the development build's originals are preserved.
+The original Khua application's preference domain is not used as a source.
+
+The history-clearing command removes the playback positions and recent-item
+history managed by the app. It does not delete media, saved screenshots,
+subtitle exports, or files saved from torrents, and should not be treated as
+a reset of every preference.
+
+Screenshots, generated subtitles, and explicit file saves write to local
+storage. Their destination follows the app's save action and the access granted
+by macOS. macOS may retain recent-document information, permission records,
+backups, and crash diagnostics under the user's system settings.
+
+## Torrents and magnet links
+
+Opening a torrent or magnet link starts a bundled TorrServer worker when
+needed. The player communicates with its authenticated control and streaming
+endpoint on `127.0.0.1`, using temporary per-worker credentials. That local
+endpoint is separate from the worker's BitTorrent peer connections.
+
+BitTorrent is a peer-to-peer protocol. The worker contacts trackers and may use
+DHT and peer exchange to discover peers. Those parties can observe the public
+IP address used for the connection and the torrent's identifier. Peers exchange
+requested pieces according to the protocol, which can include uploading
+available pieces. A torrent's own metadata or magnet link can supply tracker
+addresses and other source information. These connections are not anonymous,
+and they are not playback analytics sent to the application developer.
+
+Streaming media pieces use the configured memory cache rather than a permanent
+movie download folder. This does not mean that the application writes nothing
+to disk: temporary worker configuration and authentication files, torrent
+metadata, and playback history have different lifetimes from the piece cache.
+The operating system may also page memory to disk.
+
+To reopen a torrent from history, the application stores its identity, media
+filename, selected file, and resume position locally. It can retain the magnet
+link or a copy of the original `.torrent` metadata in Application Support.
+These records can reveal which torrent was opened. Closing playback releases
+its active torrent session; metadata retained for history is separate from
+that session's temporary streaming cache.
+
+Choosing **Save** starts a download of the selected file to the destination
+you choose. The download can use temporary disk storage before the completed
+file is moved into place. Saved files remain until you delete them.
+
+## On-device subtitles
 
 On supported macOS versions, subtitle generation and translation use Apple's
-on-device speech and translation services. Khua does not upload the selected
-media or subtitle text to a Khua server. macOS may download required language
-models through its system services; those downloads follow Apple's prompts and
-system settings. No microphone recording is used. Generated or translated
-subtitles are written to a user-selected output location. Intermediate work and
-save-recovery data remain local, and deleting playback history does not delete
-subtitle files the user has saved.
+on-device speech and translation services. Кинолёт does not send the selected
+video or subtitle text to a developer-operated transcription service. macOS
+may download the language models required by those services, following Apple's
+prompts and system settings. This feature reads the selected media's audio;
+it does not record your microphone.
 
-The build scripts download checksum-pinned open-source dependencies when a
-developer compiles the app. That build-time activity is separate from the
-runtime application.
+Generated or translated subtitle files and intermediate task data remain
+local. Clearing playback history does not remove subtitle exports you saved.
 
-Non-App-Store builds contain optional software-update support. Unless a
-distributor supplies both an appcast URL and an EdDSA public key at build time,
-the updater remains inactive and makes no request. When configured, Sparkle may
-contact that appcast automatically by default or after a manual check. Automatic
-checks can be disabled from the App menu. System profiling is explicitly
-disabled, and no playback files, history, or language preference are added to
-the request. As with any network connection, the feed host can observe ordinary
-transport metadata such as the requesting IP address. Mac App Store builds
-exclude Sparkle and update only through the store.
+## Updates and development downloads
 
-The official direct-download channel enables this configuration starting with
-version 0.6.0. Its signed update feed is hosted at `khua.app`, and update packages
-are served from `downloads.khua.app`. Cloudflare provides website, feed, and
-download hosting and may process ordinary request metadata to deliver and
-protect these services. The website does not add analytics or advertising
-scripts. Its language choice is stored in the browser's local storage.
+Fork releases are published at
+[github.com/Mikhailekb/kinolet/releases](https://github.com/Mikhailekb/kinolet/releases).
+The Кинолёт distribution does not use Khua's automatic update feed or its
+installation-identifier statistics. Visiting GitHub or downloading a release
+uses GitHub's normal service and request processing.
 
-## Update-check statistics
+When a developer builds the application, the build scripts download pinned
+open-source dependency archives and the required build toolchain. This
+build-time network activity is separate from opening or watching a video.
 
-Starting with version 0.6.1, an existing update check to the official feed also
-sends a randomly generated installation identifier. It is stored in this app's
-local preferences, not derived from hardware, an account, an advertising ID,
-or media files, and is not stored in Keychain or synchronized through iCloud.
-The updater already sends the app version in its User-Agent header. Together,
-these fields let us count an installation once per UTC date and understand
-version adoption. There is no analytics SDK, extra heartbeat, additional
-request, or increase in update-check frequency.
+## Changes to this policy
 
-This is pseudonymous installation-level statistics, not fully anonymous data:
-the random identifier can link update checks across days. The statistics
-database stores only a SHA-256 hash of that identifier, a UTC date, and the app
-version. It does not store raw identifiers, IP addresses, full User-Agent
-strings, exact request times, hardware identifiers, media details, or playback
-events. We do not use this data for advertising or combine it with other
-services' user profiles. An installation is not necessarily one person;
-resetting preferences or restoring a backup can affect the counts.
-
-Installation-level records are kept for a rolling window of 30 UTC dates and
-pruned by a daily job. Aggregate daily counts without installation identifiers
-may be retained longer. Cloudflare's operational processing and disaster-recovery
-backups have separate provider-managed retention; deleting records from the
-live database does not instantly remove every backup. Worker application logs
-omit identifiers, and query strings are redacted in Worker observability.
-
-There is no separate statistics setting or permission dialog. Automatic update
-checks remain enabled by default and can be disabled using the existing App
-menu setting. With automatic checks off, a manual **Check for Updates** still
-contacts the feed and sends the same statistics fields. No update check means
-no statistics request. Other distributors' feeds and Mac App Store builds do
-not participate in this official-channel mechanism. Statistics failures do not
-prevent the app from checking for or downloading updates.
-
-If a future version adds purchases, network playback, crash reporting, or any
-other data processing, this policy and the relevant store privacy disclosure
-must be updated before that version is distributed.
+Changes to accounts, telemetry, update services, or other network features
+must be reflected in this policy before distribution. Privacy questions and
+reports can be raised through this fork's
+[issue tracker](https://github.com/Mikhailekb/kinolet/issues); avoid including
+private media, credentials, magnet links, or file paths in a public report.

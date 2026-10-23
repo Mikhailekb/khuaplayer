@@ -1,5 +1,7 @@
 import AppKit
 
+SPBrandMigration.runIfNeeded()
+
 #if !SP_APP_STORE
 
 if let logPath = ProcessInfo.processInfo.environment["SP_LOGFILE"] {

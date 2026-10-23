@@ -1,0 +1,82 @@
+TorrServer with Khua playback-window policy
+Upstream project: YouROK/TorrServer, by YouROK and contributors
+Project URL: https://github.com/YouROK/TorrServer
+Upstream release: MatriX.147 (published 2026-10-16)
+Upstream source commit: a86d8fa7fd4e07605f240fe69bf299392f7cb023
+Worker version: MatriX.147-khua.4
+License: GNU General Public License, version 3; see the accompanying LICENSE.
+
+This worker contains downstream source changes in Khua-playback-window.patch.
+The patch adds authenticated, per-consumer playback retention windows, shares
+forward cache capacity between windows, and evicts watched or unrelated whole
+pieces independently of cache-capacity pressure. Playback windows do not start
+downloads. Managed HTTP readers request data within the assigned bounds; ordinary
+whole-file saves keep their separate reader behavior. Whole current/in-flight
+pieces can cross a media-time cutoff; incomplete pieces are never zeroed and
+misrepresented as completed content.
+A live playback window also owns the paused torrent independently of HTTP
+readers and idle status polling. Replacing a consumer window is atomic; only
+explicit release removes that ownership. Idle managed readers park at EOF so
+they retain no download priority and resume at their original logical offset.
+Active managed HTTP readers start with 16 MiB of lookahead immediately, bounded
+by the applied playback window; metadata reads outside it do not extend that
+lookahead. Playback windows alone continue to request no missing data.
+Managed foreground GETs with one finite byte range allow HTTP/1.1 connection
+reuse. Each response still closes its torrent reader, and a client-requested
+connection close is honored. Unmanaged and prefetch stream behavior is unchanged.
+
+worker-manifest.json records the exact unsigned worker size/SHA-256, source
+archive size/SHA-256, patch size/SHA-256, and pinned Go toolchain. App bundle
+signing changes signature bytes; the manifest describes the reproducible
+unsigned build, before signing.
+
+The unchanged upstream source is distributed as TorrServer-MatriX.147-source.tar.gz.
+Source URL: https://codeload.github.com/YouROK/TorrServer/tar.gz/a86d8fa7fd4e07605f240fe69bf299392f7cb023
+Source archive size: 53638818 bytes
+Source archive SHA-256: 3a2510e05b297358c2009e97ed313bbc55e15b862fdb3ee5b2cbd57dabafbf45
+Apply Khua-playback-window.patch to the extracted upstream root with patch -p1.
+The archived upstream server/go.mod and server/go.sum remain unchanged.
+The pinned github.com/tsynik/torrent v1.2.32 source accompanies the worker as
+torrent-v1.2.32-source.zip. Its SHA-256 is
+6e350783b3fe2391e0c7f5c20f73166aa90473e2e1036da70f264fbc2403e60c.
+Khua-torrent-piece-reset.patch adds a narrowly scoped atomic partial-piece
+reset operation; received-chunk state and backing bytes are discarded together,
+never while a chunk write or piece hash is in flight. The dependency's own
+license is included in its source ZIP. The same patch raises the minimum
+strategy-3 peer request pipeline to 32 chunks (512 KiB at the default chunk
+size), clamped to the peer's advertised request limit. The existing adaptive
+calculation and cancellation behavior remain unchanged.
+Other third-party Go sources are not vendored; retrieve their exact versions
+and checksums with the archived manifests when preparing complete Corresponding Source.
+
+Reproduce with the accompanying build script after copying this resource folder:
+python3 build_torrent_worker.py --rebuild --output-directory ./rebuilt
+The script extracts the dependency ZIP as khua-torrent beside server, applies its
+patch, and changes only the existing torrent replacement to ../khua-torrent in
+the temporary build's go.mod. All other module versions and go.sum stay fixed.
+Build from that patched server directory using Go go1.26.4:
+GOTOOLCHAIN=go1.26.4 GOWORK=off GOFLAGS= GOEXPERIMENT= GOOS=darwin GOARCH=arm64 GOARM64=v8.0 CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=false -tags=nosqlite -ldflags="-s -w -checklinkname=0 -buildid= -X server/version.Version=MatriX.147-khua.4" -o TorrServer ./cmd
+The Khua source also includes Scripts/build_torrent_worker.py and
+Scripts/prepare_torrent_worker.sh to verify, patch and build these pinned inputs.
+The build does not regenerate web assets, update API docs, or run go mod tidy.
+
+Redistribution must preserve applicable notices and provide Corresponding Source
+as required by the GPL. See LICENSE sections 4 through 6. This notice identifies
+the component and does not determine the license scope of other application code.
+TorrServer is provided without warranty; see LICENSE sections 15 and 16.
+
+Nonce-tagged bounded prefetch responses report a capacity stop through the next
+authenticated playback-window ACK. Proof includes the exact file, finite range,
+request UUID and successfully delivered byte frontier. Only a real quota EOF
+before the requested end is eligible; client cancellation, writer failure,
+ordinary file EOF, missing windows and untagged requests produce no proof.
+One event is retained per consumer, replaced by a new request and cleared on
+release or file changes; refreshing a window preserves it until consumed.
+
+Finite managed prefetch readers bind the validated range start before cache
+registration and remain inactive during HTTP metadata seeks. The first actual
+read starts bounded lookahead, so a temporary byte-zero cursor does not consume
+cache quota. The watchdog checks parked state and resumes readers under the same
+reader lock, preventing a completed bounded fill from being reactivated at its
+upper boundary and evicting retained bytes. Core and whole-file save reader
+construction and seek behavior remain unchanged.

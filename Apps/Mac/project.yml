@@ -27,9 +27,9 @@ settings:
     SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SP_ENHANCE"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     ARCHS: arm64
-    MARKETING_VERSION: "0.7.0"
-    CURRENT_PROJECT_VERSION: "12"
-    KHUA_BUNDLE_ID: app.khuaplayer.KhuaPlayer
+    MARKETING_VERSION: "0.7.0-kinolet.1"
+    CURRENT_PROJECT_VERSION: "16"
+    KHUA_BUNDLE_ID: app.kinolet.player
     KHUA_DEVELOPMENT_TEAM: ""
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     HEADER_SEARCH_PATHS:
@@ -92,6 +92,31 @@ targets:
             exit 1
           fi
         basedOnDependencyAnalysis: false
+    postBuildScripts:
+      - name: Embed Torrent Worker
+        script: |
+          "${KHUA_REPO_ROOT}/Scripts/embed_torrent_worker.sh"
+        inputFiles:
+          - $(KHUA_REPO_ROOT)/Scripts/embed_torrent_worker.sh
+          - $(KHUA_REPO_ROOT)/Scripts/prepare_torrent_worker.sh
+          - $(KHUA_REPO_ROOT)/Scripts/build_torrent_worker.py
+          - $(KHUA_REPO_ROOT)/Apps/Mac/TorrentWorker.entitlements
+          - $(KHUA_REPO_ROOT)/Apps/Mac/Resources/Torrent/LICENSE
+          - $(KHUA_REPO_ROOT)/Apps/Mac/Resources/Torrent/NOTICE
+          - $(KHUA_REPO_ROOT)/Apps/Mac/Resources/Torrent/worker-manifest.json
+          - $(KHUA_REPO_ROOT)/Apps/Mac/Resources/Torrent/Khua-playback-window.patch
+          - $(KHUA_REPO_ROOT)/Apps/Mac/Resources/Torrent/Khua-torrent-piece-reset.patch
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/TorrServer
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/LICENSE
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/NOTICE
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/worker-manifest.json
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/Khua-playback-window.patch
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/Khua-torrent-piece-reset.patch
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/torrent-v1.2.32-source.zip
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/build_torrent_worker.py
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Torrent/TorrServer-MatriX.147-source.tar.gz
+        basedOnDependencyAnalysis: false
     sources:
       - path: UI
       - path: CaptionsHost
@@ -134,9 +159,11 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleName: Khua
-        CFBundleDisplayName: Khua
-        SPProductName: Khua Player
+        CFBundleName: Кинолёт
+        CFBundleDisplayName: Кинолёт
+        SPProductName: Кинолёт
+        # A distributor must explicitly enable and configure its own update feed.
+        SPEnableDistributionUpdates: false
         CFBundleDevelopmentRegion: en
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
@@ -144,9 +171,9 @@ targets:
         LSMinimumSystemVersion: "14.0"
         NSHighResolutionCapable: true
         LSApplicationCategoryType: public.app-category.video
-        NSHumanReadableCopyright: "Copyright © 2026 Khua contributors"
-        NSSpeechRecognitionUsageDescription: "Khua generates subtitles from the audio of the media you open. Processing takes place on this Mac."
-        # Folder and volume privacy prompts appear only when Khua scans the
+        NSHumanReadableCopyright: "Copyright © 2026 Кинолёт and Khua contributors"
+        NSSpeechRecognitionUsageDescription: "Кинолёт generates subtitles from the audio of the media you open. Processing takes place on this Mac."
+        # Folder and volume privacy prompts appear only when the player scans the
         # folder of a video you opened. Translations: Resources/InfoPlist.xcstrings.
         NSDesktopFolderUsageDescription: "Used to find subtitles and the next episode in the folder of the video you open."
         NSDocumentsFolderUsageDescription: "Used to find subtitles and the next episode in the folder of the video you open."
@@ -288,12 +315,15 @@ targets:
         # beside videos in Downloads and Movies without a folder prompt.
         com.apple.security.files.downloads.read-write: true
         com.apple.security.assets.movies.read-write: true
+        # Local streaming control and BitTorrent peer connections.
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(KHUA_BUNDLE_ID)
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_OBJC_BRIDGING_HEADER: Support/KhuaPlayer-Bridging-Header.h
-        PRODUCT_NAME: Khua
+        PRODUCT_NAME: Kinolet
         PRODUCT_MODULE_NAME: KhuaPlayer
         COMBINE_HIDPI_IMAGES: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -425,7 +455,7 @@ targets:
       path: QuickLook/Info.plist
       properties:
         CFBundleName: KhuaPlayerQuickLook
-        CFBundleDisplayName: Khua Quick Look
+        CFBundleDisplayName: Кинолёт Quick Look
         CFBundlePackageType: XPC!
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)

@@ -1,6 +1,30 @@
 import AppKit
 import UniformTypeIdentifiers
 
+/// In-memory handoff for replacing the shared torrent worker. This never stores
+/// a worker stream address, credentials or a rounded history checkpoint.
+@MainActor
+struct SPTorrentCacheRestartSnapshot {
+    fileprivate let owner: ObjectIdentifier
+    fileprivate let token: UUID
+    fileprivate let descriptor: SPTorrentDescriptor
+    fileprivate let file: SPTorrentFile
+    fileprivate let position: Double
+    fileprivate let wasPlaying: Bool
+    fileprivate let rate: Double
+    fileprivate let profile: SPPlaylistProfile
+    fileprivate let audioOff: Bool
+    fileprivate let audioIndex: Int
+    fileprivate let volume: Float
+    fileprivate let muted: Bool
+    fileprivate let volumeBoostUnlocked: Bool
+    fileprivate let subtitleID: String?
+    fileprivate let subtitleScale: Double
+    fileprivate let lastSubtitleID: String?
+    fileprivate let playlistShown: Bool
+    fileprivate let settingsShown: Bool
+}
+
 /// Cooperative cancellation for the CPU-only subtitle ranking attached to a
 /// directory snapshot. Rapid Previous/Next must not leave a trail of obsolete
 /// Unicode normalization/sort jobs competing with foreground playback.
@@ -86,6 +110,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private lazy var dragEffect = WindowDragEffect()
 
     private func handleVideoMouseDown(_ event: NSEvent) {
+        view.window?.makeFirstResponder(playerView)
         noteVideoMouseDown(event)
         guard let core, core.hasEverPresentedThisSession, WindowDragEffect.enabled else { return }
 
@@ -178,8 +203,19 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var turboTimer: Timer?
     private var turboHUD: SPTurboHUDView?
     private var playbackNotice: SPPlaybackNoticeView?
-    private var colorPanel: SPColorPanelView?
-    private(set) var isColorPanelShown = false
+    private var seekFeedback: SPSeekFeedbackView?
+    private var volumeFeedback: SPVolumeFeedbackView?
+    private var settingsPanel: SPPlaybackSettingsView?
+    private(set) var isSettingsPanelShown = false
+    nonisolated(unsafe) private var settingsEventMonitor: Any?
+    private var settingsDismissMouseButton: Int?
+    private var settingsRefreshAt: TimeInterval = 0
+    private var settingsCodec = ""
+    private var settingsDecoder = ""
+    private var lastQuickSubtitleID: String?
+    private var quickSubtitleRefreshAt: TimeInterval = 0
+    private var currentRotation = 0
+    private var currentMirror = 0
     private var fullscreenApplied = false
     private var hideControlsTimer: Timer?
     private var playbackCursor: SPPlaybackCursorController?
@@ -196,6 +232,75 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var burstStepCount = 0
 
     private var burstWasPlaying = false
+
+    private var torrentContext: SPTorrentPlaybackContext?
+    private var torrentOpenCandidate: SPTorrentPlaybackContext?
+    private var torrentOpenTask: Task<Void, Never>?
+    private var torrentStatusTask: Task<Void, Never>?
+    private var torrentSaveTask: Task<Void, Never>?
+    private var torrentOpenGeneration: UInt64 = 0
+    private var torrentSaveGeneration: UInt64 = 0
+    private var torrentResolving = false
+    private var torrentDownloadProgress: Double?
+    private var torrentLastStatus: SPTorrentStatus?
+    private var torrentLoadingView: SPTorrentLoadingView?
+    private var torrentMagnetSheet: SPTorrentMagnetSheet?
+    private var torrentCacheRestartToken: UUID?
+    private var suspendedTorrentCacheSnapshot: SPTorrentCacheRestartSnapshot?
+    private var torrentCacheRestartOpening = false
+    private var torrentExactStartOverride: (lease: UUID, position: Double)?
+    private var torrentCacheRestartMute: (token: UUID, lease: UUID, muted: Bool)?
+    private var torrentPauseBufferManuallyStopped = false
+    private var torrentPauseBufferMonitor: Task<Void, Never>?
+    private var torrentPauseBufferMonitorGeneration = UUID()
+    private struct AppliedTorrentPlaybackWindow {
+        let leaseID: UUID
+        let fileID: Int
+        let openGeneration: Int64
+        let seekGeneration: Int64
+        let historyLowerBound: Int64
+        let requestedHistoryLowerBound: Int64
+        let playbackOffset: Int64
+        let forwardUpperBound: Int64
+        let prefetchCapacityStop: SPTorrentPrefetchCapacityStop?
+    }
+    private var torrentAppliedPlaybackWindow: AppliedTorrentPlaybackWindow?
+    private var torrentPlaybackWindowTask: Task<Void, Never>?
+    private var torrentPlaybackWindowEpoch = UUID()
+    private lazy var torrentPauseBuffer: SPTorrentPauseBuffer = {
+        let buffer = SPTorrentPauseBuffer()
+        buffer.onChange = { [weak self] _ in self?.refreshPlaylistView() }
+        return buffer
+    }()
+
+    private var playbackIdentityURL: URL? {
+        torrentContext?.identityURL ?? openMediaPath.map { URL(fileURLWithPath: $0, isDirectory: false) }
+    }
+    private var resumeIdentityPath: String? { playbackIdentityURL?.path }
+
+    private lazy var playlistController: SPPlaylistController = {
+        let controller = SPPlaylistController(mediaExtensions: Self.mediaExtensions)
+        controller.onChange = { [weak self] in self?.playlistDidChange() }
+        return controller
+    }()
+    private var playlistPanel: SPPlaylistView?
+    private(set) var isPlaylistShown = false
+    private var playlistInitialOpenPending = false
+    private var playlistAdvanceAfterScanPath: String?
+    private var playlistNavigationRevision: UInt64?
+    private var playlistNavigationPath: String?
+    private var playlistNavigationRoot: URL?
+    private var playlistProfileRoot: URL?
+    private var playlistProfile = SPPlaylistProfile()
+    private var playlistProfileRestorePending = false
+    private var pictureAdjustment = SPColorAdjustStore.current
+    private var playlistAutoAdvance: Bool {
+        get { UserDefaults.standard.object(forKey: "sp.playlist.autoAdvance") as? Bool ?? true }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "sp.playlist.autoAdvance")
+            if !newValue { playlistAdvanceAfterScanPath = nil }
+        }
+    }
 
     private var mediaList: [URL] = []
     private var currentMediaIndex = -1
@@ -264,6 +369,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if let monitor = clickUpMonitor {
             MainActor.assumeIsolated { NSEvent.removeMonitor(monitor) }
         }
+        if let monitor = settingsEventMonitor {
+            MainActor.assumeIsolated { NSEvent.removeMonitor(monitor) }
+        }
 
         if spDebugEnabled {
             NSLog("[UI] PlayerViewController 已销毁（窗口关闭释放）")
@@ -302,6 +410,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             guard let self else { return }
             self.activeExternalSubtitleURL = nil
             self.userTouchedSubtitleSelection = true
+            self.refreshPlaybackSettings()
         }
         c.onDisplaySelection = { [weak self] in
             self?.core?.cancelPendingSubtitleLoad()
@@ -319,7 +428,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         view = NSView(frame: NSRect(origin: .zero, size: initialContentSize))
 
         playerView.frame = view.bounds
-        playerView.autoresizingMask = [.width, .height]
+        playerView.autoresizingMask = []
         playerView.onDoubleClick = { [weak self] in
             guard let self else { return }
 
@@ -333,6 +442,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         playerView.onKeyDown = { [weak self] event in self?.handleKey(event) }
         playerView.onKeyUp = { [weak self] event in self?.handleKeyUp(event) }
+        playerView.onResignFirstResponder = { [weak self] in
+            self?.endTurbo(reason: "resignFirstResponder")
+        }
         playerView.onScrollWheel = { [weak self] event in
             self?.handlePlaybackScroll(event) ?? false
         }
@@ -368,12 +480,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         c.delegate = self
 
         core = c
+        applyHDRViewingPreference()
 
         if view.window != nil { c.displayScreenChanged() }
         // New cores start at engine defaults; only push non-neutral shared
         // adjustments so automation hooks keep full control until the user
         // touches the panel.
-        if !SPColorAdjustStore.current.isDefault { applyColorAdjust(nil) }
+        if !pictureAdjustment.isDefault { applyColorAdjust(nil) }
         if Self.dbg {
             NSLog("[UI] SPPlayerCore 创建耗时 %.1fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
         }
@@ -427,6 +540,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func replayCoreState() {
         guard let core else { return }
+        applyHDRViewingPreference()
         transitionPresentation(.stateChanged(presentationLifecycle(for: core.state),
                                              presentationSnapshot(core: core)))
     }
@@ -434,6 +548,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func transitionPresentation(_ event: PlayerPresentationEvent) {
         chromePresentation = PlayerPresentationReducer.reduce(chromePresentation, event)
         chromePresenter?.render(chromePresentation)
+        refreshPlaybackSettings(force: false)
     }
 
     private func presentationSnapshot(core: SPPlayerCore) -> PlayerPresentationSnapshot {
@@ -509,13 +624,27 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func installWindowObservers(_ win: NSWindow) {
         observerTokens.append(NotificationCenter.default.addObserver(
+            forName: SPHDRViewingPreferences.changed, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.applyHDRViewingPreference()
+                self?.refreshPlaybackSettings(force: true)
+            }
+        })
+        observerTokens.append(NotificationCenter.default.addObserver(
             forName: SPColorAdjustStore.changed, object: nil, queue: .main
         ) { [weak self] note in
             let field = SPColorAdjustStore.changedField(of: note)
             MainActor.assumeIsolated {
                 guard let self else { return }
+                // The legacy color panel targets the active player. Restoring
+                // another series never broadcasts its profile to other windows.
+                guard self.view.window?.isKeyWindow == true else { return }
+                if let field { self.pictureAdjustment[field] = SPColorAdjustStore.current[field] }
+                else { self.pictureAdjustment = SPColorAdjustStore.current }
                 self.applyColorAdjust(field)
-                self.colorPanel?.configure(with: SPColorAdjustStore.current)
+                self.savePlaylistProfile()
+                self.refreshPlaybackSettings()
             }
         })
         observerTokens.append(NotificationCenter.default.addObserver(
@@ -524,7 +653,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             MainActor.assumeIsolated {
                 self?.cancelPlaybackScroll()
                 self?.pinchGesture.reset()
+                self?.refreshPlaybackSettings()
             }
+        })
+        observerTokens.append(NotificationCenter.default.addObserver(
+            forName: SPTimelineStyleSettings.changed, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshPlaybackSettings() }
         })
         for name in [NSWindow.willEnterFullScreenNotification,
                      NSWindow.willExitFullScreenNotification] {
@@ -533,6 +668,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.gestureFullscreenTransition = true
+                    self?.setSettingsPanelShown(false)
+                    self?.setPlaylistShown(false)
                     self?.cancelPlaybackScroll()
                 }
             })
@@ -542,7 +679,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             observerTokens.append(NotificationCenter.default.addObserver(
                 forName: name, object: win, queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.gestureFullscreenTransition = false }
+                MainActor.assumeIsolated {
+                    self?.gestureFullscreenTransition = false
+                    self?.refreshPlaybackSettings()
+                }
             })
         }
         observerTokens.append(NotificationCenter.default.addObserver(
@@ -566,6 +706,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
             self?.core?.setWindowVisibleForRendering(true)
             self?.runPendingDirectoryScanWhenFirstFramePresented()
+            self?.playlistController.refresh()
         })
         observerTokens.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: win, queue: .main
@@ -574,6 +715,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             self?.stopRepeat()
             self?.endTurbo(reason: "resignKey")
             MainActor.assumeIsolated {
+                self?.seekFeedback?.dismiss()
+                self?.volumeFeedback?.dismiss()
+                self?.setSettingsPanelShown(false)
+                    self?.setPlaylistShown(false)
+                self?.settingsDismissMouseButton = nil
+                self?.removeSettingsEventMonitor()
                 self?.cancelPlaybackScroll()
                 if self?.gestureFullscreenTransition != true { self?.pinchGesture.reset() }
             }
@@ -622,13 +769,15 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     override func viewDidLayout() {
         super.viewDidLayout()
 
+        layoutPlaybackSettings()
+        layoutTorrentLoading()
         guard chromeInstalled else { return }
-        chromePresenter?.layout(in: view.bounds)
         if let idleHint, !idleHint.isHidden { layoutIdleHint() }
         if let overlay = compareOverlay, !overlay.isHidden { layoutCompareOverlay() }
         if let hud = turboHUD, !hud.isHidden { layoutTurboHUD() }
+        seekFeedback?.place(in: playerView.frame)
+        volumeFeedback?.place(in: volumeFeedbackBounds)
         if let notice = playbackNotice, !notice.isHidden { layoutPlaybackNotice() }
-        if let panel = colorPanel, !panel.isHidden { layoutColorPanel() }
 
         core?.notePausedLayoutChange()
     }
@@ -645,7 +794,6 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func setupNewChrome() {
         let c = SPChromeView()
         c.onPlayPause = { [weak self] in self?.perform(.togglePlayback) }
-        c.onSeekRelative = { [weak self] d in self?.perform(.seekRelative(d)) }
         // Clicks and drags remain coarse keyframe seeks. This keeps each step
         // visible and its latency independent of GOP decode length.
         c.onScrubBegan = { [weak self] target in
@@ -741,7 +889,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         c.onVolumeBoostIntent = { [weak self] in self?.handleVolumeBoostIntent() }
         c.onMute = { [weak self] in self?.perform(.toggleMute) }
         c.onFullscreen = { [weak self] in self?.perform(.toggleFullscreen) }
+        c.onSettingsToggle = { [weak self] in self?.togglePlaybackSettingsAction(nil) }
+        c.setSettingsSelected(isSettingsPanelShown)
+        c.onTogglePlaylist = { [weak self] in self?.togglePlaylistAction(nil) }
+        c.setPlaylistSelected(isPlaylistShown)
         c.onRateSelected = { [weak self] rate in self?.perform(.setPlaybackRate(rate)) }
+        c.onSpeedSettings = { [weak self] in self?.openPlaybackSpeedSettings() }
+        c.onSubtitlesToggle = { [weak self] in self?.toggleQuickSubtitles() }
         c.onMotionSmoothingToggle = { [weak self] in
             self?.perform(.toggleFrameInterpolation)
         }
@@ -750,9 +904,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         c.dustSnapshotProvider = { [weak self] in self?.core?.timelineDustSnapshot() }
         c.damageSnapshotProvider = { [weak self] in self?.core?.damageSnapshot() }
         view.addSubview(c, positioned: .above, relativeTo: playerView)
-        c.layoutChrome(in: view.bounds)
+        c.layoutChrome(in: playerView.frame)
         chrome = c
         chromePresenter = c
+        refreshQuickSubtitleControl()
 #if !SP_APP_STORE
         installChromeAutomationHooks()
 #endif
@@ -1048,7 +1203,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func hideControls() {
         guard isControlBarVisible else { return }
+        if isSettingsPanelShown || isPlaylistShown { armHideTimer(after: 1.0); return }
         if isScrubbing { armHideTimer(after: 1.0); return }
+        if chrome?.ownsKeyboardFocus == true { armHideTimer(after: 1.0); return }
 
         if Self.useNewUI, let chrome, !chrome.isHidden, let win = view.window {
             let p = view.convert(win.mouseLocationOutsideOfEventStream, from: nil)
@@ -1061,7 +1218,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func dismissControlsNow() {
-        guard isControlBarVisible, !Self.pinControls else { return }
+        guard isControlBarVisible, !Self.pinControls, !isSettingsPanelShown, !isPlaylistShown else { return }
         hideControlsTimer?.invalidate()
         hideControlsTimer = nil
         isControlBarVisible = false
@@ -1289,6 +1446,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             w = WelcomeView(frame: view.bounds)
             w.autoresizingMask = [.width, .height]
             w.onOpenFile = { [weak self] in self?.presentOpenDocumentPanel() }
+            w.onOpenTorrent = { [weak self] in self?.openTorrentAction(nil) }
+            w.onOpenMagnet = { [weak self] in self?.openMagnetAction(nil) }
             // A 120 ms hover dwell filters incidental pointer crossings.
             // Leaving cancels pending preparation. Once synchronous construction
             // starts, newly queued keyboard input waits for it to finish.
@@ -1358,6 +1517,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             let defaults = UserDefaults.standard
             let entries = RecentPlays.load()
                 .prefix(WelcomeView.visibleEntryCount)
+                .filter { $0.torrent == nil && !SPRecentWarmPolicy.isManagedTorrentPath($0.path) }
                 .map { entry in
                     let position = defaults.object(
                         forKey: "sp.pos." + entry.path) as? Double
@@ -1444,6 +1604,18 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var recentOpenSettled = 0
 
     func openRecentEntry(path: String) {
+        if torrentResolving { cancelTorrentOpen() }
+        if let reference = RecentPlays.load().first(where: { $0.path == path })?.torrent {
+            recentOpenToken &+= 1
+            recentOpenSettled = recentOpenToken
+            view.window?.makeKeyAndOrderFront(nil)
+            beginTorrentOpen(resume: reference)
+            return
+        }
+        guard !SPRecentWarmPolicy.isManagedTorrentPath(path) else {
+            presentNonBlockingAlert(message: L("torrent.openFailed"), informative: L("torrent.resumeUnavailable"))
+            return
+        }
         let requestedAt = spDebugEnabled ? ProcessInfo.processInfo.systemUptime : 0
         let diagnosticWindow = view.window?.windowNumber ?? -1
         // Yield speculative reads before the existence check and actual open,
@@ -1618,6 +1790,32 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     func open(url: URL, incomingSecurityScopedGrant: Bool = true) {
+        if !torrentCacheRestartOpening {
+            invalidateTorrentCacheRestart()
+        }
+        cancelTorrentPauseBuffer(resetManualStop: true)
+        if url.scheme?.lowercased() == "magnet" {
+            beginTorrentOpen(magnet: url.absoluteString)
+            return
+        }
+        if url.isFileURL, url.pathExtension.lowercased() == "torrent" {
+            beginTorrentOpen(file: url)
+            if incomingSecurityScopedGrant { spReleaseSecurityScopedGrant(url) }
+            return
+        }
+        if let context = torrentContext, let file = context.file(for: url) {
+            playTorrentFile(file, descriptor: context.descriptor)
+            return
+        }
+        if !url.isFileURL, torrentOpenCandidate?.streamURL != url, torrentContext?.streamURL != url {
+            presentNonBlockingAlert(message: L("torrent.openFailed"), informative: L("torrent.invalidSource"))
+            return
+        }
+        if torrentOpenCandidate == nil, torrentResolving { cancelTorrentOpen() }
+        if url.hasDirectoryPath {
+            openPlaylistFolder(url)
+            return
+        }
         let requestedAt = spDebugEnabled ? ProcessInfo.processInfo.systemUptime : 0
 
         dismissFailurePresentation()
@@ -1646,7 +1844,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func performOpenRequest(url: URL, incomingSecurityScopedGrant: Bool) {
         SPBackgroundStorageGate.noteForegroundActivity() // Includes drag-and-drop and menu opens.
-        RecentPlaysWarmer.noteForegroundOpen(path: url.path)
+        if url.isFileURL { RecentPlaysWarmer.noteForegroundOpen(path: url.path) }
         recentOpenToken &+= 1
         recentOpenSettled = recentOpenToken
         SPMainThreadSentinel.phase("open.ensureCore") {
@@ -1677,12 +1875,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         // One session owns a media path. If another window already has it, focus
         // that window; reopening it here also avoids restarting the session.
         let stdPath = SPMainThreadSentinel.phase("open.normalizePath") {
-            url.standardizedFileURL.path
+            url.isFileURL ? url.standardizedFileURL.path : url.absoluteString
         }
         if let existing = (NSApp.delegate as? AppDelegate)?.windowController(forOpenPath: stdPath),
            existing.playerViewController !== self {
             if existing.playerViewController.handleDuplicateMediaOpen(
                 url: url, incomingSecurityScopedGrant: incomingSecurityScopedGrant) {
+                if playlistController.recursive, playlistController.contains(url),
+                   let root = playlistController.rootURL {
+                    existing.playerViewController.openPlaylistFolder(root)
+                }
                 return
             }
         }
@@ -1693,12 +1895,20 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         // A new session cannot inherit unfinished scrub or repeat state. Avoid
         // stopRepeat() here because it may resume playback in the outgoing
         // session and interfere with the incoming file.
+        savePlaylistProfile()
         yieldDirectoryScanToForegroundIO()
         let shouldResumePreviousPlayback = cancelTransientInteractions()
 
         flushResumePositionNow(forceDiskSync: false)
 
+        let previousTorrentContext = torrentContext
+        cancelTorrentPlaybackWindowPolicy()
+        let incomingTorrentContext = url.isFileURL ? nil :
+            (torrentOpenCandidate ?? (torrentContext?.streamURL == url ? torrentContext : nil))
+        torrentContext = incomingTorrentContext
         let previousHasMediaSession = hasMediaSession
+        let previousGeometry = (currentForcedAspectTag, currentCropTag, currentRotation, currentMirror)
+        let previousProfileRestorePending = playlistProfileRestorePending
         let previousTitle = view.window?.title ?? L("app.displayName")
         let previousInterpolationMode = core.frameInterpolationMode
         let previousOpenMediaPath = openMediaPath
@@ -1717,11 +1927,18 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         currentForcedAspectTag = 0
         currentCropTag = 0
+        currentRotation = 0
+        currentMirror = 0
+        settingsCodec = ""
+        settingsDecoder = ""
         // Install the opening indicator only after openMedia accepts the request.
         view.window?.title = url.lastPathComponent
         transitionPresentation(.stateChanged(.opening, presentationSnapshot(core: core)))
 
-        let resumePath = url.path
+        let resumePath = incomingTorrentContext?.identityURL.path ?? url.path
+        let exactStart = incomingTorrentContext.flatMap { context in
+            torrentExactStartOverride.flatMap { $0.lease == context.descriptor.leaseID ? $0.position : nil }
+        }
         let resume = SPMainThreadSentinel.phase("open.resumeLookup") {
             SPResumePolicy.startPosition(
                 path: resumePath,
@@ -1733,12 +1950,15 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         do {
             try SPMainThreadSentinel.phase("core.openMedia") {
-                if let resume, resume > 2 {
+                if let exactStart {
+                    try core.openMedia(at: url, startAt: exactStart)
+                } else if let resume, resume > 2 {
                     try core.openMedia(at: url, startAt: resume)
                 } else {
                     try core.openMedia(at: url)
                 }
             }
+            applyHDRViewingPreference()
             // Clear boost only after the replacement session is accepted.
             resetVolumeBoostForNewSource()
         } catch {
@@ -1748,7 +1968,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             if incomingSecurityScopedGrant { url.stopAccessingSecurityScopedResource() }
 #endif
 
+            torrentContext = previousTorrentContext
             hasMediaSession = previousHasMediaSession
+            (currentForcedAspectTag, currentCropTag, currentRotation, currentMirror) = previousGeometry
+            playlistProfileRestorePending = previousProfileRestorePending
             if !previousHasMediaSession { captionsMediaWillClose() }
             openMediaPath = previousOpenMediaPath
             recentRecordedThisOpen = previousRecentRecordedThisOpen
@@ -1765,6 +1988,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             view.window?.title = previousTitle
             if previousHasMediaSession {
                 replayCoreState()
+                startTorrentPlaybackWindowPolicyIfNeeded()
             } else {
                 transitionPresentation(.sessionClosed)
             }
@@ -1786,6 +2010,15 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             }
             return
         }
+        if previousTorrentContext?.descriptor.leaseID != incomingTorrentContext?.descriptor.leaseID,
+           let previousTorrentContext {
+            SPTorrentServer.shared.release(previousTorrentContext.descriptor)
+        }
+        if incomingTorrentContext == nil {
+            torrentStatusTask?.cancel()
+            torrentStatusTask = nil
+            torrentLastStatus = nil
+        }
         // Show feedback until the opening state completes or fails.
         setIdleHintVisible(true, text: String(format: L("hint.openingFmt"), url.lastPathComponent))
 #if SP_APP_STORE
@@ -1802,17 +2035,24 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         mediaList = [url]
         currentMediaIndex = 0
+        if incomingTorrentContext != nil { prepareTorrentPlaylist() }
+        else { preparePlaylistContext(for: url) }
 
         externalSubtitleCandidates.removeAll()
         directoryAutoSubtitleCandidates.removeAll()
         activeExternalSubtitleURL = nil
+        lastQuickSubtitleID = nil
         pendingSubtitleAutoload = false
         dropPendingExternalSubtitle()
         userTouchedSubtitleSelection = false
 
         captionsMediaWillClose(unregisterCore: false)
 
-        if SPFileAccess.mayScanAfterOpen(directory: url.deletingLastPathComponent()) {
+        if !url.isFileURL {
+            cancelDirectoryScanForSessionBoundary()
+            directorySnapshot = nil
+            startTorrentStatusUpdates()
+        } else if SPFileAccess.mayScanAfterOpen(directory: url.deletingLastPathComponent()) {
             SPMainThreadSentinel.phase("open.configureDirectory") {
                 configureDirectorySnapshot(for: url)
             }
@@ -1843,7 +2083,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     func handleDuplicateMediaOpen(url: URL,
                                   incomingSecurityScopedGrant: Bool = true) -> Bool {
         let path = SPMainThreadSentinel.phase("open.normalizePath") {
-            url.standardizedFileURL.path
+            url.isFileURL ? url.standardizedFileURL.path : url.absoluteString
         }
         guard openMediaPath == path, hasMediaSession, let core else { return false }
         let replaying = core.state == .ended
@@ -1928,7 +2168,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         // must not become a main-thread scan every time Previous/Next opens.
         var list = snapshot.mediaFiles
         let currentIndex = snapshot.mediaIndex(of: mediaURL)
-        if let currentIndex {
+        if playlistController.rootURL != nil {
+            // Series navigation belongs to the live recursive catalogue. This
+            // shallow snapshot remains responsible for local subtitle discovery.
+        } else if let currentIndex {
             mediaList = list
             currentMediaIndex = currentIndex
         } else {
@@ -2026,6 +2269,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         directoryAutoSubtitleCandidates = newAuto
         externalSubtitleCandidates = merged
+        refreshPlaybackSettings()
         guard !newAuto.isEmpty else { return }
         pendingSubtitleAutoload = true
         maybeRunSubtitleAutoload()
@@ -2047,6 +2291,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let url = externalSubtitleCandidates[index]
         let accepted = core?.loadSubtitleFile(url.path, silent: true) { [weak self] ok in
             guard let self, self.playlistScanGeneration == gen else { return }
+            defer { self.refreshPlaybackSettings() }
             if ok {
                 if self.activeExternalSubtitleURL == nil,
                    !self.userTouchedSubtitleSelection {
@@ -2115,7 +2360,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                                      precise: Bool = true,
                                      forward: Bool = false) {
         yieldDirectoryScanToForegroundIO()
+        cancelTorrentPauseBuffer()
+        cancelTorrentPlaybackWindowPolicy()
         core?.seek(to: target, precise: precise, forward: forward)
+        startTorrentPlaybackWindowPolicyIfNeeded()
     }
 
     private func cancelDirectoryScanForSessionBoundary() {
@@ -2261,6 +2509,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 .contains(where: { $0.standardizedFileURL == standardized }) {
                 self.externalSubtitleCandidates.append(url)
             }
+            self.refreshPlaybackSettings()
         }
         if !accepted {
             if #available(macOS 26.0, *), let captionSelection {
@@ -2282,11 +2531,41 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var closingWindowInProgress = false
 
     func handleWindowClose(destroyingWindow: Bool = false) {
+        invalidateTorrentCacheRestart()
+        cancelTorrentPauseBuffer(resetManualStop: true)
+        cancelTorrentPlaybackWindowPolicy()
+        torrentOpenGeneration &+= 1
+        torrentOpenTask?.cancel()
+        torrentOpenTask = nil
+        torrentResolving = false
+        torrentSaveGeneration &+= 1
+        torrentSaveTask?.cancel()
+        torrentSaveTask = nil
+        torrentStatusTask?.cancel()
+        torrentStatusTask = nil
+        torrentMagnetSheet?.dismiss()
+        torrentLoadingView?.isHidden = true
+        let closingTorrent = torrentContext
+        defer {
+            torrentContext = nil
+            if let closingTorrent { SPTorrentServer.shared.release(closingTorrent.descriptor) }
+        }
+        savePlaylistProfile()
+        playlistInitialOpenPending = false
+        playlistAdvanceAfterScanPath = nil
+        playlistController.stop()
+        playlistProfileRestorePending = false
+        playlistProfileRoot = nil
+        setPlaylistShown(false)
+        setSettingsPanelShown(false)
+        settingsDismissMouseButton = nil
+        removeSettingsEventMonitor()
         playbackSleep.stop()
         playbackCursor?.setHasVideo(false)
         if destroyingWindow { windowDestructionPending = true }
         dismissOpenPanelPresentation() // Close a standalone panel but retain its cached instance.
         openMediaPath = nil
+        lastQuickSubtitleID = nil
         replayResumeResetArmedPath = nil
 
         recentOpenToken &+= 1
@@ -2301,7 +2580,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             return
         }
         cancelTransientInteractions()
-        setColorPanelShown(false)
+        setSettingsPanelShown(false)
         directorySnapshot = nil
         mediaList.removeAll(keepingCapacity: false)
         currentMediaIndex = -1
@@ -2339,27 +2618,1007 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if hadWelcome { welcome?.rerollTexture() }
     }
 
+    private func torrentErrorMessage(_ error: Error) -> String {
+        if let error = error as? SPTorrentHistoryOpenError {
+            switch error {
+            case .sourceUnavailable: return L("torrent.resumeUnavailable")
+            case .fileMissing: return L("torrent.resumeFileMissing")
+            }
+        }
+        if error is SPTorrentInputError { return L("torrent.invalidSource") }
+        if let error = error as? SPTorrentServerError {
+            switch error {
+            case .workerMissing, .workerUnavailable, .workerExited: return L("torrent.workerUnavailable")
+            case .invalidInput, .invalidLease, .invalidFile, .invalidResponse: return L("torrent.invalidSource")
+            case .capacityReached: return L("torrent.capacityReached")
+            case .cacheRestartBusy: return L("torrent.settings.restartBusy")
+            case .noPlayableFiles: return L("torrent.noPlayableFiles")
+            case .metadataTimeout: return L("torrent.metadataTimeout")
+            case .http: return L("torrent.networkError")
+            case .destinationExists: return NSError(domain: NSCocoaErrorDomain, code: NSFileWriteFileExistsError).localizedDescription
+            }
+        }
+        if (error as NSError).domain == NSURLErrorDomain { return L("torrent.networkError") }
+        return error.localizedDescription
+    }
+
+    @objc func cancelTorrentSaveAction(_ sender: Any?) { torrentSaveTask?.cancel() }
+
+    // MARK: - Torrent streaming
+
+    private enum SPTorrentHistoryOpenError: Error {
+        case sourceUnavailable
+        case fileMissing
+    }
+
+    @objc func openTorrentAction(_ sender: Any?) {
+        guard let window = view.window, window.attachedSheet == nil else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [UTType(filenameExtension: "torrent") ?? .data]
+        panel.title = L("torrent.openFile")
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.beginTorrentOpen(file: url)
+        }
+    }
+
+    @objc func openMagnetAction(_ sender: Any?) {
+        guard let window = view.window, window.attachedSheet == nil else { return }
+        let sheet = SPTorrentMagnetSheet()
+        sheet.onOpen = { [weak self] value in self?.beginTorrentOpen(magnet: value) }
+        torrentMagnetSheet = sheet
+        sheet.present(over: window)
+    }
+
+    var hasUnsettledTorrentOpen: Bool {
+        torrentResolving || torrentOpenTask != nil || torrentOpenCandidate != nil ||
+            (torrentContext != nil && (core?.state == .opening || core?.seekSettled == false))
+    }
+
+    func torrentCacheRestartSnapshot() throws -> SPTorrentCacheRestartSnapshot? {
+        guard !hasUnsettledTorrentOpen else { throw SPTorrentServerError.cacheRestartBusy }
+        if let suspended = suspendedTorrentCacheSnapshot,
+           torrentCacheRestartToken == suspended.token, torrentContext == nil { return suspended }
+        guard let context = torrentContext else { return nil }
+        guard torrentSaveTask == nil, let core, hasMediaSession,
+              core.state == .playing || core.state == .paused || core.state == .ended,
+              core.position.isFinite, core.position >= 0,
+              context.descriptor.originalTorrentData != nil || context.descriptor.originalLink != nil
+        else { throw SPTorrentServerError.cacheRestartBusy }
+        var profile = playlistProfile
+        profile.brightness = pictureAdjustment.brightness
+        profile.contrast = pictureAdjustment.contrast
+        profile.saturation = pictureAdjustment.saturation
+        profile.gamma = pictureAdjustment.gamma
+        profile.hue = pictureAdjustment.hue
+        profile.aspect = currentForcedAspectTag
+        profile.crop = currentCropTag
+        profile.rotation = currentRotation
+        profile.mirror = currentMirror
+        profile.motionMode = core.frameInterpolationMode.rawValue
+        profile.xdr = core.xdrEnabled
+        if let track = core.audioTrackList.first(where: {
+            ($0["index"] as? NSNumber)?.intValue == core.currentAudioTrackIndex
+        }) as? [String: Any] { profile.audio = SPPlaylistAudioPreference(track: track) }
+        return SPTorrentCacheRestartSnapshot(owner: ObjectIdentifier(self), token: UUID(),
+            descriptor: context.descriptor, file: context.file, position: core.position,
+            wasPlaying: core.state == .playing || burstWasPlaying || scrollSeekWasPlaying,
+            rate: turbo.phase == .active ? turbo.baseRate : core.playbackRate,
+            profile: profile, audioOff: core.currentAudioTrackIndex < 0, audioIndex: core.currentAudioTrackIndex,
+            volume: core.volume, muted: core.isMuted, volumeBoostUnlocked: volumeBoostUnlocked,
+            subtitleID: currentQuickSubtitleID, subtitleScale: core.subtitleScale,
+            lastSubtitleID: lastQuickSubtitleID, playlistShown: isPlaylistShown,
+            settingsShown: isSettingsPanelShown)
+    }
+
+    func suspendTorrentForCacheRestart(_ snapshot: SPTorrentCacheRestartSnapshot) throws {
+        if snapshot.owner == ObjectIdentifier(self), torrentCacheRestartToken == snapshot.token,
+           suspendedTorrentCacheSnapshot?.token == snapshot.token, torrentContext == nil { return }
+        guard snapshot.owner == ObjectIdentifier(self),
+              torrentContext?.descriptor.leaseID == snapshot.descriptor.leaseID,
+              torrentContext?.file == snapshot.file, !hasUnsettledTorrentOpen,
+              torrentSaveTask == nil else { throw SPTorrentServerError.cacheRestartBusy }
+        handleWindowClose()
+        // A normal close/new open invalidates this token. Only this deliberate
+        // suspension installs it afterwards, so later user navigation wins.
+        torrentCacheRestartToken = snapshot.token
+        suspendedTorrentCacheSnapshot = snapshot
+    }
+
+    func resumeTorrentAfterCacheRestart(_ snapshot: SPTorrentCacheRestartSnapshot) async throws {
+        try checkTorrentCacheRestart(snapshot)
+        var acquired: SPTorrentDescriptor?
+        var accepted = false
+        do {
+            let descriptor: SPTorrentDescriptor
+            if let data = snapshot.descriptor.originalTorrentData {
+                descriptor = try await SPTorrentServer.shared.add(torrentData: data)
+            } else if let link = snapshot.descriptor.originalLink {
+                descriptor = try await SPTorrentServer.shared.add(magnet: link)
+            } else { throw SPTorrentServerError.invalidInput }
+            acquired = descriptor
+            try checkTorrentCacheRestart(snapshot)
+            guard descriptor.hash == snapshot.descriptor.hash,
+                  let file = descriptor.files.first(where: {
+                      $0.path == snapshot.file.path && $0.length == snapshot.file.length && $0.isPlayable
+                  }) else { throw SPTorrentHistoryOpenError.fileMissing }
+            guard let core else { throw SPTorrentServerError.workerUnavailable }
+            // Reopening a paused session must not briefly play audible audio.
+            torrentCacheRestartMute = (snapshot.token, descriptor.leaseID, snapshot.muted)
+            core.setMuted(true)
+            torrentExactStartOverride = (descriptor.leaseID, snapshot.position)
+            torrentCacheRestartOpening = true
+            playTorrentFile(file, descriptor: descriptor)
+            torrentCacheRestartOpening = false
+            torrentExactStartOverride = nil
+            guard torrentContext?.descriptor.leaseID == descriptor.leaseID else {
+                throw SPTorrentServerError.workerUnavailable
+            }
+            accepted = true
+            acquired = nil
+            playlistProfile = snapshot.profile
+            playlistProfileRestorePending = true
+            let deadline = ProcessInfo.processInfo.systemUptime + 90
+            var appliedSelection = false
+            while true {
+                try checkTorrentCacheRestart(snapshot, lease: descriptor.leaseID)
+                guard core.state != .failed, core.state != .idle else {
+                    throw NSError(domain: "SPTorrentCacheRestart", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: L("torrent.settings.restartFailed")])
+                }
+                if core.state == .playing || core.state == .paused || core.state == .ready || core.state == .ended {
+                    restorePlaylistProfileIfReady()
+                    if !appliedSelection {
+                        appliedSelection = true
+                        core.setPlaybackRate(snapshot.rate)
+                        core.setVolume(snapshot.volume)
+                        volumeBoostUnlocked = snapshot.volumeBoostUnlocked
+                        if snapshot.audioOff { core.selectAudioTrack(at: -1) }
+                        else {
+                            let tracks = core.audioTrackList.compactMap { $0 as? [String: Any] }
+                            // This is the identical hash and file, so an exact
+                            // stream index also preserves unnamed/ambiguous voices.
+                            let index = snapshot.profile.audio?.bestMatch(in: tracks) ?? snapshot.audioIndex
+                            if tracks.contains(where: { ($0["index"] as? NSNumber)?.intValue == index }),
+                               index != core.currentAudioTrackIndex { core.selectAudioTrack(at: index) }
+                        }
+                        core.setSubtitleScale(snapshot.subtitleScale)
+                        lastQuickSubtitleID = snapshot.lastSubtitleID
+                        userTouchedSubtitleSelection = true
+                        if let subtitle = snapshot.subtitleID {
+                            if subtitle == "generated" { captionsAttachIfNeeded() }
+                            if subtitle.hasPrefix("external:"),
+                               let url = URL(string: String(subtitle.dropFirst(9))) {
+                                _ = url.startAccessingSecurityScopedResource()
+                                loadExternalSubtitle(url: url)
+                            } else { handleSettingsAction(.subtitleTrack(subtitle)) }
+                        } else { handleSettingsAction(.subtitleTrack("off")) }
+                        // Open-time positioning may begin at a preceding key
+                        // frame (and intentionally skips near-end history
+                        // positions). A live worker handoff requires the exact
+                        // saved frame, including sub-second and near-end points.
+                        core.pause()
+                        core.seek(to: snapshot.position, precise: true)
+                    }
+                    let frameTolerance = max(0.15, core.videoInfo.fps > 0 ? 2 / core.videoInfo.fps : 0.15)
+                    let atSavedPosition = abs(core.position - snapshot.position) <= frameTolerance
+                    if atSavedPosition && (core.state == .ended || (core.seekSettled &&
+                        (core.audioOnlySession || core.hasEverPresentedThisSession))) {
+                        // pause publishes its delegate synchronously; doing it
+                        // here avoids reentering an outer Playing state handler.
+                        if snapshot.wasPlaying, core.state != .ended { core.play() }
+                        else { core.pause() }
+                        core.setMuted(snapshot.muted)
+                        core.setVolume(snapshot.volume)
+                        volumeBoostUnlocked = snapshot.volumeBoostUnlocked
+                        publishVolumePresentation()
+                        setPlaylistShown(snapshot.playlistShown)
+                        if snapshot.settingsShown { setSettingsPanelShown(true) }
+                        torrentCacheRestartToken = nil
+                        suspendedTorrentCacheSnapshot = nil
+                        torrentCacheRestartMute = nil
+                        refreshPlaybackSettings()
+                        refreshPlaylistView()
+                        startTorrentPlaybackWindowPolicyIfNeeded()
+                        updateTorrentPauseBuffer()
+                        return
+                    }
+                }
+                guard ProcessInfo.processInfo.systemUptime < deadline else {
+                    throw SPTorrentServerError.metadataTimeout
+                }
+                try await Task.sleep(for: .milliseconds(30))
+            }
+        } catch {
+            torrentCacheRestartOpening = false
+            torrentExactStartOverride = nil
+            if let muted = torrentCacheRestartMute, muted.token == snapshot.token {
+                if torrentContext?.descriptor.leaseID == muted.lease || !hasMediaSession {
+                    core?.setMuted(muted.muted)
+                }
+                torrentCacheRestartMute = nil
+            }
+            if let acquired { SPTorrentServer.shared.release(acquired) }
+            if accepted, torrentCacheRestartToken == snapshot.token {
+                handleWindowClose()
+                torrentCacheRestartToken = snapshot.token
+                suspendedTorrentCacheSnapshot = snapshot
+            }
+            throw error
+        }
+    }
+
+    private func checkTorrentCacheRestart(_ snapshot: SPTorrentCacheRestartSnapshot,
+                                         lease: UUID? = nil) throws {
+        try Task.checkCancellation()
+        guard snapshot.owner == ObjectIdentifier(self), torrentCacheRestartToken == snapshot.token,
+              !windowDestructionPending,
+              lease == nil || torrentContext?.descriptor.leaseID == lease else { throw CancellationError() }
+    }
+
+    private func invalidateTorrentCacheRestart() {
+        if let muted = torrentCacheRestartMute,
+           torrentContext?.descriptor.leaseID == muted.lease || !hasMediaSession {
+            core?.setMuted(muted.muted)
+        }
+        torrentCacheRestartMute = nil
+        torrentCacheRestartToken = nil
+        suspendedTorrentCacheSnapshot = nil
+    }
+
+    private func cancelTorrentPlaybackWindowPolicy(releaseRetainedWindow: Bool = false) {
+        torrentPlaybackWindowEpoch = UUID()
+        torrentPlaybackWindowTask?.cancel()
+        torrentPlaybackWindowTask = nil
+        torrentAppliedPlaybackWindow = nil
+        if let context = torrentContext {
+            // Revoke local authorization immediately, but retain the worker's
+            // previous bytes until a valid new media window replaces it. Only
+            // releasing/closing the source removes its worker window.
+            if releaseRetainedWindow {
+                SPTorrentServer.shared.endPlaybackWindow(context.descriptor)
+            } else {
+                SPTorrentServer.shared.invalidatePlaybackWindow(context.descriptor)
+            }
+        }
+    }
+
+    private func startTorrentPlaybackWindowPolicyIfNeeded() {
+        guard torrentPlaybackWindowTask == nil, let context = torrentContext,
+              hasMediaSession, torrentCacheRestartToken == nil, let core,
+              core.state == .opening || core.state == .ready ||
+                core.state == .playing || core.state == .paused else { return }
+        let epoch = UUID()
+        torrentPlaybackWindowEpoch = epoch
+        torrentPlaybackWindowTask = Task { @MainActor [weak self] in
+            var lastUpdateAt: TimeInterval = 0
+            while !Task.isCancelled {
+                guard let self, self.torrentPlaybackWindowEpoch == epoch,
+                      self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
+                      self.hasMediaSession, self.torrentCacheRestartToken == nil,
+                      let core = self.core else { break }
+                let source = core.sourcePlaybackWindow
+                let valid = (core.state == .playing || core.state == .paused) && core.seekSettled &&
+                    source.openGeneration >= 0 && source.seekGeneration >= 0 &&
+                    source.historyStartOffset >= 0 && source.playbackOffset >= source.historyStartOffset &&
+                    source.playbackOffset < context.file.length
+                if !valid {
+                    if self.torrentAppliedPlaybackWindow != nil {
+                        self.torrentAppliedPlaybackWindow = nil
+                        self.torrentPauseBuffer.cancel()
+                        SPTorrentServer.shared.invalidatePlaybackWindow(context.descriptor)
+                    }
+                } else {
+                    let previous = self.torrentAppliedPlaybackWindow
+                    let now = ProcessInfo.processInfo.systemUptime
+                    // The paused playhead leaves both boundaries fixed. Refresh
+                    // its lease occasionally without turning the prefetch
+                    // reader's moving cursor into watched content.
+                    let changed = previous?.openGeneration != source.openGeneration ||
+                        previous?.seekGeneration != source.seekGeneration ||
+                        previous?.requestedHistoryLowerBound != source.historyStartOffset ||
+                        previous?.playbackOffset != source.playbackOffset
+                    if changed || now - lastUpdateAt >= 2 {
+                        do {
+                            let applied = try await SPTorrentServer.shared.updatePlaybackWindow(
+                                context.descriptor, file: context.file,
+                                historyLowerBound: source.historyStartOffset,
+                                playbackOffset: source.playbackOffset,
+                                forwardUpperBound: context.file.length)
+                            guard !Task.isCancelled, self.torrentPlaybackWindowEpoch == epoch,
+                                  self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID else { break }
+                            let current = core.sourcePlaybackWindow
+                            guard current.openGeneration == source.openGeneration,
+                                  current.seekGeneration == source.seekGeneration,
+                                  current.playbackOffset >= 0, core.seekSettled else {
+                                self.torrentAppliedPlaybackWindow = nil
+                                self.torrentPauseBuffer.cancel()
+                                SPTorrentServer.shared.invalidatePlaybackWindow(context.descriptor)
+                                continue
+                            }
+                            self.torrentAppliedPlaybackWindow = AppliedTorrentPlaybackWindow(
+                                leaseID: context.descriptor.leaseID, fileID: context.file.id,
+                                openGeneration: source.openGeneration, seekGeneration: source.seekGeneration,
+                                historyLowerBound: applied.historyLowerBound,
+                                requestedHistoryLowerBound: source.historyStartOffset,
+                                playbackOffset: applied.playbackOffset,
+                                forwardUpperBound: applied.forwardUpperBound,
+                                prefetchCapacityStop: applied.prefetchCapacityStop)
+                            lastUpdateAt = now
+                            self.updateTorrentPauseBuffer()
+                        } catch is CancellationError {
+                            // A superseded server acknowledgement need not mean
+                            // this controller/source task was cancelled. Keep
+                            // waiting for its new media epoch after a seek.
+                            guard !Task.isCancelled, self.torrentPlaybackWindowEpoch == epoch,
+                                  self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID else { break }
+                            self.torrentAppliedPlaybackWindow = nil
+                            self.torrentPauseBuffer.cancel()
+                        }
+                        catch {
+                            // A rejected/failed update cannot authorize a new
+                            // background request from a stale cache window.
+                            if self.torrentPlaybackWindowEpoch == epoch {
+                                self.torrentAppliedPlaybackWindow = nil
+                                self.torrentPauseBuffer.cancel()
+                                SPTorrentServer.shared.invalidatePlaybackWindow(context.descriptor)
+                            }
+                        }
+                    }
+                }
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { break }
+            }
+            if let self, self.torrentPlaybackWindowEpoch == epoch {
+                self.torrentPlaybackWindowTask = nil
+            }
+        }
+    }
+
+    private func cancelTorrentPauseBuffer(resetManualStop: Bool = false) {
+        torrentPauseBuffer.cancel()
+        if resetManualStop {
+            torrentPauseBufferManuallyStopped = false
+            stopTorrentPauseBufferMonitor()
+        }
+    }
+
+    private func stopTorrentPauseBufferMonitor() {
+        torrentPauseBufferMonitorGeneration = UUID()
+        torrentPauseBufferMonitor?.cancel()
+        torrentPauseBufferMonitor = nil
+    }
+
+    private func startTorrentPauseBufferMonitorIfNeeded() {
+        guard torrentPauseBufferMonitor == nil else { return }
+        let generation = UUID()
+        torrentPauseBufferMonitorGeneration = generation
+        torrentPauseBufferMonitor = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.torrentPauseBufferMonitorGeneration == generation,
+                      self.torrentContext != nil,
+                      self.core?.state == .paused || self.core?.state == .playing else { break }
+                self.updateTorrentPauseBuffer()
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { break }
+            }
+            if let self, self.torrentPauseBufferMonitorGeneration == generation {
+                self.torrentPauseBufferMonitor = nil
+            }
+        }
+    }
+
+    private func updateTorrentPauseBuffer() {
+        guard let context = torrentContext, let core,
+              core.state == .paused || core.state == .playing,
+              hasMediaSession, torrentCacheRestartToken == nil,
+              !torrentResolving else {
+            if torrentPauseBuffer.snapshot.state != .idle { torrentPauseBuffer.cancel() }
+            return
+        }
+        startTorrentPauseBufferMonitorIfNeeded()
+        let source = core.sourcePlaybackWindow
+        guard core.seekSettled, core.sourceReadOffset >= 0,
+              let applied = torrentAppliedPlaybackWindow,
+              applied.leaseID == context.descriptor.leaseID, applied.fileID == context.file.id,
+              source.openGeneration >= 0, source.seekGeneration >= 0,
+              applied.openGeneration == source.openGeneration,
+              applied.seekGeneration == source.seekGeneration else {
+            if torrentPauseBuffer.snapshot.state != .idle { torrentPauseBuffer.cancel() }
+            return
+        }
+        guard !torrentPauseBufferManuallyStopped else { return }
+        torrentPauseBuffer.start(identity: .init(hash: context.descriptor.hash, fileID: context.file.id,
+            sessionGeneration: context.descriptor.leaseID), streamURL: context.streamURL,
+            offset: core.sourceReadOffset, fileLength: context.file.length,
+            forwardEndOffset: applied.forwardUpperBound, capacityStop: applied.prefetchCapacityStop)
+    }
+
+    private var torrentPauseWindowReady: Bool {
+        guard let context = torrentContext, let core,
+              core.state == .paused || core.state == .playing,
+              core.seekSettled, core.sourceReadOffset >= 0,
+              let applied = torrentAppliedPlaybackWindow,
+              applied.leaseID == context.descriptor.leaseID, applied.fileID == context.file.id else { return false }
+        let source = core.sourcePlaybackWindow
+        return source.openGeneration >= 0 && source.seekGeneration >= 0 &&
+            source.openGeneration == applied.openGeneration && source.seekGeneration == applied.seekGeneration
+    }
+
+    func toggleTorrentPauseBuffer() {
+        guard torrentContext != nil,
+              core?.state == .paused || core?.state == .playing else { return }
+        if torrentPauseBuffer.snapshot.state == .filling || torrentPauseBuffer.snapshot.state == .waitingForCapacity {
+            torrentPauseBufferManuallyStopped = true
+            torrentPauseBuffer.stop()
+        } else if torrentPauseBuffer.snapshot.state == .filled {
+            // A full rolling window can grow again as playback advances. Stop
+            // that future fill too, without removing already cached pieces.
+            torrentPauseBufferManuallyStopped = true
+            torrentPauseBuffer.cancel()
+        } else {
+            torrentPauseBufferManuallyStopped = false
+            // Explicit action retries a failure; periodic status polling never does.
+            if torrentPauseBuffer.snapshot.state == .failed { torrentPauseBuffer.stop() }
+            updateTorrentPauseBuffer()
+        }
+        refreshPlaylistView()
+    }
+
+    func beginTorrentOpen(magnet: String? = nil, file: URL? = nil,
+                          resume reference: SPTorrentResumeReference? = nil) {
+        invalidateTorrentCacheRestart()
+        cancelTorrentPauseBuffer(resetManualStop: true)
+        torrentOpenGeneration &+= 1
+        let generation = torrentOpenGeneration
+        torrentOpenTask?.cancel()
+        torrentResolving = true
+        let ownsFileGrant = file?.startAccessingSecurityScopedResource() == true
+        showTorrentLoading(L("torrent.resolving"), detail: L("torrent.cachePolicy"))
+        torrentOpenTask = Task { @MainActor [weak self] in
+            defer { if ownsFileGrant { file?.stopAccessingSecurityScopedResource() } }
+            guard let self else { return }
+            var acquired: SPTorrentDescriptor?
+            do {
+                let descriptor: SPTorrentDescriptor
+                if let reference {
+                    let source: SPTorrentResumeResolvedSource
+                    do {
+                        source = try await Task.detached(priority: .userInitiated) {
+                            try SPTorrentResumeStore.shared.resolve(reference)
+                        }.value
+                    } catch {
+                        throw SPTorrentHistoryOpenError.sourceUnavailable
+                    }
+                    try Task.checkCancellation()
+                    switch source {
+                    case .magnet(let link): descriptor = try await SPTorrentServer.shared.add(magnet: link)
+                    case .torrentFile(let url): descriptor = try await SPTorrentServer.shared.add(torrentFile: url)
+                    }
+                } else if let magnet { descriptor = try await SPTorrentServer.shared.add(magnet: magnet) }
+                else if let file { descriptor = try await SPTorrentServer.shared.add(torrentFile: file) }
+                else { throw SPTorrentServerError.invalidInput }
+                acquired = descriptor
+                try Task.checkCancellation()
+                guard self.torrentOpenGeneration == generation else { throw CancellationError() }
+                let selected: SPTorrentFile
+                if let reference {
+                    guard descriptor.hash == reference.hash,
+                          let file = descriptor.files.first(where: {
+                              $0.path == reference.filePath && $0.length == reference.length && $0.isPlayable
+                          }) else { throw SPTorrentHistoryOpenError.fileMissing }
+                    selected = file
+                } else {
+                    guard let first = descriptor.files.first(where: \.isPlayable) else { throw SPTorrentServerError.noPlayableFiles }
+                    selected = first
+                }
+                self.torrentResolving = false
+                self.playTorrentFile(selected, descriptor: descriptor)
+                if self.torrentContext?.descriptor.leaseID == descriptor.leaseID { acquired = nil }
+            } catch is CancellationError {
+                // The outgoing media keeps playing while metadata resolves.
+            } catch {
+                if self.torrentOpenGeneration == generation, !Task.isCancelled {
+                    self.presentNonBlockingAlert(message: L("torrent.openFailed"), informative: self.torrentErrorMessage(error))
+                }
+            }
+            if let acquired { SPTorrentServer.shared.release(acquired) }
+            if self.torrentOpenGeneration == generation {
+                self.torrentResolving = false
+                self.torrentOpenTask = nil
+                self.updateTorrentLoadingForCoreState(self.core?.state ?? .idle)
+            }
+        }
+    }
+
+    private func playTorrentFile(_ file: SPTorrentFile, descriptor: SPTorrentDescriptor) {
+        do {
+            let url = try SPTorrentServer.shared.streamURL(hash: descriptor.hash, file: file,
+                                                         playbackConsumer: descriptor.leaseID)
+            torrentOpenCandidate = SPTorrentPlaybackContext(descriptor: descriptor, file: file, streamURL: url)
+            defer { torrentOpenCandidate = nil }
+            open(url: url, incomingSecurityScopedGrant: false)
+            if torrentContext?.descriptor.leaseID == descriptor.leaseID {
+                showTorrentLoading(L("torrent.buffering"), detail: L("torrent.cachePolicy"))
+                setPlaylistShown(true)
+            }
+        } catch {
+            presentNonBlockingAlert(message: L("torrent.openFailed"), informative: torrentErrorMessage(error))
+        }
+    }
+
+    private func prepareTorrentPlaylist() {
+        guard let context = torrentContext else { return }
+        playlistInitialOpenPending = false
+        playlistAdvanceAfterScanPath = nil
+        playlistController.stop()
+        if playlistProfileRoot != context.rootURL {
+            playlistProfileRoot = context.rootURL
+            playlistProfile = SPPlaylistPreferencesStore.shared.profile(for: context.rootURL) ?? SPPlaylistProfile()
+        }
+        playlistProfileRestorePending = true
+        mediaList = context.playableFiles.map { context.identityURL(for: $0) }
+        currentMediaIndex = context.playableFiles.firstIndex(where: { $0.id == context.file.id }) ?? 0
+        refreshPlaylistView()
+    }
+
+    private var torrentPresentation: SPTorrentPlaylistPresentation? {
+        guard torrentContext != nil else { return nil }
+        let saving = torrentSaveTask != nil
+        let waiting = core?.state == .opening || core?.sourcePlaybackWaiting == true
+        let paused = core?.state == .paused
+        let pauseSnapshot = torrentPauseBuffer.snapshot
+        var pauseAction: String?
+        var pauseEnabled = false
+        var details = L("torrent.cachePolicy")
+        if let status = torrentLastStatus {
+            let buffered = ByteCountFormatter.string(fromByteCount: status.bufferedBytes, countStyle: .memory)
+            let capacity = ByteCountFormatter.string(fromByteCount: status.bufferCapacityBytes > 0
+                ? status.bufferCapacityBytes : (SPTorrentServer.shared.effectiveCacheSizeBytes ?? SPTorrentPreferences.configuration().cacheSizeBytes), countStyle: .memory)
+            if paused && !saving && status.downloadBytesPerSecond < 1 {
+                details = String(format: L("torrent.pausedStatusFormat"), status.activePeers, buffered, capacity)
+            } else {
+                details = String(format: L("torrent.statusFormat"), status.activePeers,
+                    ByteCountFormatter.string(fromByteCount: Int64(status.downloadBytesPerSecond), countStyle: .file),
+                    buffered, capacity)
+            }
+        }
+        if (paused || core?.state == .playing) && !torrentResolving && torrentCacheRestartToken == nil {
+            switch pauseSnapshot.state {
+            case .filling:
+                let received = ByteCountFormatter.string(fromByteCount: pauseSnapshot.receivedBytes, countStyle: .memory)
+                let budget = ByteCountFormatter.string(fromByteCount: pauseSnapshot.budgetBytes, countStyle: .memory)
+                details += " · " + String(format: L("torrent.pauseBufferFillingFormat"), received, budget)
+                pauseAction = L("torrent.pauseBufferStop")
+                pauseEnabled = true
+            case .filled:
+                details += " · " + L("torrent.pauseBufferFilled")
+                pauseAction = L("torrent.pauseBufferStop")
+                pauseEnabled = true
+            case .waitingForCapacity:
+                details += " · " + L("torrent.pauseBufferWaitingForCapacity")
+                pauseAction = L("torrent.pauseBufferStop")
+                pauseEnabled = true
+            case .stopped:
+                details += " · " + L("torrent.pauseBufferStopped")
+                pauseAction = L("torrent.pauseBufferResume")
+                pauseEnabled = torrentPauseWindowReady
+            case .failed:
+                details += " · " + L("torrent.pauseBufferFailed")
+                pauseAction = L("torrent.pauseBufferResume")
+                pauseEnabled = torrentPauseWindowReady
+            case .idle:
+                if torrentPauseBufferManuallyStopped { details += " · " + L("torrent.pauseBufferStopped") }
+                pauseAction = torrentPauseBufferManuallyStopped ? L("torrent.pauseBufferResume") : L("torrent.pauseBufferStart")
+                pauseEnabled = torrentPauseWindowReady
+            }
+        }
+        let statusText = saving ? L("torrent.saving") : (waiting ? L("torrent.buffering") : (paused ? L("torrent.paused") : L("torrent.streaming")))
+        return SPTorrentPlaylistPresentation(status: statusText,
+            details: details, downloadProgress: saving ? torrentDownloadProgress : nil,
+            isSaving: saving, canSave: !saving && hasMediaSession,
+            pauseBufferAction: pauseAction, pauseBufferEnabled: pauseEnabled)
+    }
+
+    private func startTorrentStatusUpdates() {
+        torrentStatusTask?.cancel()
+        guard let context = torrentContext else { return }
+        startTorrentPlaybackWindowPolicyIfNeeded()
+        torrentStatusTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let status = try await SPTorrentServer.shared.status(hash: context.descriptor.hash)
+                    guard let self, self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID else { return }
+                    self.startTorrentPlaybackWindowPolicyIfNeeded()
+                    self.torrentLastStatus = status
+                    self.updateTorrentPauseBuffer()
+                    self.refreshPlaylistView()
+                    self.updateTorrentLoadingForCoreState(self.core?.state ?? .idle)
+                } catch is CancellationError { return }
+                catch { /* Playback requests report failures through Core. */ }
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            }
+        }
+    }
+
+    private func showTorrentLoading(_ text: String, detail: String?) {
+        if torrentLoadingView == nil {
+            let loading = SPTorrentLoadingView(frame: .zero)
+            loading.onCancel = { [weak self] in self?.cancelTorrentOpen() }
+            view.addSubview(loading)
+            torrentLoadingView = loading
+        }
+        torrentLoadingView?.setStatus(text, detail: detail)
+        torrentLoadingView?.isHidden = false
+        layoutTorrentLoading()
+    }
+
+    private func layoutTorrentLoading() {
+        guard let loading = torrentLoadingView else { return }
+        let width = min(loading.preferredMenuSize.width, max(0, view.bounds.width - 32))
+        loading.frame = NSRect(x: (view.bounds.width - width) / 2,
+            y: max(90, (view.bounds.height - loading.preferredMenuSize.height) / 2),
+            width: width, height: loading.preferredMenuSize.height)
+    }
+
+    private func updateTorrentLoadingForCoreState(_ state: SPPlayerState) {
+        if torrentResolving { return }
+        if torrentContext != nil, state == .opening {
+            showTorrentLoading(L("torrent.buffering"), detail: torrentPresentation?.details)
+        } else { torrentLoadingView?.isHidden = true }
+    }
+
+    private func cancelTorrentOpen() {
+        let resolving = torrentResolving
+        torrentOpenGeneration &+= 1
+        torrentOpenTask?.cancel()
+        torrentOpenTask = nil
+        torrentResolving = false
+        torrentLoadingView?.isHidden = true
+        if !resolving, torrentContext != nil, core?.state == .opening { handleWindowClose() }
+    }
+
+    @objc func saveTorrentFileAction(_ sender: Any?) {
+        guard let context = torrentContext, torrentSaveTask == nil,
+              let window = view.window, window.attachedSheet == nil else { return }
+        let panel = NSSavePanel()
+        panel.title = L("torrent.saveFile")
+        panel.nameFieldStringValue = context.file.displayName
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let destination = panel.url, let self else { return }
+            self.torrentSaveGeneration &+= 1
+            let generation = self.torrentSaveGeneration
+            self.torrentDownloadProgress = nil
+            let ownsGrant = destination.startAccessingSecurityScopedResource()
+            let replaceExisting = FileManager.default.fileExists(atPath: destination.path)
+            self.torrentSaveTask = Task { @MainActor [weak self] in
+                defer { if ownsGrant { destination.stopAccessingSecurityScopedResource() } }
+                guard let self else { return }
+                do {
+                    _ = try await SPTorrentServer.shared.saveFile(context.descriptor, file: context.file,
+                        to: destination, replaceExisting: replaceExisting) { [weak self] progress in
+                            guard let self, self.torrentSaveGeneration == generation else { return }
+                            self.torrentDownloadProgress = progress.fraction
+                            self.refreshPlaylistView()
+                        }
+                    self.showTransientNotice(L("torrent.saved"))
+                } catch is CancellationError {
+                } catch {
+                    if !Task.isCancelled {
+                        self.presentNonBlockingAlert(message: L("torrent.saveFailed"), informative: self.torrentErrorMessage(error))
+                    }
+                }
+                if self.torrentSaveGeneration == generation {
+                    self.torrentSaveTask = nil
+                    self.torrentDownloadProgress = nil
+                    self.refreshPlaylistView()
+                }
+            }
+            self.refreshPlaylistView()
+        }
+    }
+
+    // MARK: - Live folder playlists
+
+    @objc func openPlaylistFolderAction(_ sender: Any?) {
+        guard let window = view.window, window.attachedSheet == nil else { return }
+        setSettingsPanelShown(false)
+        setPlaylistShown(false)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = L("playlist.openFolder")
+        panel.directoryURL = playlistController.rootURL
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+#if SP_APP_STORE
+            SPFolderGrants.remember(folder: url)
+#endif
+            self?.openPlaylistFolder(url)
+        }
+    }
+
+    /// An explicit folder includes all nested seasons. Opening a lone file
+    /// automatically discovers its siblings without crawling its whole disk.
+    func openPlaylistFolder(_ root: URL) {
+        if torrentResolving { cancelTorrentOpen() }
+        playlistAdvanceAfterScanPath = nil
+        savePlaylistProfile()
+        SPPlaylistPreferencesStore.shared.rememberRoot(root)
+        let retained = openMediaPath.map { SPPlaylistController.contains(URL(fileURLWithPath: $0, isDirectory: false), in: root) } ?? false
+        let inherited = playlistProfile
+        if retained {
+            playlistProfileRoot = root.standardizedFileURL
+            playlistProfile = SPPlaylistPreferencesStore.shared.profile(for: root) ?? inherited
+            playlistProfileRestorePending = true
+        }
+        playlistInitialOpenPending = !retained
+        playlistController.setRoot(root, recursive: true)
+        restorePlaylistProfileIfReady()
+        setPlaylistShown(true)
+    }
+
+    private func preparePlaylistContext(for mediaURL: URL) {
+        playlistAdvanceAfterScanPath = nil
+        playlistInitialOpenPending = false
+        let retained = playlistController.contains(mediaURL)
+        let remembered = retained ? nil : SPPlaylistPreferencesStore.shared.rememberedRoot(containing: mediaURL)
+        let root = retained ? playlistController.rootURL! : (remembered ?? mediaURL.deletingLastPathComponent().standardizedFileURL)
+        if playlistProfileRoot != root {
+            playlistProfileRoot = root
+            playlistProfile = SPPlaylistPreferencesStore.shared.profile(for: root) ?? SPPlaylistProfile()
+        }
+        playlistProfileRestorePending = true
+        if !retained { playlistController.setRoot(root, recursive: remembered != nil) }
+        playlistDidChange()
+    }
+
+    private func playlistDidChange() {
+        if torrentContext != nil {
+            if playlistInitialOpenPending, !playlistController.isRefreshing,
+               let first = playlistController.entries.first?.url {
+                playlistInitialOpenPending = false
+                open(url: first, incomingSecurityScopedGrant: false)
+                setPlaylistShown(true)
+            }
+            return
+        }
+        let revision = playlistController.entriesRevision
+        if playlistNavigationRevision != revision || playlistNavigationPath != openMediaPath ||
+            playlistNavigationRoot != playlistController.rootURL {
+            playlistNavigationRevision = revision
+            playlistNavigationPath = openMediaPath
+            playlistNavigationRoot = playlistController.rootURL
+            var files = playlistController.entries.map(\.url)
+            if let path = openMediaPath {
+                let current = URL(fileURLWithPath: path, isDirectory: false).standardizedFileURL
+                if let index = files.firstIndex(of: current) {
+                    mediaList = files
+                    currentMediaIndex = index
+                } else if playlistController.contains(current) {
+                    // An unlinked current file can keep playing through Core's
+                    // descriptor. Insert it without re-sorting the catalogue.
+                    var lower = 0, upper = files.count
+                    while lower < upper {
+                        let middle = (lower + upper) / 2
+                        if Self.playlistPathLess(files[middle].path, current.path) { lower = middle + 1 }
+                        else { upper = middle }
+                    }
+                    files.insert(current, at: lower)
+                    mediaList = files
+                    currentMediaIndex = lower
+                } else {
+                    // A newly chosen empty/unavailable root must not navigate
+                    // through an unrelated folder from the outgoing session.
+                    mediaList = [current]
+                    currentMediaIndex = 0
+                }
+            } else {
+                mediaList = files
+                currentMediaIndex = -1
+            }
+        }
+        refreshPlaylistView()
+        if let pending = playlistAdvanceAfterScanPath, !playlistController.isRefreshing,
+           openMediaPath == pending, let core, core.state == .ended {
+            playlistAdvanceAfterScanPath = nil
+            schedulePlaylistAdvanceIfFinished(core)
+        }
+        if playlistInitialOpenPending, !playlistController.isRefreshing,
+           let first = playlistController.entries.first?.url {
+            playlistInitialOpenPending = false
+            open(url: first, incomingSecurityScopedGrant: false)
+            setPlaylistShown(true)
+        }
+    }
+
+    private static func playlistPathLess(_ lhs: String, _ rhs: String) -> Bool {
+        let left = lhs.split(separator: "/"), right = rhs.split(separator: "/")
+        for (a, b) in zip(left, right) {
+            let order = String(a).localizedStandardCompare(String(b))
+            if order != .orderedSame { return order == .orderedAscending }
+        }
+        return left.count == right.count ? lhs < rhs : left.count < right.count
+    }
+
+    private func savePlaylistProfile() {
+        guard let root = playlistProfileRoot, hasMediaSession,
+              let identity = playbackIdentityURL,
+              SPPlaylistController.contains(identity, in: root),
+              !playlistProfileRestorePending else { return }
+        playlistProfile.brightness = pictureAdjustment.brightness
+        playlistProfile.contrast = pictureAdjustment.contrast
+        playlistProfile.saturation = pictureAdjustment.saturation
+        playlistProfile.gamma = pictureAdjustment.gamma
+        playlistProfile.hue = pictureAdjustment.hue
+        playlistProfile.aspect = currentForcedAspectTag
+        playlistProfile.crop = currentCropTag
+        playlistProfile.rotation = currentRotation
+        playlistProfile.mirror = currentMirror
+        playlistProfile.motionMode = core?.frameInterpolationMode.rawValue ?? 0
+        playlistProfile.xdr = core?.xdrEnabled ?? false
+        SPPlaylistPreferencesStore.shared.save(playlistProfile, for: root)
+    }
+
+    private func restorePlaylistProfileIfReady() {
+        guard playlistProfileRestorePending, hasMediaSession, let core,
+              core.state == .ready || core.state == .playing || core.state == .paused || core.state == .ended else { return }
+        playlistProfileRestorePending = false
+        let profile = playlistProfile
+        pictureAdjustment = SPColorAdjust(brightness: profile.brightness, contrast: profile.contrast,
+            saturation: profile.saturation, gamma: profile.gamma, hue: profile.hue)
+        applyColorAdjust(nil)
+        currentForcedAspectTag = profile.aspect
+        currentCropTag = profile.crop
+        currentRotation = profile.rotation
+        currentMirror = profile.mirror
+        core.setForcedAspect(Double(profile.aspect) / 1000)
+        core.setCropAspect(Double(profile.crop) / 1000)
+        core.setRotation(profile.rotation)
+        core.setMirror(profile.mirror)
+        if let mode = SPFrameInterpolationMode(rawValue: profile.motionMode) {
+            core.frameInterpolationMode = hasVideoSession ? mode : .off
+        }
+        core.xdrEnabled = profile.xdr
+        applyHDRViewingPreference()
+        if let index = profile.audio?.bestMatch(in: core.audioTrackList.compactMap { $0 as? [String: Any] }),
+           index != core.currentAudioTrackIndex {
+            yieldDirectoryScanToForegroundIO()
+            core.selectAudioTrack(at: index)
+        }
+        refreshPlaybackSettings()
+    }
+
+    private func schedulePlaylistAdvanceIfFinished(_ core: SPPlayerCore) {
+        guard torrentCacheRestartToken == nil else { return }
+        if let context = torrentContext {
+            guard playlistAutoAdvance, !torrentResolving, !core.sourceWaiting, !core.sourceStalled,
+                  core.duration.isFinite, core.duration > 0, core.position >= core.duration - 1 else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.core?.state == .ended, self.playlistAutoAdvance,
+                      self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
+                      self.torrentContext?.file.id == context.file.id else { return }
+                self.playNextMedia()
+            }
+            return
+        }
+        // A torrent can temporarily end at the available prefix. This is not a
+        // completed episode and must never skip the rest of it automatically.
+        guard playlistAutoAdvance, !playlistInitialOpenPending, let path = openMediaPath,
+              playlistController.contains(URL(fileURLWithPath: path, isDirectory: false)),
+              !core.sourceGrowing, !core.sourceWaiting, !core.sourceStalled,
+              !core.sourceWaitingForIndex, core.availableEndSeconds < 0,
+              core.duration.isFinite, core.duration > 0,
+              core.position >= core.duration - 1,
+              !playlistController.entries.contains(where: { $0.url.path == openMediaPath && $0.isGrowing }) else { return }
+        if playlistController.isRefreshing {
+            playlistAdvanceAfterScanPath = path
+            return
+        }
+        let root = playlistController.rootURL
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.openMediaPath == path, self.core?.state == .ended,
+                  self.playlistAutoAdvance, !self.playlistInitialOpenPending,
+                  self.playlistController.rootURL == root else { return }
+            self.playNextMedia()
+        }
+    }
+
+    @objc func togglePlaylistAction(_ sender: Any?) { setPlaylistShown(!isPlaylistShown) }
+
+    private func setPlaylistShown(_ shown: Bool) {
+        guard shown != isPlaylistShown else { return }
+        isPlaylistShown = shown
+        chrome?.setPlaylistSelected(shown)
+        if shown {
+            setSettingsPanelShown(false)
+            cancelPlaybackScroll()
+            stopRepeat()
+            if playlistPanel == nil {
+                let panel = SPPlaylistView(frame: .zero)
+                panel.onClose = { [weak self] in self?.setPlaylistShown(false) }
+                panel.onPlaybackKeyDown = { [weak self] event in self?.handleKey(event) }
+                panel.onPlaybackKeyUp = { [weak self] event in self?.handleKeyUp(event) }
+                panel.onPlaybackFocusLost = { [weak self] in self?.endTurbo(reason: "playlistFocusLost") }
+                panel.onOpenFolder = { [weak self] in self?.openPlaylistFolderAction(nil) }
+                panel.onRefresh = { [weak self] in
+                    guard let self else { return }
+                    if self.torrentContext != nil { self.startTorrentStatusUpdates() }
+                    else { self.playlistController.refresh() }
+                }
+                panel.onOpenTorrent = { [weak self] in self?.openTorrentAction(nil) }
+                panel.onSaveTorrentFile = { [weak self] in self?.saveTorrentFileAction(nil) }
+                panel.onCancelTorrentSave = { [weak self] in self?.torrentSaveTask?.cancel() }
+                panel.onCancelTorrentOpen = { [weak self] in self?.cancelTorrentOpen() }
+                panel.onTogglePauseBuffer = { [weak self] in self?.toggleTorrentPauseBuffer() }
+                panel.onSelect = { [weak self] url in
+                    self?.open(url: url, incomingSecurityScopedGrant: false)
+                    self?.setPlaylistShown(true)
+                }
+                panel.onAutoAdvanceChanged = { [weak self] value in self?.playlistAutoAdvance = value }
+                view.addSubview(panel)
+                playlistPanel = panel
+            }
+            playlistPanel?.isHidden = false
+            refreshPlaylistView()
+            layoutPlaylist()
+            installSettingsEventMonitor()
+            view.window?.makeFirstResponder(playlistPanel)
+            if torrentContext == nil { playlistController.refresh() }
+        } else {
+            playlistPanel?.isHidden = true
+            view.window?.makeFirstResponder(playerView)
+            if !isSettingsPanelShown, settingsDismissMouseButton == nil { removeSettingsEventMonitor() }
+        }
+        clickCandidate = nil
+        showControlsTemporarily()
+        core?.notePausedLayoutChange()
+    }
+
+    private func refreshPlaylistView() {
+        guard isPlaylistShown, let panel = playlistPanel else { return }
+        panel.configure(root: torrentContext?.rootURL ?? playlistController.rootURL,
+            entries: torrentContext?.entries ?? playlistController.entries,
+            currentURL: playbackIdentityURL,
+            autoAdvance: playlistAutoAdvance, isRefreshing: playlistController.isRefreshing,
+            error: torrentContext != nil || playlistController.error == nil ? nil : L("playlist.scanFailed"))
+        panel.setTorrentPresentation(torrentPresentation)
+    }
+
+    private func layoutPlaylist() {
+        guard let panel = playlistPanel else { return }
+        let top = view.window.map { max(0, view.bounds.maxY - $0.contentLayoutRect.maxY) } ?? 0
+        let width = min(SPPlaylistView.idealWidth, max(240, view.bounds.width - 20))
+        let bottom = min(88, max(12, view.bounds.height - top - 180))
+        panel.frame = NSRect(x: max(10, view.bounds.maxX - width - 12), y: bottom,
+            width: width, height: max(0, view.bounds.height - top - bottom - 12))
+    }
+
     func playNextMedia() {
 #if SP_APP_STORE
         if requestPlaylistFolderAccessIfNeeded() { return }
 #endif
-        guard mediaList.count > 1 else { return }
-        let next = (currentMediaIndex + 1) % mediaList.count
-        open(url: mediaList[next])
+        guard currentMediaIndex >= 0, currentMediaIndex + 1 < mediaList.count else { return }
+        let keepPlaylistOpen = isPlaylistShown
+        open(url: mediaList[currentMediaIndex + 1])
+        if keepPlaylistOpen { setPlaylistShown(true) }
     }
 
     func playPreviousMedia() {
 #if SP_APP_STORE
         if requestPlaylistFolderAccessIfNeeded() { return }
 #endif
-        guard mediaList.count > 1 else { return }
-        let prev = (currentMediaIndex - 1 + mediaList.count) % mediaList.count
-        open(url: mediaList[prev])
+        guard currentMediaIndex > 0, currentMediaIndex < mediaList.count else { return }
+        let keepPlaylistOpen = isPlaylistShown
+        open(url: mediaList[currentMediaIndex - 1])
+        if keepPlaylistOpen { setPlaylistShown(true) }
     }
 
     private var playlistFolderAccessRequestable: Bool {
 #if SP_APP_STORE
-        guard hasMediaSession, mediaList.count <= 1,
+        guard torrentContext == nil, hasMediaSession, mediaList.count <= 1,
               currentMediaIndex >= 0, currentMediaIndex < mediaList.count else { return false }
         let directory = mediaList[currentMediaIndex].deletingLastPathComponent().path
 
@@ -2389,6 +3648,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
             self.configureDirectorySnapshot(for: mediaURL)
             self.runPendingDirectoryScanWhenFirstFramePresented()
+            self.playlistController.refresh()
         }
 
         playlistFolderAccessCheckInFlight = true
@@ -2416,6 +3676,21 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 #endif
 
     func playerCore(_ core: SPPlayerCore, didChange state: SPPlayerState) {
+        if state == .playing || state == .paused { startTorrentPlaybackWindowPolicyIfNeeded() }
+        else if state != .ready {
+            cancelTorrentPlaybackWindowPolicy(releaseRetainedWindow:
+                state == .idle || state == .ended || state == .failed)
+        }
+        if state != .paused && state != .playing {
+            stopTorrentPauseBufferMonitor()
+            cancelTorrentPauseBuffer()
+        }
+        if state == .opening, playlistProfileRoot != nil { playlistProfileRestorePending = true }
+        if state == .playing || state == .paused || state == .ready {
+            applyHDRViewingPreference()
+            restorePlaylistProfileIfReady()
+        }
+        if state == .paused || state == .playing { updateTorrentPauseBuffer() }
 
         if state != .opening, state != .playing || core.audioOnlySession {
             installPendingChromeSoon()
@@ -2426,7 +3701,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         if turbo.phase == .active, state != .playing {
             endTurbo(reason: "state=\(state.rawValue)")
-        } else if turbo.phase == .charging, state != .paused, state != .playing {
+        } else if turbo.phase == .charging, state != .playing {
+            endTurbo(reason: "state=\(state.rawValue)")
+        } else if turbo.phase == .pendingTap, state != .playing, state != .paused, state != .ended {
             endTurbo(reason: "state=\(state.rawValue)")
         }
 
@@ -2441,6 +3718,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         if state == .ended {
             persistCompletedResumeState(core)
+            schedulePlaylistAdvanceIfFinished(core)
         } else if state == .playing {
             resetResumeStateForReplayIfNeeded(core)
         }
@@ -2454,7 +3732,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         if state == .failed {
             cancelTransientInteractions()
-            setColorPanelShown(false)
+            setSettingsPanelShown(false)
 
             hasMediaSession = false
             playbackCursor?.setHasVideo(false)
@@ -2487,12 +3765,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             runPendingDirectoryScanWhenFirstFramePresented()
         }
         if state == .playing { everStartedPlayback = true }
-        if state == .playing, !recentRecordedThisOpen, let fp = core.currentFilePath {
+        updateTorrentLoadingForCoreState(state)
+        if state == .playing, !recentRecordedThisOpen, let fp = resumeIdentityPath {
             recentRecordedThisOpen = true
             let title = (fp as NSString).lastPathComponent
             let position = core.position, duration = core.duration
+            let context = torrentContext
             Self.resumeSaveQueue.async {
-                RecentPlays.record(path: fp, title: title, position: position, duration: duration)
+                Self.recordRecentCheckpoint(path: fp, title: title,
+                    checkpoint: SPResumeCheckpoint(position: position, duration: duration),
+                    torrent: context, insert: true)
             }
         }
         let snapshot = presentationSnapshot(core: core)
@@ -2505,11 +3787,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             showControlsTemporarily()
         }
         if state == .playing {
+            refreshPlaybackSettings(metadata: settingsCodec.isEmpty)
             let info = core.videoInfo
             if info.width > 0 && info.height > 0 {
                 let aspect = NSSize(width: CGFloat(info.width), height: CGFloat(info.height))
 
-                if let window = view.window, window.contentAspectRatio != aspect {
+                if let window = view.window {
                     window.contentAspectRatio = aspect
                 }
                 // contentAspectRatio constrains future manual resizing but does
@@ -2614,7 +3897,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let now = ProcessInfo.processInfo.systemUptime
         if now - lastSaveTime > 5, position > 2, let core = self.core {
             lastSaveTime = now
-            if let fp = core.currentFilePath {
+            if let fp = resumeIdentityPath {
                 let checkpoint = SPResumeCheckpoint(position: position,
                                                     duration: duration)
                 Self.pendingResumeByPath[fp] = checkpoint
@@ -2628,23 +3911,45 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     static let resumeSaveQueue =
         DispatchQueue(label: "dev.khuaplayer.resume-save", qos: .utility)
 
+    /// Only stable torrent metadata enters the ledger. Stream addresses and
+    /// worker credentials belong to the live player, never to recent history.
+    nonisolated private static func recordRecentCheckpoint(path: String, title: String,
+        checkpoint: SPResumeCheckpoint, torrent: SPTorrentPlaybackContext?, insert: Bool) {
+        if let torrent {
+            // Clearing history while playing must not recreate a source file
+            // merely because the current session later flushes its position.
+            guard insert || RecentPlays.load().contains(where: { $0.path == path }) else { return }
+            guard let reference = try? SPTorrentResumeStore.shared.reference(
+                for: torrent.descriptor, file: torrent.file) else { return }
+            let name = torrent.descriptor.name
+            let leaf = torrent.file.displayName
+            let displayTitle = name.isEmpty || name == leaf ? leaf : name + " — " + leaf
+            RecentPlays.record(path: path, title: displayTitle,
+                position: checkpoint.position, duration: checkpoint.duration,
+                insert: insert, torrent: reference)
+        } else {
+            RecentPlays.record(path: path, title: title,
+                position: checkpoint.position, duration: checkpoint.duration, insert: insert)
+        }
+    }
+
     private func persistCompletedResumeState(_ core: SPPlayerCore) {
-        guard hasMediaSession, let fp = core.currentFilePath else { return }
+        guard hasMediaSession, let fp = resumeIdentityPath else { return }
         let checkpoint = SPResumePolicy.completedCheckpoint(duration: core.duration)
         Self.pendingResumeByPath[fp] = checkpoint
         replayResumeResetArmedPath = fp
         recentRecordedThisOpen = true
         let title = (fp as NSString).lastPathComponent
+        let context = torrentContext
         Self.resumeSaveQueue.async {
             SPResumePositionStore.persist(checkpoint, path: fp)
-            RecentPlays.record(path: fp, title: title,
-                               position: checkpoint.position,
-                               duration: checkpoint.duration, insert: false)
+            Self.recordRecentCheckpoint(path: fp, title: title,
+                checkpoint: checkpoint, torrent: context, insert: false)
         }
     }
 
     private func resetResumeStateForReplayIfNeeded(_ core: SPPlayerCore) {
-        guard let fp = core.currentFilePath,
+        guard let fp = resumeIdentityPath,
               replayResumeResetArmedPath == fp else { return }
         replayResumeResetArmedPath = nil
         let checkpoint = SPResumePolicy.replayCheckpoint(
@@ -2658,9 +3963,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     func flushResumePositionNow(forceDiskSync: Bool) {
 
+        let context = torrentContext
         let snapshot: (fp: String, position: Double, duration: Double)? = {
             guard let core, core.state != .opening,
-                  let fp = core.currentFilePath, core.position > 2 else { return nil }
+                  let fp = resumeIdentityPath, core.position > 2 else { return nil }
             return (fp, core.position, core.duration)
         }()
         if let s = snapshot {
@@ -2673,8 +3979,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                     let checkpoint = SPResumeCheckpoint(position: s.position,
                                                         duration: s.duration)
                     SPResumePositionStore.persist(checkpoint, path: s.fp)
-                    RecentPlays.record(path: s.fp, title: (s.fp as NSString).lastPathComponent,
-                                       position: s.position, duration: s.duration, insert: false)
+                    Self.recordRecentCheckpoint(path: s.fp, title: (s.fp as NSString).lastPathComponent,
+                        checkpoint: checkpoint, torrent: context, insert: false)
                 }
                 UserDefaults.standard.synchronize()
             }
@@ -2683,8 +3989,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 let checkpoint = SPResumeCheckpoint(position: s.position,
                                                     duration: s.duration)
                 SPResumePositionStore.persist(checkpoint, path: s.fp)
-                RecentPlays.record(path: s.fp, title: (s.fp as NSString).lastPathComponent,
-                                   position: s.position, duration: s.duration, insert: false)
+                Self.recordRecentCheckpoint(path: s.fp, title: (s.fp as NSString).lastPathComponent,
+                    checkpoint: checkpoint, torrent: context, insert: false)
             }
         }
     }
@@ -2811,13 +4117,18 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     func playerCoreDidChangeDecoder(_ core: SPPlayerCore) {
+        applyHDRViewingPreference()
         transitionPresentation(.hdrChanged(description: core.hdrDescription,
                                            detail: core.hdrDetailDescription))
         refreshXDRControl()
+        refreshPlaybackSettings(metadata: true)
     }
 
     func playerCoreDidChangeSourceGrowth(_ core: SPPlayerCore) {
         guard core === self.core else { return }
+        startTorrentPlaybackWindowPolicyIfNeeded()
+        updateTorrentPauseBuffer()
+        if torrentContext != nil { refreshPlaylistView() }
         if core.sourceWaitingForIndex {
 
             if let w = welcome, w.isShowingFailureNotice, let reason = shownFailureReason, reason == .waitingForDownload {
@@ -2827,10 +4138,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             }
             return
         }
-        if let new = core.currentFilePath, let old = openMediaPath, new != old, hasMediaSession {
+        if torrentContext == nil, let new = core.currentFilePath, let old = openMediaPath, new != old, hasMediaSession {
             followRenamedSource(from: old, to: new)
         }
-        if core.sourceWaiting {
+        // A torrent can fetch the next range while buffered video keeps playing.
+        // Its on-video notice describes a playback interruption, not background I/O.
+        let waiting = torrentContext == nil ? core.sourceWaiting : core.sourcePlaybackWaiting
+        if waiting {
             playbackNoticeView().setSticky(core.sourceStalled ? L("playback.notice.downloadStalled")
                                                                : L("playback.notice.waitingForDownload"))
         } else if core.contentSearching {
@@ -2967,8 +4281,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         case .clearLoop:
             core?.clearLoop()
         case .stepFrame(let delta):
+            cancelTorrentPauseBuffer()
+            cancelTorrentPlaybackWindowPolicy()
             yieldDirectoryScanToForegroundIO()
             core?.stepFrame(delta)
+            startTorrentPlaybackWindowPolicyIfNeeded()
         case .captureScreenshot:
             captureScreenshot()
         case .openDocument:
@@ -2978,18 +4295,27 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         case .showMediaInfo:
             presentMediaInfo()
         case .selectSubtitleTrack(let index):
+            cancelTorrentPauseBuffer()
+            cancelTorrentPlaybackWindowPolicy()
             // Positive track changes re-read cues through an internal precise
             // seek; Off is an in-memory reset and needs no storage preemption.
             if index >= 0, core?.currentSubtitleTrackIndex != index {
                 yieldDirectoryScanToForegroundIO()
             }
             core?.selectSubtitleTrack(at: index)
+            startTorrentPlaybackWindowPolicyIfNeeded()
         case .selectAudioTrack(let index):
+            cancelTorrentPauseBuffer()
+            cancelTorrentPlaybackWindowPolicy()
+            if let track = core?.audioTrackList.first(where: { ($0["index"] as? NSNumber)?.intValue == index }) as? [String: Any] {
+                playlistProfile.audio = SPPlaylistAudioPreference(track: track)
+            }
             if core?.currentAudioTrackIndex != index {
                 yieldDirectoryScanToForegroundIO()
                 resetVolumeBoostForNewSource()
             }
             core?.selectAudioTrack(at: index)
+            startTorrentPlaybackWindowPolicyIfNeeded()
         case .setSubtitleScale(let scale):
             core?.setSubtitleScale(scale)
         case .setFrameInterpolation(let enabled):
@@ -2999,8 +4325,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             refreshXDRControl()
         case .setRotation(let degrees):
             core?.setRotation(degrees)
+            currentRotation = degrees
         case .setMirror(let mode):
             core?.setMirror(mode)
+            currentMirror = mode
         case .previousMedia:
             playPreviousMedia()
         case .nextMedia:
@@ -3012,6 +4340,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if PlayerCommandPolicy.revealsControls(after: command) {
             showControlsTemporarily()
         }
+        savePlaylistProfile()
+        refreshPlaybackSettings()
     }
 
     private func publishVolumePresentation() {
@@ -3127,12 +4457,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         guard let item = sender as? NSMenuItem else { return }
         core?.setForcedAspect(Double(item.tag) / 1000.0)
         currentForcedAspectTag = item.tag
+        savePlaylistProfile()
+        refreshPlaybackSettings()
     }
 
     @objc func cropAspectAction(_ sender: Any?) {
         guard let item = sender as? NSMenuItem else { return }
         core?.setCropAspect(Double(item.tag) / 1000.0)
         currentCropTag = item.tag
+        savePlaylistProfile()
+        refreshPlaybackSettings()
     }
 
     @objc func rotationAction(_ sender: Any?) {
@@ -3541,6 +4875,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(saveTorrentFileAction(_:)) {
+            return torrentContext != nil && hasMediaSession && torrentSaveTask == nil
+        }
+        if menuItem.action == #selector(cancelTorrentSaveAction(_:)) { return torrentSaveTask != nil }
         if menuItem.action == #selector(frameInterpolationAction(_:)) {
             return hasVideoSession
         }
@@ -3552,8 +4890,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
            menuItem.action == #selector(cropAspectAction(_:)) {
             return hasVideoSession
         }
-        if menuItem.action == #selector(toggleColorAdjustPanelAction(_:)) {
-            return hasVideoSession
+        if menuItem.action == #selector(togglePlaybackSettingsAction(_:)) {
+            return hasMediaSession
         }
         if let action = menuItem.action { return responds(to: action) }
         return false
@@ -3574,6 +4912,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func refreshXDRControl() {
         guard let core else { return }
         transitionPresentation(.xdrChanged(currentXDRPresentation(core: core)))
+        refreshPlaybackSettings()
     }
 
     private func currentXDRPresentation(core: SPPlayerCore? = nil) -> XDRPresentation {
@@ -3692,6 +5031,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             }
             self.seekStepInFlight = true
             self.seekStepIssuedAt = now
+            if self.hasMediaSession, core.duration > 0 {
+                self.showSeekFeedback(delta: step)
+            }
         }
     }
 
@@ -3710,6 +5052,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func applyVolumeStep(_ delta: Double, mayUnlockBoost: Bool) {
         guard let core else { stopRepeat(); return }
+        defer { showVolumeFeedback() }
         let percent = Double(core.volume) * 100
 
         if delta > 0, !volumeBoostUnlocked {
@@ -3885,8 +5228,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func turboSpaceDown() {
-        // Restore the pre-gesture state before Turbo decides whether Space is
-        // a pause request or a request to start an already paused item.
+        // Restore the pre-gesture state before deciding whether this press can
+        // accelerate. A short press toggles playback only when released.
         cancelPlaybackScroll()
         guard let core else { return }
 
@@ -3929,12 +5272,18 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 togglePlaybackNow()
             case .scheduleThreshold:
                 turboTimer?.invalidate()
-                turboTimer = Timer.scheduledTimer(withTimeInterval: SPTurboSpeed.holdThreshold,
-                                                  repeats: false) { [weak self] _ in
+                let timer = Timer(timeInterval: SPTurboSpeed.holdThreshold,
+                                  repeats: false) { [weak self] _ in
                     guard let self else { return }
                     self.turboTimer = nil
+                    guard self.core?.state == .playing else {
+                        self.endTurbo(reason: "thresholdWithoutPlayback")
+                        return
+                    }
                     self.applyTurbo(self.turbo.thresholdFired(), reason: "threshold")
                 }
+                turboTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
                 chrome?.setTurboPhase(.charging)
                 turboHUDView().beginCharge(targetRate: turbo.turboRate)
                 if Self.dbg {
@@ -3947,14 +5296,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 turboHUD?.cancelCharge()
                 if Self.dbg { NSLog("[Turbo] 蓄力取消（%@）", reason) }
             case .engage(let rate):
-                guard let core else { break }
+                guard let core, core.state == .playing else {
+                    endTurbo(reason: "engageWithoutPlayback")
+                    break
+                }
 
                 openPanelQuietPrewarmWork?.cancel()
                 openPanelQuietPrewarmWork = nil
 
                 core.setPlaybackRate(rate)
                 transitionPresentation(.playbackRateChanged(core.playbackRate))
-                core.play()
                 chrome?.setTurboPhase(.active)
                 turboHUDView().engage(baseRate: turbo.baseRate, rate: core.playbackRate)
                 if Self.dbg { NSLog("[Turbo] 加速 %.2f→%.2f", turbo.baseRate, core.playbackRate) }
@@ -3982,6 +5333,42 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         return hud
     }
 
+    private func showSeekFeedback(delta: Double) {
+        let feedback: SPSeekFeedbackView
+        if let existing = seekFeedback {
+            feedback = existing
+        } else {
+            feedback = SPSeekFeedbackView(frame: .zero)
+            view.addSubview(feedback, positioned: .above, relativeTo: playerView)
+            seekFeedback = feedback
+        }
+        feedback.place(in: playerView.frame)
+        feedback.show(delta: delta)
+    }
+
+    private var volumeFeedbackBounds: CGRect {
+        var rect = playerView.frame
+        if let window = view.window {
+            let contentTop = view.convert(window.contentLayoutRect, from: nil).maxY
+            rect.size.height = max(0, min(rect.maxY, contentTop) - rect.minY)
+        }
+        return rect
+    }
+
+    private func showVolumeFeedback() {
+        guard hasMediaSession, let core else { return }
+        let feedback: SPVolumeFeedbackView
+        if let existing = volumeFeedback { feedback = existing }
+        else {
+            feedback = SPVolumeFeedbackView(frame: .zero)
+            view.addSubview(feedback, positioned: .above, relativeTo: playerView)
+            volumeFeedback = feedback
+        }
+        feedback.place(in: volumeFeedbackBounds)
+        // Read back the result after policy clamps and mute changes.
+        feedback.show(percent: Double(core.volume) * 100, muted: core.isMuted)
+    }
+
     private func playbackNoticeView() -> SPPlaybackNoticeView {
         if let notice = playbackNotice { return notice }
         let notice = SPPlaybackNoticeView(frame: .zero)
@@ -3992,43 +5379,318 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     @discardableResult
-    private func colorPanelView() -> SPColorPanelView {
-        if let panel = colorPanel { return panel }
-        let panel = SPColorPanelView(frame: .zero)
-        panel.setHueAvailable(engineSupportsHue)
-        panel.onChange = { field, percent in
-            SPColorAdjustStore.update(field, toPercent: percent)
-        }
-        panel.onResetField = { field in
-            SPColorAdjustStore.reset(field)
-        }
-        panel.onResetAll = {
-            SPColorAdjustStore.resetAll()
-        }
-        panel.configure(with: SPColorAdjustStore.current)
-        view.addSubview(panel, positioned: .above, relativeTo: playerView)
-        colorPanel = panel
-        layoutColorPanel()
+    private func playbackSettingsView() -> SPPlaybackSettingsView {
+        if let panel = settingsPanel { return panel }
+        let panel = SPPlaybackSettingsView(frame: .zero)
+        panel.onAction = { [weak self] action in self?.handleSettingsAction(action) }
+        panel.onClose = { [weak self] in self?.setSettingsPanelShown(false) }
+        panel.onPreferredSizeChanged = { [weak self] in self?.layoutPlaybackSettings() }
+        // Keep the floating menu above the video and playback overlays.
+        view.addSubview(panel)
+        settingsPanel = panel
+        layoutPlaybackSettings()
         return panel
     }
 
-    private func layoutColorPanel() {
-        colorPanel?.place(in: view.bounds)
-    }
-
-    @objc func toggleColorAdjustPanelAction(_ sender: Any?) {
-        setColorPanelShown(!isColorPanelShown)
-    }
-
-    private func setColorPanelShown(_ shown: Bool) {
-        guard isColorPanelShown != shown else { return }
-        isColorPanelShown = shown
-        if shown {
-            applyColorAdjust(nil)
-            colorPanelView().setVisible(true)
-        } else {
-            colorPanel?.setVisible(false)
+    private func layoutPlaybackSettings() {
+        let inset = view.window.map { max(0, view.bounds.maxY - $0.contentLayoutRect.maxY) } ?? 0
+        if playerView.frame != view.bounds { playerView.frame = view.bounds }
+        chromePresenter?.layout(in: view.bounds)
+        if !Self.useNewUI {
+            controlBar.setFrameSize(NSSize(width: view.bounds.width, height: controlBar.frame.height))
+            layoutControls()
         }
+        let layout = SPSettingsLayout(bounds: view.bounds, topInset: inset, shown: isSettingsPanelShown,
+                                      preferredMenuSize: settingsPanel?.preferredMenuSize ?? NSSize(width: 380, height: 368),
+                                      anchor: chrome?.settingsMenuAnchorRect(in: view))
+        settingsPanel?.frame = layout.menu
+        layoutPlaylist()
+    }
+
+    @objc func togglePlaybackSettingsAction(_ sender: Any?) {
+        setSettingsPanelShown(!isSettingsPanelShown)
+    }
+
+    private func setSettingsPanelShown(_ shown: Bool) {
+        guard isSettingsPanelShown != shown else { return }
+        cancelPlaybackScroll()
+        stopRepeat()
+        isSettingsPanelShown = shown
+        chrome?.setSettingsSelected(shown)
+        clickCandidate = nil
+        if shown {
+            setPlaylistShown(false)
+            applyColorAdjust(nil)
+            let panel = playbackSettingsView()
+            panel.resetNavigation()
+            panel.isHidden = false
+            refreshPlaybackSettings(metadata: true)
+            installSettingsEventMonitor()
+            showControlsTemporarily()
+            view.window?.makeFirstResponder(panel)
+        } else {
+            // Commit an active numeric edit before hiding its field editor.
+            view.window?.makeFirstResponder(playerView)
+            settingsPanel?.isHidden = true
+            if settingsDismissMouseButton == nil, !isPlaylistShown { removeSettingsEventMonitor() }
+            showControlsTemporarily()
+        }
+        layoutPlaybackSettings()
+        core?.notePausedLayoutChange()
+    }
+
+    private func installSettingsEventMonitor() {
+        guard settingsEventMonitor == nil else { return }
+        settingsEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [
+            .leftMouseDown, .leftMouseUp, .leftMouseDragged,
+            .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+            .otherMouseDown, .otherMouseUp, .otherMouseDragged, .keyDown
+        ]) { [weak self] event in
+            let shouldDeliver = MainActor.assumeIsolated {
+                guard let self else { return true }
+                return self.filterPlaybackSettingsEvent(event) != nil
+            }
+            return shouldDeliver ? event : nil
+        }
+    }
+
+    private func removeSettingsEventMonitor() {
+        if let monitor = settingsEventMonitor { NSEvent.removeMonitor(monitor) }
+        settingsEventMonitor = nil
+    }
+
+    /// Consume a dismissal click before it can start dragging or toggle video controls.
+    func filterPlaybackSettingsEvent(_ event: NSEvent) -> NSEvent? {
+        let mouseUp = event.type == .leftMouseUp || event.type == .rightMouseUp || event.type == .otherMouseUp
+        let mouseDrag = event.type == .leftMouseDragged || event.type == .rightMouseDragged || event.type == .otherMouseDragged
+        if mouseUp || mouseDrag, let button = settingsDismissMouseButton, event.buttonNumber == button {
+            if mouseUp {
+                settingsDismissMouseButton = nil
+                if !isSettingsPanelShown, !isPlaylistShown { removeSettingsEventMonitor() }
+            }
+            return nil
+        }
+        guard isSettingsPanelShown || isPlaylistShown else { return event }
+        guard event.window === view.window else { return event }
+        if event.type == .keyDown, event.keyCode == 53 {
+            setSettingsPanelShown(false)
+            setPlaylistShown(false)
+            return nil
+        }
+        let mouseDown = event.type == .leftMouseDown || event.type == .rightMouseDown || event.type == .otherMouseDown
+        guard mouseDown else { return event }
+        let point = view.convert(event.locationInWindow, from: nil)
+        if isSettingsPanelShown, let panel = settingsPanel, panel.frame.contains(point) { return event }
+        if isPlaylistShown, let panel = playlistPanel, panel.frame.contains(point) { return event }
+        // The gear keeps its normal click tracking, which toggles the open menu.
+        if chrome?.settingsButtonRect(in: view).contains(point) == true ||
+            chrome?.playlistButtonRect(in: view).contains(point) == true { return event }
+        settingsDismissMouseButton = event.buttonNumber
+        setSettingsPanelShown(false)
+        setPlaylistShown(false)
+        return nil
+    }
+
+    private func refreshPlaybackSettings(metadata: Bool = false, force: Bool = true) {
+        refreshQuickSubtitleControl(force: force)
+        guard isSettingsPanelShown, let panel = settingsPanel else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now - settingsRefreshAt >= 0.25 else { return }
+        settingsRefreshAt = now
+        let core = self.core
+        if metadata, let info = core?.mediaInfo() {
+            settingsCodec = info[L("media.codec")] as? String ?? ""
+            settingsDecoder = info[L("media.decoder")] as? String ?? ""
+        }
+        var state = SPSettingsSnapshot()
+        state.hasMedia = hasMediaSession
+        state.hasVideo = hasVideoSession
+        state.picture = pictureAdjustment
+        state.hueAvailable = engineSupportsHue
+        let hdrDescription = core?.hdrDescription ?? ""
+        state.hdrBrightRoomAvailable = hasVideoSession && !hdrDescription.isEmpty && hdrDescription != "SDR"
+        state.hdrBrightRoomEnabled = SPHDRViewingPreferences.brightRoomEnabled
+        let xdr = currentXDRPresentation()
+        state.xdrAvailable = xdr.isControlEnabled
+        state.xdrEnabled = xdr.isOn
+        if !xdr.hasMedia { state.xdrReason = L("chrome.xdr.tooltip.noMedia") }
+        else if !xdr.contentSDR { state.xdrReason = L("chrome.xdr.tooltip.contentHDR") }
+        else if !xdr.displayCapable { state.xdrReason = L("chrome.xdr.tooltip.noHeadroom") }
+        if let core, hasVideoSession {
+            let video = core.videoInfo
+            state.videoSummary = [settingsCodec, "\(video.width) × \(video.height)",
+                                  String(format: "%.3f fps", locale: Locale(identifier: Bundle.main.preferredLocalizations.first ?? "en"), video.fps)]
+                .filter { !$0.isEmpty }.joined(separator: " · ")
+            let pixels = max(video.width, video.height)
+            state.resolutionBadge = pixels >= 7680 ? "8K" : (pixels >= 3840 ? "4K" : "")
+            state.dynamicRange = core.hdrDescription ?? ""
+            state.decoder = settingsDecoder
+        }
+        state.forcedAspect = currentForcedAspectTag
+        state.crop = currentCropTag
+        state.rotation = currentRotation
+        state.mirror = currentMirror
+        state.rate = core?.playbackRate ?? 1
+        state.volume = Double(core?.volume ?? 1) * 100
+        state.muted = core?.isMuted ?? false
+        state.audioTracks = (core?.audioTrackList ?? []).compactMap { track in
+            guard let index = track["index"] as? NSNumber,
+                  let title = track["title"] as? String else { return nil }
+            return SPSettingsTrack(id: index.stringValue, title: title)
+        }
+        state.selectedAudio = String(core?.currentAudioTrackIndex ?? -1)
+        state.subtitleTracks = (core?.subtitleTrackList ?? []).compactMap { track in
+            guard let index = track["index"] as? NSNumber,
+                  let title = track["title"] as? String else { return nil }
+            return SPSettingsTrack(id: "embedded:\(index)", title: title)
+        }
+        for url in externalSubtitleCandidates {
+            state.subtitleTracks.append(SPSettingsTrack(id: "external:\(url.absoluteString)",
+                                                        title: url.lastPathComponent))
+        }
+        if let item = captionsTrackMenuItem() {
+            state.subtitleTracks.append(SPSettingsTrack(id: "generated", title: item.title))
+        }
+        if captionsDisplayActive {
+            state.selectedSubtitle = "generated"
+        } else if let url = activeExternalSubtitleURL {
+            state.selectedSubtitle = "external:\(url.absoluteString)"
+        } else if let index = core?.currentSubtitleTrackIndex, index >= 0 {
+            state.selectedSubtitle = "embedded:\(index)"
+        }
+        state.subtitleScale = core?.subtitleScale ?? 1
+        switch SPTimelineStyleSettings.style {
+        case .starTrail: state.timeline = 0
+        case .tide: state.timeline = 1
+        case .classic: state.timeline = 2
+        }
+        state.horizontalSeek = SPPlaybackGestureSettings.horizontalSeekEnabled
+        state.verticalVolume = SPPlaybackGestureSettings.verticalVolumeEnabled
+        state.pinch = SPPlaybackGestureSettings.pinchAction.rawValue
+        state.seekSensitivity = SPPlaybackGestureSettings.sensitivity.multiplier
+        state.fullscreen = view.window?.styleMask.contains(.fullScreen) == true
+        panel.configure(state)
+    }
+
+    private var currentQuickSubtitleID: String? {
+        if captionsDisplayActive { return "generated" }
+        if let url = activeExternalSubtitleURL { return "external:\(url.absoluteString)" }
+        if let index = core?.currentSubtitleTrackIndex, index >= 0 { return "embedded:\(index)" }
+        return nil
+    }
+
+    private var quickSubtitleIDs: [String] {
+        var ids = (core?.subtitleTrackList ?? []).compactMap { track -> String? in
+            guard let index = track["index"] as? NSNumber else { return nil }
+            return "embedded:\(index.intValue)"
+        }
+        ids += externalSubtitleCandidates.map { "external:\($0.absoluteString)" }
+        if captionsTrackMenuItem() != nil { ids.append("generated") }
+        return ids
+    }
+
+    private func refreshQuickSubtitleControl(force: Bool = true) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now - quickSubtitleRefreshAt >= 0.25 else { return }
+        quickSubtitleRefreshAt = now
+        let selected = hasMediaSession ? currentQuickSubtitleID : nil
+        if let selected { lastQuickSubtitleID = selected }
+        // When no tracks exist, the same button opens subtitle loading options.
+        chrome?.setSubtitlesSelected(selected != nil, available: hasMediaSession)
+    }
+
+    private func toggleQuickSubtitles() {
+        guard hasMediaSession else { return }
+        if let selected = currentQuickSubtitleID {
+            lastQuickSubtitleID = selected
+            handleSettingsAction(.subtitleTrack("off"))
+        } else {
+            let available = quickSubtitleIDs
+            let remembered = lastQuickSubtitleID.flatMap { available.contains($0) ? $0 : nil }
+            if let next = remembered ?? available.first {
+                handleSettingsAction(.subtitleTrack(next))
+            } else {
+                setSettingsPanelShown(true)
+                settingsPanel?.selectTab(.subtitles)
+                refreshPlaybackSettings()
+            }
+        }
+        refreshQuickSubtitleControl()
+        showControlsTemporarily()
+    }
+
+    private func openPlaybackSpeedSettings() {
+        setSettingsPanelShown(true)
+        settingsPanel?.showSpeedSettings()
+        refreshPlaybackSettings()
+    }
+
+    private func handleSettingsAction(_ action: SPSettingsAction) {
+        switch action {
+        case .picture(let field, let value):
+            pictureAdjustment[field] = value
+            applyColorAdjust(field)
+        case .resetPicture(let field):
+            pictureAdjustment[field] = 0
+            applyColorAdjust(field)
+        case .resetAllPicture:
+            pictureAdjustment = SPColorAdjust()
+            applyColorAdjust(nil)
+        case .hdrBrightRoom(let enabled):
+            SPHDRViewingPreferences.brightRoomEnabled = enabled
+            applyHDRViewingPreference()
+            refreshPlaybackSettings(force: true)
+            return
+        case .xdr(let enabled): perform(.setXDR(enabled))
+        case .forcedAspect(let tag):
+            let item = NSMenuItem(); item.tag = tag; forcedAspectAction(item)
+        case .crop(let tag):
+            let item = NSMenuItem(); item.tag = tag; cropAspectAction(item)
+        case .rotation(let degrees): perform(.setRotation(degrees))
+        case .mirror(let mode): perform(.setMirror(mode))
+        case .rate(let rate): perform(.setPlaybackRate(rate))
+        case .volume(let percent): perform(.setVolumePercent(percent))
+        case .muted(let muted):
+            if core?.isMuted != muted { perform(.toggleMute) }
+        case .audioTrack(let id):
+            if let index = Int(id) { perform(.selectAudioTrack(index)) }
+        case .subtitleTrack(let id):
+            let item = NSMenuItem()
+            if id == "generated", let generated = captionsTrackMenuItem(), let action = generated.action {
+                NSApp.sendAction(action, to: generated.target, from: generated)
+            } else if id.hasPrefix("external:"), let url = URL(string: String(id.dropFirst(9))) {
+                item.representedObject = url
+                externalSubtitleTrackAction(item)
+            } else if id == "off" || id.hasPrefix("embedded:") {
+                item.tag = id == "off" ? -1 : (Int(id.dropFirst(9)) ?? -1)
+                subtitleTrackAction(item)
+            }
+        case .loadSubtitle: perform(.loadSubtitle)
+        case .subtitleScale(let scale): perform(.setSubtitleScale(scale))
+        case .timeline(let index):
+            let styles: [SPTimelineStyleSettings.Style] = [.starTrail, .tide, .classic]
+            if styles.indices.contains(index) { SPTimelineStyleSettings.style = styles[index] }
+        case .horizontalSeek(let enabled): SPPlaybackGestureSettings.horizontalSeekEnabled = enabled
+        case .verticalVolume(let enabled): SPPlaybackGestureSettings.verticalVolumeEnabled = enabled
+        case .pinch(let raw):
+            if let mode = SPPlaybackGestureSettings.PinchAction(rawValue: raw) {
+                SPPlaybackGestureSettings.pinchAction = mode
+            }
+        case .seekSensitivity(let value):
+            SPPlaybackGestureSettings.sensitivity = value < 1 ? .low : (value > 1 ? .high : .normal)
+        case .fullscreen: perform(.toggleFullscreen)
+        case .fitWindow:
+            if let video = core?.videoInfo {
+                resizeWindowToVideoAspect(NSSize(width: CGFloat(video.width), height: CGFloat(video.height)))
+            }
+        case .mediaInfo: perform(.showMediaInfo)
+        case .torrentSettings:
+            setSettingsPanelShown(false)
+            (NSApp.delegate as? AppDelegate)?.showTorrentSettingsAction(nil)
+            return
+        }
+        savePlaylistProfile()
+        refreshPlaybackSettings()
     }
 
     /// True when the linked engine implements the hue setter. Swap-builds
@@ -4037,23 +5699,32 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         core?.responds(to: Selector(("setHue:"))) ?? false
     }
 
-    /// Push the shared adjustment state into this window's engine. A nil field
+    private func applyHDRViewingPreference() {
+        guard let core else { return }
+        let enabled = SPHDRViewingPreferences.brightRoomEnabled
+        if core.hdrShadowLiftEnabled != enabled { core.hdrShadowLiftEnabled = enabled }
+    }
+
+    /// Push this playlist's adjustment state into this window's engine. A nil field
     /// re-applies everything (panel opening, reset all, new core); a specific
     /// field re-applies just that engine property while its slider moves.
     private func applyColorAdjust(_ field: SPColorAdjust.Field?) {
         guard let core else { return }
-        let value = SPColorAdjustStore.current
-        switch field {
-        case .brightness, nil:
+        let value = pictureAdjustment
+        if field == nil || field == .brightness {
             core.setBrightness(Float(value.engineBrightness))
-        case .contrast, nil:
+        }
+        if field == nil || field == .contrast {
             core.setContrast(Float(value.engineContrast))
-        case .saturation, nil:
+        }
+        if field == nil || field == .saturation {
             core.setSaturation(Float(value.engineSaturation))
-        case .gamma, nil:
+        }
+        if field == nil || field == .gamma {
             core.setGamma(Float(value.engineGamma))
-        case .hue, nil:
-            if engineSupportsHue { core.setHue(Float(value.engineHueDegrees)) }
+        }
+        if (field == nil || field == .hue), engineSupportsHue {
+            core.setHue(Float(value.engineHueDegrees))
         }
     }
 
@@ -4099,9 +5770,15 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     @discardableResult
     private func cancelTransientInteractions() -> Bool {
+        setSettingsPanelShown(false)
+        setPlaylistShown(false)
+        settingsDismissMouseButton = nil
+        removeSettingsEventMonitor()
         // Waiting and skipped-content notices belong to the outgoing session.
         // Closing to the welcome view need not produce another growth callback.
         playbackNotice?.clearAll()
+        seekFeedback?.dismiss()
+        volumeFeedback?.dismiss()
         skipNoticeCount = 0
         skipNoticeLastAt = 0
 
@@ -4152,7 +5829,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func captureScreenshot() {
-        guard let core, let fp = core.currentFilePath else { return }
+        guard let core, let fp = resumeIdentityPath else { return }
         let name = ((fp as NSString).lastPathComponent as NSString).deletingPathExtension
         let baseName = "\(name)_screenshot_\(Int(core.position))"
         let mediaDirectory = (fp as NSString).deletingLastPathComponent
@@ -4332,6 +6009,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 // PlayerCommandPolicy preserves the separate confirmation for
                 // volume boost; a gesture cannot silently cross above 100%.
                 perform(.adjustVolumePercent(delta))
+                showVolumeFeedback()
             }
         }
 
@@ -4466,7 +6144,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
 
         switch event.keyCode {
-        case 53: // PlayerView consumes key events, so handle fullscreen Escape here.
+        case 53: // Close the settings menu before leaving fullscreen.
+            if isSettingsPanelShown {
+                setSettingsPanelShown(false)
+                return
+            }
             if view.window?.styleMask.contains(.fullScreen) == true {
                 toggleFullscreen()
             }
@@ -4542,8 +6224,8 @@ extension PlayerViewController: NSMenuDelegate {
         switch menu.identifier?.rawValue {
         case "sp.viewMenu":
             for item in menu.items
-            where item.identifier?.rawValue == "sp.imageAdjust" {
-                item.state = isColorPanelShown ? .on : .off
+            where item.identifier?.rawValue == "sp.playbackSettings" {
+                item.state = isSettingsPanelShown ? .on : .off
             }
         case "sp.audioTracks":
             menu.removeAllItems()
@@ -4622,7 +6304,7 @@ extension PlayerViewController: NSMenuDelegate {
                                       keyEquivalent: "")
                 item.target = self
                 item.representedObject = entry.path
-                item.toolTip = entry.path
+                item.toolTip = entry.torrent.map { $0.torrentName + " — " + $0.filePath } ?? entry.path
                 if #available(macOS 14.0, *) {
                     item.badge = NSMenuItemBadge(string: entry.isFinished
                         ? L("welcome.finished")
@@ -4675,6 +6357,7 @@ extension PlayerViewController {
     }
 
     var captionsMenuAvailable: Bool {
+        if torrentContext != nil { return false }
         if #available(macOS 26.0, *) { return SPPlayerCore.fullFeatureTier() && (hasMediaSession || CaptionTaskCenter.shared.backgroundTask != nil) }
         return false
     }
@@ -4687,7 +6370,7 @@ extension PlayerViewController {
 
     @available(macOS 26.0, *)
     private func captionsMediaContext() -> CaptionsController.MediaContext? {
-        guard let core, hasMediaSession, let window = view.window,
+        guard torrentContext == nil, let core, hasMediaSession, let window = view.window,
               currentMediaIndex >= 0, currentMediaIndex < mediaList.count else { return nil }
         return CaptionsController.MediaContext(
             core: core, window: window, mediaURL: mediaList[currentMediaIndex],

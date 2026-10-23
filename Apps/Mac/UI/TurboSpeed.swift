@@ -52,6 +52,7 @@ enum SPTurboSettings {
 struct SPTurboGesture: Equatable {
     enum Phase: Equatable {
         case idle
+        case pendingTap
         case charging
         case active
     }
@@ -73,11 +74,14 @@ struct SPTurboGesture: Equatable {
     mutating func keyDown(enabled: Bool, playing: Bool,
                           currentRate: Double, configuredRate: Double) -> [Effect] {
         guard phase == .idle else { return [] }
-        guard enabled, playing else { return [.togglePlayback] }
+        guard enabled, playing else {
+            phase = .pendingTap
+            return []
+        }
         phase = .charging
         baseRate = currentRate
         turboRate = SPTurboSpeed.targetRate(base: currentRate, configured: configuredRate)
-        return [.togglePlayback, .scheduleThreshold]
+        return [.scheduleThreshold]
     }
 
     mutating func thresholdFired() -> [Effect] {
@@ -87,20 +91,23 @@ struct SPTurboGesture: Equatable {
     }
 
     mutating func keyUp() -> [Effect] {
-        end()
+        end(released: true)
     }
 
     mutating func forceEnd() -> [Effect] {
-        end()
+        end(released: false)
     }
 
-    private mutating func end() -> [Effect] {
+    private mutating func end(released: Bool) -> [Effect] {
         switch phase {
         case .idle:
             return []
+        case .pendingTap:
+            phase = .idle
+            return released ? [.togglePlayback] : []
         case .charging:
             phase = .idle
-            return [.cancelThreshold]
+            return released ? [.cancelThreshold, .togglePlayback] : [.cancelThreshold]
         case .active:
             phase = .idle
             return [.restore(rate: baseRate)]

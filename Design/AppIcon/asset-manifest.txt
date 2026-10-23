@@ -1,17 +1,21 @@
-# Editable source
+# Selected Kinolet source and tools
 asset-manifest.txt
 check_appicon.py
+Kinolet-Prism-Master.png
+requirements.txt
+
+# Legacy Khua source, retained with attribution
 KhuaPlayer.icon/icon.json
 KhuaPlayer.icon/Assets/01-Background.png
 KhuaPlayer.icon/Assets/03-RearRibbons.png
 KhuaPlayer.icon/Assets/04-PlayTriangle.png
 KhuaPlayer-StaticMaster-1024.png
 prepare_icon_composer_layers.py
-requirements.txt
 
 # Deterministic production export
 export_static_appicon.py
 export-manifest.json
+AppIcon.icns
 AppIcon.appiconset/Contents.json
 AppIcon.appiconset/AppIcon-16.png
 AppIcon.appiconset/AppIcon-32.png

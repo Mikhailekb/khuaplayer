@@ -1,55 +1,67 @@
-# Khua App Icon
+# Kinolet App Icon
 
-This directory is the canonical, editable source for the Khua app icon.
-It deliberately keeps source artwork separate from the icon used by the Xcode
-target.
+`Kinolet-Prism-Master.png` is the selected prism icon, concept **05**, generated
+with OpenAI ImageGen for Kinolet on 2026-10-23. It is the transparent version of
+the selected concept, copied byte for byte from the generated PNG. Its original
+1254 x 1254 RGBA pixels and alpha channel are retained. The file has no embedded
+color profile; exports interpret its RGB channels as sRGB.
 
-## Files
+The production exporter only resizes and packages this raster. It does not
+redraw the prism, change its colors, remove a background, crop it, or recreate
+its transparency. The selected source SHA-256 is recorded in
+`export-manifest.json`.
 
-- `KhuaPlayer.icon` is the editable Apple Icon Composer document. Its three
-  active layers preserve the approved artwork's geometry, colors, gradients,
-  and optical vertical alignment. The discarded blueprint experiment is not
-  included.
-- `KhuaPlayer-StaticMaster-1024.png` is the approved 1024 px opaque sRGB
-  artwork. It contains no white rim.
-- `AppIcon.appiconset` is a directly usable, traditional macOS asset catalog
-  export. It is also the fallback that ships in the app.
-- `export-manifest.json` records hashes and export settings for reproducibility.
+## Production files
 
-Icon Composer applies its own platform shell and edge treatment in previews and
-compiled output. Those system effects cannot be disabled by editing the source
-layers. For that reason, the production target uses the static asset catalog:
-this removes the unwanted white shell without changing the approved artwork.
+- `Kinolet-Prism-Master.png`: unchanged selected source.
+- `AppIcon.appiconset`: canonical macOS PNGs at 16, 32, 64, 128, 256, 512 and
+  1024 pixels, with all standard and Retina asset catalog slots.
+- `AppIcon.icns`: deterministic ICNS container for Finder, Dock and builds that
+  do not recompile the asset catalog. Its entries contain the exact canonical
+  PNG bytes, including alpha.
+- `export-manifest.json`: source, export and ICNS hashes, dimensions, alpha
+  policy and pinned Pillow version.
 
-## Export
+Every PNG is resized directly from the source using Pillow Lanczos, retains
+RGBA transparency and receives a fixed sRGB declaration. No intermediate size
+is used as another size's source.
 
-The exporter requires Python 3 and the pinned Pillow version. The optional
-layer-reconstruction tool also uses the pinned NumPy version. Every size is
-rendered directly from the 1024 px master with Lanczos resampling; the export
-is opaque RGB with a deterministic sRGB chunk.
+## Export and verify
 
-From the directory containing this README:
-
-```sh
-python3 -m pip install -r requirements.txt
-python3 export_static_appicon.py
-python3 export_static_appicon.py --check
-python3 check_appicon.py
-```
-
-From the public repository root, update the Xcode target after changing the
-master with:
+The exporter uses Python 3 and the Pillow version pinned in `requirements.txt`.
+From the repository root:
 
 ```sh
+python3 -m pip install -r Design/AppIcon/requirements.txt
+python3 Design/AppIcon/export_static_appicon.py
 python3 Design/AppIcon/export_static_appicon.py \
   --output Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset
+python3 Design/AppIcon/export_static_appicon.py --check
+python3 Design/AppIcon/check_appicon.py \
+  --shipping Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset
 ```
 
-Run `prepare_icon_composer_layers.py` only when the flattened master changes and
-the Icon Composer layers must be reconstructed. Normal visual edits should be
-made directly in `KhuaPlayer.icon`.
+`--check` regenerates PNGs, ICNS and the manifest in a temporary directory and
+compares their bytes. `check_appicon.py` uses only the Python standard library;
+it validates PNG checksums, real alpha samples and transparent corners, source
+and export hashes, ICNS entries and the shipping copy.
 
-Keep the editable source, static exports, and `export-manifest.json` together
-when updating the icon. The Mac target consumes its asset catalog under
-`Apps/Mac/Resources`; exporting and checking the artwork is a separate step
-from compiling the application.
+For a manual app bundle, copy `AppIcon.icns` into `Contents/Resources` and set
+`CFBundleIconFile` to `AppIcon.icns`. When an old `Assets.car` remains in a manual
+build, load this ICNS explicitly with `NSImage(contentsOf:)` for in-app artwork
+and `NSApplication.applicationIconImage`; an asset-catalog lookup can otherwise
+still return the previous icon. A normal Xcode build consumes the updated
+asset catalog under `Apps/Mac/Resources`.
+
+## Legacy Khua artwork
+
+`KhuaPlayer.icon`, `KhuaPlayer-StaticMaster-1024.png` and
+`prepare_icon_composer_layers.py` are retained unchanged from the upstream
+[Khua repository](https://github.com/nake13/khuaplayer). Their attribution remains
+with Khua contributors under the repository's MIT license. The Icon Composer
+document contains the previous Khua artwork; it is not an editable source for
+the Kinolet prism and is not used by the production export.
+
+The legacy layer reconstruction tool requires the pinned NumPy version. Run it
+only to reconstruct the retained legacy artwork. Production checks retain its
+source-integrity checks alongside validation of the new selected raster.

@@ -76,6 +76,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         wc.playerViewController.openDocumentAction(sender)
     }
 
+    @MainActor @objc func openPlaylistFolderAction(_ sender: Any?) {
+        let wc = windowControllers.first { $0.window?.isKeyWindow ?? false }
+            ?? windowControllers.first { $0.window?.isMainWindow ?? false }
+            ?? windowControllers.first
+        if !(wc?.window?.isVisible ?? false) { wc?.showWindowForReopen() }
+        wc?.playerViewController.openPlaylistFolderAction(sender)
+    }
+
+    @MainActor @objc func togglePlaylistAction(_ sender: Any?) {
+        let wc = windowControllers.first { $0.window?.isKeyWindow ?? false }
+            ?? windowControllers.first
+        if !(wc?.window?.isVisible ?? false) { wc?.showWindowForReopen() }
+        wc?.playerViewController.togglePlaylistAction(sender)
+    }
+
+    @MainActor @objc func openTorrentAction(_ sender: Any?) {
+        let wc = windowControllers.first { $0.window?.isKeyWindow ?? false } ?? windowControllers.first
+        if !(wc?.window?.isVisible ?? false) { wc?.showWindowForReopen() }
+        wc?.playerViewController.openTorrentAction(sender)
+    }
+    @MainActor @objc func openMagnetAction(_ sender: Any?) {
+        let wc = windowControllers.first { $0.window?.isKeyWindow ?? false } ?? windowControllers.first
+        if !(wc?.window?.isVisible ?? false) { wc?.showWindowForReopen() }
+        wc?.playerViewController.openMagnetAction(sender)
+    }
+
+    @MainActor @objc func showTorrentSettingsAction(_ sender: Any?) {
+        let settings = SPTorrentSettingsWindowController.shared
+        settings.onApply = { [weak self] size in
+            guard let self else { throw CancellationError() }
+            try await SPTorrentCacheReconfiguration.apply(cacheSizeMiB: size,
+                controllers: self.windowControllers.map(\.playerViewController))
+        }
+        settings.showSettings()
+    }
+
     /// Duplicate-open lookup: standardized media path to its existing window.
     /// The small window registry is scanned directly, avoiding duplicate state.
     @MainActor func windowController(forOpenPath path: String) -> PlayerWindowController? {
@@ -226,11 +262,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         NSApp.activate(ignoringOtherApps: true)
 
-        // Direct-distribution updates only. An unconfigured build does not load
-        // Sparkle or make a network request.
+        // Updates stay off until this distributor configures and enables its
+        // own feed. An inherited framework or feed cannot opt the app in.
 #if !SP_APP_STORE
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            SPSoftwareUpdater.startIfConfigured()
+        if SPSoftwareUpdater.isConfigured {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                SPSoftwareUpdater.startIfConfigured()
+            }
         }
 #endif
 #if SP_INTERNAL_BUILD && !SP_APP_STORE
@@ -272,6 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
+        SPTorrentServer.shared.shutdown()
         RecentPlaysWarmer.noteAppTerminating()
     }
 
@@ -387,12 +426,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     // ── Software updates (configured non-App-Store builds only) ─────────
 #if !SP_APP_STORE
     @objc func checkForUpdatesAction(_ sender: Any?) {
+        guard SPSoftwareUpdater.isConfigured else { return }
         // Menu actions run on the main thread; enter the actor explicitly.
         MainActor.assumeIsolated { SPSoftwareUpdater.checkForUpdates() }
     }
 
     // Automatic-update toggle; menuNeedsUpdate refreshes its checkmark.
     @objc func toggleAutoUpdateAction(_ sender: NSMenuItem) {
+        guard SPSoftwareUpdater.isConfigured else { return }
         MainActor.assumeIsolated {
             SPSoftwareUpdater.setAutomaticChecks(
                 !SPSoftwareUpdater.automaticChecksEnabled)

@@ -1,62 +1,80 @@
-# Contributing
+# Contributing to Кинолёт
 
-Thank you for helping improve Khua.
+Keep changes focused on the Mac player and its public build pipeline. This
+repository is an independent fork of
+[Khua Player](https://github.com/nake13/khuaplayer); report issues with this
+fork through [Kinolet's issue tracker](https://github.com/Mikhailekb/kinolet/issues).
 
-## Before opening a change
+## Source changes
 
-- Keep changes focused on the shipping player or its public build pipeline.
-- Do not commit generated Xcode projects, build products, dependency sources,
-  downloaded media, benchmarks, or local logs.
-- Preserve the existing `SP` internal symbol prefix unless a change genuinely
-  requires an ABI-level rename.
+- Preserve the original copyright, MIT license, and third-party notices.
 - Keep public documentation, diagnostics, and new source comments in English.
-- Follow the source ownership described in
-  [REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md). Product and platform directories
-  are not independent packages; do not assume the current media or subtitle
-  APIs already support iOS.
+  The product's display name is **Кинолёт**, with **Kinolet** as its Latin spelling.
 - Add user-facing strings to `Apps/Mac/Resources/Localizable.xcstrings`.
-  English is the source language; merged shipping changes must keep all
-  supported locales complete and preserve every format placeholder.
+  English is the source language; preserve placeholders and keep every
+  supported translation complete.
+- Retain existing `SP` symbols and internal framework/module names unless a
+  technical change requires renaming them. They are not the product branding.
+- Edit `Apps/Mac/project.yml` instead of generated Xcode projects.
+- Do not commit downloaded media, build products, dependency caches, generated
+  projects, private logs, or signing credentials.
 
-Use the localization workflow before opening a pull request:
+See [REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md) for source ownership.
+
+## Checks
+
+Run checks that exercise the changed behavior. The focused runners in
+`Scripts/test_*.sh` compile their fixtures independently where possible, so
+many model and policy checks work with Command Line Tools without building
+the complete application. Do not treat those checks as proof that the full
+app packages or runs correctly.
+
+Localization and source checks:
 
 ```bash
 python3 Scripts/l10n.py status
 python3 Scripts/l10n.py check --full
+python3 Scripts/verify_public_surface.py
+./Scripts/check_public_repo.sh
 ```
 
-When translations are missing, `Scripts/l10n.py export <directory>` creates a
-JSON file per incomplete locale with English and Simplified Chinese reference
-text. Translate those files, reduce each entry to `{key: translated_string}`,
-then run `Scripts/l10n.py merge <directory>` and the full check again.
-
-## Build verification
-
-### Product naming
-
-Use `Khua` for the app bundle, Dock, Finder, application menu, idle window, and
-localized `app.displayName`. The About panel uses the full product name
-`Khua Player` from `SPProductName` in `Apps/Mac/project.yml` and its generated
-Info.plist. Keep that metadata separate from system display names; do not rename
-bundle identifiers or internal `KhuaPlayer` modules to change visible branding.
-
-### Checks
-
-Use an Apple Silicon Mac with Xcode and the macOS 26.4 SDK or later, then run
-these commands from the repository root:
+Examples of feature checks:
 
 ```bash
-./Scripts/check_public_repo.sh
-./Apps/Mac/Scripts/build.sh Release
-./Scripts/verify_app_bundle.sh \
-  .build/Build/Products/Release/Khua.app
+./Scripts/test_playback_gestures.sh
+./Scripts/test_playlist_filesystem.sh
+./Scripts/test_playlist_keyboard.sh
+./Scripts/test_torrent_models.sh
+./Scripts/test_torrent_server.sh
+./Scripts/test_torrent_resume_store.sh
 ```
 
-`Scripts/build.sh` remains a compatibility entry point. Edit
-`Apps/Mac/project.yml` for Mac build configuration changes, not the generated
-`Apps/Mac/KhuaPlayer.xcodeproj`. The shared `.build` directory and root-level
-`Khua.app` deployment location are unchanged.
+Some integration runners need additional tools or fixtures; read their headers
+before running them. Keep temporary fixtures outside tracked source and do
+not use someone else's application preferences for tests.
 
-Describe the media formats and macOS versions exercised in the pull request.
-The public repository intentionally does not ship large media fixtures or the
-maintainers' extended benchmark and reliability suites.
+For a complete source build, use an Apple silicon Mac with Xcode and the
+macOS 26.4 SDK or later, install the tools listed in [README.md](README.md),
+then run:
+
+```bash
+./Apps/Mac/Scripts/build.sh Debug
+# For an optimized local package:
+./Apps/Mac/Scripts/build.sh Release
+```
+
+Validate the resulting bundle with `Scripts/verify_app_bundle.sh` and the path
+printed by the build. Release packaging and any signing limitations belong
+in [RELEASING.md](RELEASING.md).
+
+## Pull requests
+
+Describe the user-visible behavior, the checks run, and any remaining limits.
+For playback changes, include the media format, relevant HDR/Dolby Vision
+profile, macOS version, and hardware exercised. Model checks, hidden component
+checks, visual playback checks, and a full source build establish different
+things; identify which evidence is available.
+
+Torrent worker changes must preserve its pinned source manifests, downstream
+patches, license, notices, and rebuild recipe. Do not replace a worker binary
+without updating and verifying the corresponding source information.

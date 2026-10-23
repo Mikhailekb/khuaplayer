@@ -1,160 +1,132 @@
-<img src="Design/AppIcon/AppIcon.appiconset/AppIcon-128.png" width="96" height="96" alt="Khua Player app icon">
+<img src="Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon-128.png" width="96" height="96" alt="Кинолёт app icon">
 
-# Khua Player
+# Кинолёт · Kinolet
 
-Khua Player is a lightweight, native video player built for modern macOS and Apple silicon.
+A native, open-source video player for Apple silicon Macs. Watch local files,
+keep a series together in a folder playlist, or start a video from a torrent
+before the entire file has downloaded.
 
-Get smoother motion with frame interpolation, generate and translate subtitles on your Mac,
-and keep watching the playable parts of damaged or unfinished files.
+[Releases](https://github.com/Mikhailekb/kinolet/releases) ·
+[Issues](https://github.com/Mikhailekb/kinolet/issues) ·
+[Build from source](#build-from-source) · [Privacy](PRIVACY.md)
 
-Designed from the ground up for fast, responsive, and efficient playback.
+Кинолёт is an independent fork of [Khua Player](https://github.com/nake13/khuaplayer).
+It adds its own interface, playback controls, folder playlists, and torrent
+streaming while retaining Khua's media engine and supported Mac features.
 
-[**Download for macOS**](https://khua.app/download) ·
-[Website](https://khua.app) ·
-[Release history](https://khua.app/releases) ·
-[Build from source](#build-from-source)
+## Playback
 
-Apple silicon · macOS 14 or later · Open source
+- **Local video and audio.** MKV, MP4, MOV, WebM, AVI, MPEG-TS, FLV, WMV, and
+  other formats supported by the bundled media stack. Hardware decoding is
+  used where supported, with software fallbacks for other codecs.
+- **HDR and Dolby Vision.** Metal rendering, Dolby Vision Profile 5 color
+  conversion, and tone mapping for SDR displays. Picture adjustments include
+  brightness, contrast, saturation, gamma, and hue. HDR viewing preferences
+  and SDR brightness enhancement are available on compatible displays.
+- **Motion+.** Optional frame interpolation on supported Macs running macOS
+  26 or later; hold **C** to compare the original and enhanced motion.
+- **Subtitles.** Embedded and external subtitle tracks, automatic matching of
+  nearby subtitle files, and on-device generation and translation on supported
+  macOS versions. Generated subtitles can be saved as SRT.
+- **Mac controls.** Trackpad seeking and volume, pinch to resize or toggle
+  full screen, configurable gesture sensitivity, playback speed, and a
+  hold-Space Turbo action. Layout, video, audio, and subtitle controls are
+  available in the playback settings panel.
+- **Everyday details.** Resume playback, select audio tracks, step through
+  frames, take screenshots, open multiple windows, and preview supported
+  formats through the Finder Quick Look extension.
 
-Download the DMG, open it, and drag **Khua** to **Applications**. The official
-download is Developer ID signed, notarized, and stapled; no extra codec packs
-or Homebrew installation are needed to use it.
+## Folders and series
 
-## More than playback
+Open a folder to browse its videos as a tree, including nested episode folders.
+The playlist updates when files are added, removed, renamed, or grow while
+being downloaded. It keeps the current playback session in place during those
+updates.
 
-- **Smoother motion with Motion+.** Adaptive frame interpolation makes movement
-  smoother. Hold **C** to compare the original and enhanced video side by side.
-- **Subtitles, made on your Mac.** Generate subtitles from video audio, translate
-  generated or existing text subtitles, and save the results as SRT. Processing
-  stays on your Mac. Requires macOS 26; macOS may download a language model first.
-- **Playback for imperfect files.** Khua attempts to recover playable content
-  from damaged or partially downloaded files, marks problem areas on the
-  timeline, and leaves the original file unchanged. Recovery is best-effort;
-  not every damaged or incomplete file can be played.
-- **More from your display.** Watch HDR video, use tone mapping on SDR displays,
-  or give everyday SDR video extra brightness with Brightness+ on compatible displays.
-- **A timeline drawn from your video.** Particle Star Trail takes its colors
-  from the video itself. Liquid and Classic styles are also available.
-- **Preview right in Finder.** Select a supported video and press **Space** for
-  Quick Look playback, including MKV. Set Khua as the default player by file format.
+A folder playlist remembers its picture settings, Motion+ choice, and selected
+audio voice when a matching track is available in another episode. Resume
+positions and recent items are stored locally. Recovery of damaged or unfinished
+files is best-effort and does not alter the original media.
 
-Motion+ requires macOS 26 and a supported Mac. See [Requirements](#requirements)
-for feature availability.
+## Torrent playback
 
-## Everyday essentials
+Open a `.torrent` file or a magnet link, choose a video, and start watching as
+pieces arrive. Files from a multi-file torrent appear in the playlist, so a
+series can be played episode by episode.
 
-- **Broad format support:** MKV, MP4, MOV, WebM, AVI, MPEG-TS, FLV, WMV, and common
-  audio formats, with hardware decoding where supported and a bundled fallback.
-- **Subtitles that travel with your video:** embedded and external text subtitles,
-  including subtitle files in the same folder. Khua does not search for or download subtitles.
-- **Natural-sounding speed control:** hold Space for Turbo playback, then release
-  to return to normal speed. Voices keep their pitch.
-- **Native multichannel audio:** 5.1 and 7.1 output on supported audio devices.
-- **Trackpad gestures:** scroll horizontally to seek, vertically to change volume,
-  and pinch to resize the window. Use **Playback > Gestures** to disable scroll
-  actions, adjust sensitivity, or switch pinch to full screen.
-- **Picture adjustments while you watch:** brightness, contrast, saturation,
-  gamma, and hue sliders in a floating panel. Open it from
-  **View > Image Adjustments** or press **⌥⌘C**; double-click a slider or use
-  the per-row reset buttons to restore the default.
-- **A familiar Mac experience:** playback resume, frame stepping, screenshots,
-  multiple playback windows, and an interface available in 17 languages.
-- **Private by design:** no account, ads, or playback analytics. Your media and
-  playback history stay on your Mac. See the [privacy policy](PRIVACY.md).
+Streaming uses a bundled [TorrServer](https://github.com/YouROK/TorrServer)
+worker and a configurable memory cache. It does not save a complete movie to
+a permanent media folder unless you choose **Save**. Configuration, resume
+metadata, and saved files are separate from the in-memory streaming cache;
+see [Privacy](PRIVACY.md) for details. **Save** downloads the selected file to
+the location you choose.
+
+Playback depends on the available peers, network speed, and file structure.
+Кинолёт does not provide a media catalogue or torrent search service. BitTorrent
+connections expose your IP address and torrent identifier to the peers and
+trackers involved in the transfer.
 
 ## Requirements
 
 | Feature | Requirements |
 |---|---|
-| Basic playback and Quick Look | Apple silicon Mac running macOS 14 or later |
-| Motion+ frame interpolation | macOS 26 and a Mac supporting system frame-rate conversion |
-| Subtitle generation and translation | macOS 26; language availability depends on macOS, which may download language models on first use |
-| Brightness+ | A compatible display with available extended brightness headroom |
+| Playback, playlists, torrent streaming, and Quick Look | Apple silicon Mac with macOS 14 or later |
+| Motion+ frame interpolation | macOS 26 or later and supported system frame-rate conversion |
+| Subtitle generation and translation | macOS 26 or later; available languages depend on Apple's on-device services |
+| HDR output and SDR brightness enhancement | A compatible display with available extended brightness headroom |
 
-Intel Macs are not supported. iPhone and iPad support is planned, but only the
-Mac app is currently available.
+Intel Macs are not supported. This repository builds the Mac application.
 
 ## Build from source
 
-Building requires an Apple silicon Mac and Xcode with the macOS 26.4 SDK or later.
-You do not need the build tools to use the [official download](https://khua.app/download).
-
-Install the build tools once:
+The full source build requires an Apple silicon Mac, Xcode with the macOS 26.4
+SDK or later, and these build tools:
 
 ```bash
-brew install xcodegen meson ninja cmake pkg-config
+brew install xcodegen meson ninja cmake pkg-config go
 ```
 
-Build the application:
+From the repository root:
 
 ```bash
-./Apps/Mac/Scripts/build.sh          # Debug
-./Apps/Mac/Scripts/build.sh Release  # optimized local build
+./Apps/Mac/Scripts/build.sh Debug
+# or
+./Apps/Mac/Scripts/build.sh Release
 ```
 
-Run these commands from the repository root. `Scripts/build.sh` remains a
-compatibility entry point with the same arguments and environment settings.
-The Mac project definition is [`Apps/Mac/project.yml`](Apps/Mac/project.yml);
-the build generates `Apps/Mac/KhuaPlayer.xcodeproj`. Edit the definition, not
-the generated Xcode project.
+`Scripts/build.sh` forwards to the same entry point. The project definition is
+[`Apps/Mac/project.yml`](Apps/Mac/project.yml); the generated Xcode project is
+not a source file and should not be edited by hand.
 
-The first build downloads checksum-pinned dependency source archives, builds
-them with the macOS SDK toolchain, generates the Xcode project, packages the
-runtime libraries, signs the app ad hoc, and verifies its Mach-O dependency
-closure. Subsequent builds reuse validated dependency stamps.
+The build downloads and verifies pinned dependency sources, builds the media
+and subtitle libraries, prepares the torrent worker, and packages the app.
+The torrent build uses the Go toolchain and source hashes recorded in
+[`worker-manifest.json`](Apps/Mac/Resources/Torrent/worker-manifest.json).
+Cached dependencies are reused after their build stamps have been checked.
 
-Run the app, optionally opening a local media file through the macOS document
-open event:
+The app is built at `.build/Build/Products/<configuration>/Kinolet.app`.
+Release builds also publish `Kinolet.app` at the repository root. Its visible
+name is **Кинолёт**; its executable is `Kinolet` and its bundle identifier is
+`app.kinolet.player`. Local builds use ad-hoc signing; that is separate from
+Apple Developer ID signing and notarization.
+Release artifacts and their signing status belong in the corresponding
+[GitHub release](https://github.com/Mikhailekb/kinolet/releases).
 
-```bash
-./Scripts/run.sh
-./Scripts/run.sh /path/to/video.mkv
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for checks,
+[REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md) for source ownership, and
+[RELEASING.md](RELEASING.md) for packaging notes.
 
-The generated app is located at
-`.build/Build/Products/<configuration>/Khua.app`. Release builds also deploy
-the verified app to `Khua.app` at the repository root; Debug builds leave that
-copy unchanged. Both locations are ignored by Git. Local Release builds are
-still ad-hoc signed, not distribution-ready artifacts.
+## Origin and licenses
 
-## Repository scope
+Кинолёт is based on [Khua Player](https://github.com/nake13/khuaplayer), by
+Khua contributors. The original copyright and [MIT license](LICENSE) are
+preserved. Changes in this fork are provided under the same MIT license unless
+an individual component states otherwise.
 
-This repository contains the shipping application source and the reproducible
-build and packaging recipes. Large media fixtures, benchmark suites, internal
-experiments, generated Xcode projects, dependency build trees, and caches are
-intentionally excluded.
-
-Editable Icon Composer source and the deterministic static AppIcon export live
-in [`Design/AppIcon`](Design/AppIcon).
-
-The directory layout separates the Mac product, reusable-source candidates,
-and platform implementations. See [REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md)
-for ownership and build entry points. iPhone and iPad support is planned;
-only the Mac product currently builds, and no mobile app target is included.
-
-## Distribution
-
-Local builds use ad-hoc signing. Developer ID releases and App Store archives
-use separate, fail-closed signing configurations; see
-[RELEASING.md](RELEASING.md). Release identity, version, bundle identifier, and
-Apple Developer Team values must be supplied explicitly by the distributor.
-The primary direct download is a signed, notarized, and stapled DMG with an
-Applications shortcut. Generated apps, DMGs, ZIPs, archives, and symbols stay
-outside Git history and are published through the release host.
-
-Direct-distribution builds contain configuration-gated Sparkle support. Without
-both `KHUA_SPARKLE_FEED_URL` and `KHUA_SPARKLE_PUBLIC_ED_KEY`, the updater does
-not load, create a menu item, or make a network request. App Store builds omit
-Sparkle and its configuration entirely. Configured direct builds check
-automatically by default and expose an App-menu toggle to disable that behavior.
-
-## Privacy and licensing
-
-The application does not collect or transmit playback data. See
-[PRIVACY.md](PRIVACY.md) for the current behavior.
-
-Khua's own source code is available under the [MIT License](LICENSE).
-Third-party components retain their own licenses; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
-[`ThirdParty/Licenses`](ThirdParty/Licenses). Distributors are responsible for
-satisfying all third-party license obligations.
+Third-party components keep their own licenses. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md),
+[`ThirdParty/Licenses`](ThirdParty/Licenses), and the torrent worker's
+[NOTICE](Apps/Mac/Resources/Torrent/NOTICE) and
+[GPL-3.0 license](Apps/Mac/Resources/Torrent/LICENSE). The worker's pinned
+sources, downstream patches, and rebuild instructions accompany its packaging
+recipe. Distributors must satisfy the licenses of every component they ship.

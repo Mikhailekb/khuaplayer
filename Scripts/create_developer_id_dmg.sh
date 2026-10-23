@@ -12,9 +12,9 @@ Usage: Scripts/create_developer_id_dmg.sh \
   --identity "Developer ID Application: Name (TEAM_ID)" \
   --team-id TEAM_ID
 
-The release directory must contain the signed Khua.app produced by
+The release directory must contain the signed Kinolet.app produced by
 archive_developer_id.sh, notarized and stapled by notarize_developer_id.sh.
-The output is Khua-notarization.dmg; it is not a final
+The output is Kinolet-notarization.dmg; it is not a final
 public download until notarize_developer_id_dmg.sh accepts and staples it.
 EOF
 }
@@ -84,9 +84,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-APP="$RELEASE_DIR/Khua.app"
-SUBMISSION_DMG="$RELEASE_DIR/Khua-notarization.dmg"
-SUBMISSION_CHECKSUM="$RELEASE_DIR/Khua-notarization.dmg.sha256"
+APP="$RELEASE_DIR/Kinolet.app"
+SUBMISSION_DMG="$RELEASE_DIR/Kinolet-notarization.dmg"
+SUBMISSION_CHECKSUM="$RELEASE_DIR/Kinolet-notarization.dmg.sha256"
 [ -d "$APP" ] || die "prepared app is missing: $APP"
 security find-identity -v -p codesigning | grep -Fq "$IDENTITY" || \
   die "code-signing identity is not available: $IDENTITY"
@@ -99,7 +99,7 @@ MARKETING_VERSION="$(/usr/libexec/PlistBuddy -c \
   die "app has an invalid bundle identifier: $BUNDLE_ID"
 [[ "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || \
   die "app has an invalid marketing version: $MARKETING_VERSION"
-[ ! -e "$RELEASE_DIR/Khua-$MARKETING_VERSION.dmg" ] || \
+[ ! -e "$RELEASE_DIR/Kinolet-$MARKETING_VERSION.dmg" ] || \
   die "final disk image already exists for version $MARKETING_VERSION"
 
 "$ROOT/Scripts/lib/verify_developer_id_app.sh" \
@@ -145,11 +145,11 @@ fi
 
 STAGE="$(mktemp -d "$RELEASE_DIR/.dmg-payload.XXXXXX")"
 OUTPUT_STAGE="$(mktemp -d "$RELEASE_DIR/.dmg-output.XXXXXX")"
-DMG_TMP="$OUTPUT_STAGE/Khua-notarization.dmg"
-CHECKSUM_TMP="$OUTPUT_STAGE/Khua-notarization.dmg.sha256"
+DMG_TMP="$OUTPUT_STAGE/Kinolet-notarization.dmg"
+CHECKSUM_TMP="$OUTPUT_STAGE/Kinolet-notarization.dmg.sha256"
 
-echo "==> Staging Khua.app and the Applications shortcut"
-ditto --norsrc --noextattr --noqtn "$APP" "$STAGE/Khua.app"
+echo "==> Staging Kinolet.app and the Applications shortcut"
+ditto --norsrc --noextattr --noqtn "$APP" "$STAGE/Kinolet.app"
 ln -s /Applications "$STAGE/Applications"
 
 echo "==> Creating compressed read-only disk image"
@@ -157,7 +157,7 @@ hdiutil create \
   -quiet \
   -fs HFS+ \
   -format UDZO \
-  -volname Khua \
+  -volname Kinolet \
   -srcfolder "$STAGE" \
   "$DMG_TMP"
 
@@ -176,7 +176,7 @@ codesign \
   --source-app "$APP"
 
 (cd "$OUTPUT_STAGE" && \
-  shasum -a 256 Khua-notarization.dmg >Khua-notarization.dmg.sha256)
+  shasum -a 256 Kinolet-notarization.dmg >Kinolet-notarization.dmg.sha256)
 mv "$DMG_TMP" "$SUBMISSION_DMG"
 mv "$CHECKSUM_TMP" "$SUBMISSION_CHECKSUM"
 rmdir "$OUTPUT_STAGE"

@@ -3,7 +3,7 @@
 # a clean temporary directory, and fail closed on any incomplete bundle.
 set -euo pipefail
 
-APP="${1:?usage: bundle_libs.sh <path-to-Khua.app>}"
+APP="${1:?usage: bundle_libs.sh <path-to-Kinolet.app>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=Scripts/lib/build_common.sh
 source "$ROOT/Scripts/lib/build_common.sh"
@@ -81,39 +81,65 @@ BIN="$CLEAN_APP/Contents/MacOS/$APP_EXECUTABLE"
 FW="$CLEAN_APP/Contents/Frameworks"
 MAIN_INFO="$CLEAN_APP/Contents/Info.plist"
 
-# The tracked source plist remains channel-neutral. Add updater configuration
-# only to the clean direct-distribution bundle, before the outer signature is
-# created. Blank configuration removes every SU key and keeps the updater inert.
-SPARKLE_FEED_URL="${KHUA_SPARKLE_FEED_URL:-}"
-SPARKLE_PUBLIC_ED_KEY="${KHUA_SPARKLE_PUBLIC_ED_KEY:-}"
-if { [ -n "$SPARKLE_FEED_URL" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ]; } ||
-   { [ -z "$SPARKLE_FEED_URL" ] && [ -n "$SPARKLE_PUBLIC_ED_KEY" ]; }; then
-  echo "error: KHUA_SPARKLE_FEED_URL and KHUA_SPARKLE_PUBLIC_ED_KEY must be supplied together" >&2
-  exit 2
-fi
-for update_key in SUFeedURL SUPublicEDKey SUEnableAutomaticChecks SPUpdateUsageEnabled \
-                  SUEnableSystemProfiling \
-                  SUVerifyUpdateBeforeExtraction SURequireSignedFeed; do
-  /usr/bin/plutil -remove "$update_key" "$MAIN_INFO" >/dev/null 2>&1 || true
-done
-if [ -n "$SPARKLE_FEED_URL" ]; then
-  /usr/bin/plutil -insert SUFeedURL -string "$SPARKLE_FEED_URL" "$MAIN_INFO"
-  /usr/bin/plutil -insert SUPublicEDKey -string "$SPARKLE_PUBLIC_ED_KEY" "$MAIN_INFO"
-  /usr/bin/plutil -insert SUEnableAutomaticChecks -bool YES "$MAIN_INFO"
-  /usr/bin/plutil -insert SUEnableSystemProfiling -bool NO "$MAIN_INFO"
-  /usr/bin/plutil -insert SUVerifyUpdateBeforeExtraction -bool YES "$MAIN_INFO"
-  /usr/bin/plutil -insert SURequireSignedFeed -bool YES "$MAIN_INFO"
-fi
+# Kinolet has no inherited update service. This explicit opt-in plus an own
+# feed/key pair is required before the clean, unsigned bundle gains SU keys.
+# KHUA_* variables are intentionally ignored to prevent upstream configuration
+# in a contributor's environment from changing the fork's update authority.
+SPARKLE_FEED_URL="${KINOLET_SPARKLE_FEED_URL:-}"
+SPARKLE_PUBLIC_ED_KEY="${KINOLET_SPARKLE_PUBLIC_ED_KEY:-}"
+UPDATE_OPT_IN="${KINOLET_ENABLE_AUTOMATIC_UPDATES:-false}"
+python3 - "$MAIN_INFO" "$UPDATE_OPT_IN" "$SPARKLE_FEED_URL" "$SPARKLE_PUBLIC_ED_KEY" <<'PYUPDATES'
+import base64
+from pathlib import Path
+import plistlib
+import sys
+from urllib.parse import urlsplit
 
-# Only the official direct-download channel counts existing update checks.
-# Other distributors and Store builds retain the neutral privacy manifest.
+path = Path(sys.argv[1])
+opt_in, feed, key = sys.argv[2:]
+if opt_in not in ('true', 'false'):
+    raise SystemExit('KINOLET_ENABLE_AUTOMATIC_UPDATES must be true or false')
+if bool(feed) != bool(key):
+    raise SystemExit('KINOLET_SPARKLE_FEED_URL and KINOLET_SPARKLE_PUBLIC_ED_KEY must be supplied together')
+if feed:
+    try:
+        url = urlsplit(feed)
+        host = (url.hostname or '').lower().rstrip('.')
+        url.port
+    except ValueError:
+        raise SystemExit('invalid Kinolet update feed URL')
+    if url.scheme != 'https' or not host or url.username or url.password or url.fragment:
+        raise SystemExit('the Kinolet update feed must be an HTTPS URL without credentials or a fragment')
+    if host == 'khua.app' or host.endswith('.khua.app'):
+        raise SystemExit('the upstream Khua update feed cannot be used by Kinolet')
+    if key == 'd8nyI3ZvaY4fTRHzcLYyygiRagGoGRdObweyoAARQ+0=':
+        raise SystemExit('the upstream Khua update key cannot be used by Kinolet')
+    try:
+        valid_key = len(base64.b64decode(key, validate=True)) == 32
+    except ValueError:
+        valid_key = False
+    if not valid_key:
+        raise SystemExit('the Kinolet update public key must encode a 32-byte Ed25519 key')
+if opt_in == 'true' and not feed:
+    raise SystemExit('automatic updates require an explicitly configured Kinolet feed and public key')
+with path.open('rb') as handle:
+    info = plistlib.load(handle)
+for name in ('SUFeedURL', 'SUPublicEDKey', 'SUEnableAutomaticChecks', 'SPUpdateUsageEnabled',
+             'SUEnableSystemProfiling', 'SUVerifyUpdateBeforeExtraction', 'SURequireSignedFeed'):
+    info.pop(name, None)
+info['SPEnableDistributionUpdates'] = opt_in == 'true'
+if opt_in == 'true':
+    info.update(SUFeedURL=feed, SUPublicEDKey=key, SUEnableAutomaticChecks=True,
+                SUEnableSystemProfiling=False, SUVerifyUpdateBeforeExtraction=True,
+                SURequireSignedFeed=True)
+with path.open('wb') as handle:
+    plistlib.dump(info, handle, fmt=plistlib.FMT_XML, sort_keys=False)
+PYUPDATES
+
+# The fork does not collect update usage statistics. A custom update service
+# does not implicitly opt a distributor into the original service's analytics.
 cp "$ROOT/Apps/Mac/Resources/PrivacyInfo.xcprivacy" \
    "$CLEAN_APP/Contents/Resources/PrivacyInfo.xcprivacy"
-if [ "$SPARKLE_FEED_URL" = "https://khua.app/updates/appcast.xml" ]; then
-  /usr/bin/plutil -insert SPUpdateUsageEnabled -bool YES "$MAIN_INFO"
-  cp "$ROOT/Distribution/PrivacyInfo-Direct.xcprivacy" \
-     "$CLEAN_APP/Contents/Resources/PrivacyInfo.xcprivacy"
-fi
 
 # Assemble loose dylibs from empty so stale libraries cannot survive a
 # rebuild. Xcode-embedded frameworks (KhuaPlayerMediaCore) are kept: the
@@ -202,7 +228,7 @@ codesign -s "$SP_SIGN_ID" $SP_SIGN_OPTS --force "$CLEAN_APP"
 
 # Stage publication beside the target, then use the same serialized,
 # crash-recoverable rename transaction as third-party dependency publication.
-PUBLISH_DIR="$(mktemp -d "$APP_PARENT/.khuaplayer-publish.XXXXXX")"
+PUBLISH_DIR="$(mktemp -d "$APP_PARENT/.kinolet-publish.XXXXXX")"
 PUBLISH_APP="$PUBLISH_DIR/$(basename "$APP")"
 ditto "$CLEAN_APP" "$PUBLISH_APP"
 sp_atomic_replace_directory "$PUBLISH_APP" "$APP" "$APP_PARENT"

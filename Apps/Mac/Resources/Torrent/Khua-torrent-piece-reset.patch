@@ -1,0 +1,426 @@
+diff --git a/connection.go b/connection.go
+--- a/connection.go
++++ b/connection.go
+@@ -387,7 +387,7 @@
+ 			max(
+ 				// It makes sense to always pipeline at least one connection,
+ 				// since latency must be non-zero.
+-				2,
++				32,
+ 				// Request only as many as we expect to receive in the
+ 				// dupliateRequestTimeout window. We are trying to avoid having to
+ 				// duplicate requests.
+diff --git a/piece_discard.go b/piece_discard.go
+new file mode 100644
+--- /dev/null
++++ b/piece_discard.go
+@@ -0,0 +1,44 @@
++package torrent
++
++import "github.com/anacrolix/missinggo/bitmap"
++
++// TryDiscardData atomically forgets externally cached piece bytes and their
++// received-chunk state. It may discard complete or partially received pieces.
++// It returns false without calling evict while a reader needs the current piece,
++// a write is pending, or verification is queued/running. Callers may retry later.
++//
++// evict executes under the Client lock. It must be fast, perform no I/O and call
++// no torrent API. It must return false without changing storage, or clear the
++// bytes and storage completion together and return true. Its storage lock must
++// also serialize ReadAt/WriteAt. New peer chunks received after this call starts
++// a fresh received-chunk set and are safe to cache again.
++func (p *Piece) TryDiscardData(evict func() bool) bool {
++	if evict == nil {
++		return false
++	}
++	t, cl := p.t, p.t.cl
++	cl.lock()
++	defer cl.unlock()
++	if cl.closed.IsSet() || t.closed.IsSet() || p.hashing || p.queuedForHash() ||
++		t.readerNowPieces.Contains(bitmap.BitIndex(p.index)) {
++		return false
++	}
++	p.pendingWritesMutex.Lock()
++	writing := p.pendingWrites != 0
++	p.pendingWritesMutex.Unlock()
++	if writing || !evict() {
++		return false
++	}
++	// Merely updating completion leaves partial dirtyChunks intact. A responsive
++	// reader would then regard discarded chunks as available and read zeroes or
++	// repeatedly retry empty storage instead of requesting them from peers.
++	t.pendAllChunkSpecs(p.index)
++	t.reapPieceTouchers(p.index)
++	p.priority = PiecePriorityNone
++	t.updatePieceCompletion(p.index)
++	t.updatePiecePriority(p.index)
++	t.cancelRequestsForPiece(p.index)
++	t.publishPieceChange(p.index)
++	t.tickleReaders()
++	return true
++}
+diff --git a/piece_discard_test.go b/piece_discard_test.go
+new file mode 100644
+--- /dev/null
++++ b/piece_discard_test.go
+@@ -0,0 +1,310 @@
++package torrent
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha1"
++	"io"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/anacrolix/torrent/bencode"
++	"github.com/anacrolix/torrent/metainfo"
++	pp "github.com/anacrolix/torrent/peer_protocol"
++	"github.com/anacrolix/torrent/storage"
++)
++
++// Memory-only storage with the same allocation/reset contract as TorrServer.
++// Tests feed real peer-protocol chunks through receiveChunk; no peer discovery,
++// remote connections, disk payloads or modified module-cache files are needed.
++type discardStorage struct {
++	mu                       sync.Mutex
++	data                     []byte
++	complete                 bool
++	writeEntered, allowWrite chan struct{}
++}
++
++func (s *discardStorage) OpenTorrent(*metainfo.Info, metainfo.Hash) (storage.TorrentImpl, error) {
++	return s, nil
++}
++func (s *discardStorage) Close() error                           { return nil }
++func (s *discardStorage) Piece(metainfo.Piece) storage.PieceImpl { return s }
++func (s *discardStorage) MarkComplete() error {
++	s.mu.Lock()
++	s.complete = true
++	s.mu.Unlock()
++	return nil
++}
++func (s *discardStorage) MarkNotComplete() error {
++	s.mu.Lock()
++	s.complete = false
++	s.mu.Unlock()
++	return nil
++}
++func (s *discardStorage) Completion() storage.Completion {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return storage.Completion{Complete: s.complete, Ok: true}
++}
++func (s *discardStorage) WriteAt(b []byte, off int64) (int, error) {
++	s.mu.Lock()
++	entered, allow := s.writeEntered, s.allowWrite
++	s.mu.Unlock()
++	if entered != nil {
++		close(entered)
++		<-allow
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.data == nil {
++		s.data = make([]byte, 64<<10)
++	}
++	return copy(s.data[off:], b), nil
++}
++func (s *discardStorage) ReadAt(b []byte, off int64) (int, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if off >= int64(len(s.data)) {
++		return 0, io.EOF
++	}
++	n := copy(b, s.data[off:])
++	if n != len(b) {
++		return n, io.EOF
++	}
++	return n, nil
++}
++func (s *discardStorage) discard() bool {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.data = nil
++	s.complete = false
++	return true
++}
++
++func discardFixture(t *testing.T) (*Torrent, *discardStorage, []byte) {
++	t.Helper()
++	store := &discardStorage{}
++	config := NewDefaultClientConfig()
++	config.DisableTCP, config.DisableUTP, config.NoDHT = true, true, true
++	config.DisableTrackers, config.DisablePEX, config.NoDefaultPortForwarding = true, true, true
++	config.DefaultStorage = store
++	cl, err := NewClient(config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(cl.Close)
++	data := make([]byte, 64<<10)
++	for i := range data {
++		data[i] = byte((i*17 + 29) % 251)
++	}
++	hash := sha1.Sum(data)
++	info := metainfo.Info{Name: "discard-fixture", Length: int64(len(data)), PieceLength: int64(len(data)), Pieces: hash[:]}
++	infoBytes, err := bencode.Marshal(info)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tor, err := cl.AddTorrent(&metainfo.MetaInfo{InfoBytes: infoBytes})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return tor, store, data
++}
++
++func receiveDiscardChunk(t *testing.T, tor *Torrent, payload []byte, off int) {
++	t.Helper()
++	msg := &pp.Message{Type: pp.Piece, Index: 0, Begin: pp.Integer(off), Piece: payload[off : off+16<<10]}
++	req := newRequestFromMessage(msg)
++	cn := &connection{t: tor, validReceiveChunks: map[request]struct{}{req: {}}}
++	tor.cl.lock()
++	err := cn.receiveChunk(msg)
++	tor.cl.unlock()
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestTryDiscardDataPartialRefetch(t *testing.T) {
++	tor, store, data := discardFixture(t)
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	receiveDiscardChunk(t, tor, data, 0)
++	reader := tor.NewReader()
++	reader.SetReadahead(0)
++	reader.SetResponsive()
++	got := make([]byte, 16<<10)
++	if n, err := reader.ReadContext(ctx, got); err != nil || n != len(got) || !bytes.Equal(got, data[:len(got)]) {
++		t.Fatalf("initial partial chunk read: n=%d err=%v", n, err)
++	}
++	reader.Close()
++	p := tor.Piece(0)
++	if !p.TryDiscardData(store.discard) {
++		t.Fatal("idle partial piece was not discarded")
++	}
++	tor.cl.lock()
++	left, dirty := p.bytesLeft(), p.numDirtyChunks()
++	tor.cl.unlock()
++	if left != 64<<10 || dirty != 0 {
++		t.Fatalf("discarded chunks remain available: left=%d dirty=%d", left, dirty)
++	}
++	store.mu.Lock()
++	allocated := len(store.data)
++	store.mu.Unlock()
++	if allocated != 0 {
++		t.Fatal("piece allocation was retained")
++	}
++
++	// A late, different old request becomes a newly tracked chunk. It cannot
++	// falsely make the discarded first chunk available to a responsive reader.
++	receiveDiscardChunk(t, tor, data, 16<<10)
++	again := tor.NewReader()
++	again.SetReadahead(0)
++	again.SetResponsive()
++	defer again.Close()
++	type result struct {
++		n     int
++		err   error
++		bytes []byte
++	}
++	done := make(chan result, 1)
++	go func() { b := make([]byte, 16<<10); n, err := again.ReadContext(ctx, b); done <- result{n, err, b} }()
++	select {
++	case result := <-done:
++		t.Fatalf("discarded chunk was readable before refetch: n=%d err=%v", result.n, result.err)
++	case <-time.After(30 * time.Millisecond):
++	}
++	receiveDiscardChunk(t, tor, data, 0)
++	select {
++	case result := <-done:
++		if result.err != nil || result.n != 16<<10 || !bytes.Equal(result.bytes, data[:16<<10]) {
++			t.Fatalf("refetched bytes corrupted: n=%d err=%v", result.n, result.err)
++		}
++	case <-ctx.Done():
++		t.Fatal("refetch did not unblock the responsive reader")
++	}
++}
++
++func TestTryDiscardDataGuards(t *testing.T) {
++	tor, store, data := discardFixture(t)
++	receiveDiscardChunk(t, tor, data, 0)
++	p := tor.Piece(0)
++	called := false
++	callback := func() bool { called = true; return store.discard() }
++	if p.TryDiscardData(nil) {
++		t.Fatal("nil callback accepted")
++	}
++	for _, guard := range []string{"hashing", "queued", "reader", "writing"} {
++		tor.cl.lock()
++		switch guard {
++		case "hashing":
++			p.hashing = true
++		case "queued":
++			tor.piecesQueuedForHash.Add(0)
++		case "reader":
++			tor.readerNowPieces.Add(0)
++		case "writing":
++			p.incrementPendingWrites()
++		}
++		tor.cl.unlock()
++		if p.TryDiscardData(callback) || called {
++			t.Fatalf("%s guard invoked eviction", guard)
++		}
++		tor.cl.lock()
++		switch guard {
++		case "hashing":
++			p.hashing = false
++		case "queued":
++			tor.piecesQueuedForHash.Remove(0)
++		case "reader":
++			tor.readerNowPieces.Remove(0)
++		case "writing":
++			p.decrementPendingWrites()
++		}
++		tor.cl.unlock()
++	}
++	if p.TryDiscardData(func() bool { return false }) {
++		t.Fatal("callback refusal ignored")
++	}
++	tor.cl.lock()
++	dirty := p.numDirtyChunks()
++	tor.cl.unlock()
++	if dirty != 1 {
++		t.Fatal("callback refusal changed chunk state")
++	}
++	if !p.TryDiscardData(callback) || !called {
++		t.Fatal("eligible partial eviction failed")
++	}
++	tor.Drop()
++	called = false
++	if p.TryDiscardData(callback) || called {
++		t.Fatal("closed torrent invoked eviction")
++	}
++}
++
++func TestTryDiscardDataPendingWriteDoesNotWait(t *testing.T) {
++	tor, store, data := discardFixture(t)
++	store.writeEntered, store.allowWrite = make(chan struct{}), make(chan struct{})
++	written := make(chan struct{})
++	go func() { receiveDiscardChunk(t, tor, data, 0); close(written) }()
++	select {
++	case <-store.writeEntered:
++	case <-time.After(time.Second):
++		t.Fatal("write did not begin")
++	}
++	evicted := make(chan bool, 1)
++	go func() {
++		evicted <- tor.Piece(0).TryDiscardData(func() bool { t.Error("pending write invoked callback"); return false })
++	}()
++	select {
++	case ok := <-evicted:
++		if ok {
++			t.Fatal("pending write discarded")
++		}
++	case <-time.After(200 * time.Millisecond):
++		t.Fatal("discard waited for a pending write under the Client lock")
++	}
++	close(store.allowWrite)
++	select {
++	case <-written:
++	case <-time.After(time.Second):
++		t.Fatal("write did not finish")
++	}
++	if !tor.Piece(0).TryDiscardData(store.discard) {
++		t.Fatal("finished write prevented later eviction")
++	}
++}
++
++func TestTryDiscardDataCompleteRefetch(t *testing.T) {
++	tor, store, data := discardFixture(t)
++	for off := 0; off < len(data); off += 16 << 10 {
++		receiveDiscardChunk(t, tor, data, off)
++	}
++	deadline := time.Now().Add(2 * time.Second)
++	for !store.Completion().Complete {
++		if time.Now().After(deadline) {
++			t.Fatal("complete fixture did not verify")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	p := tor.Piece(0)
++	for !p.TryDiscardData(store.discard) {
++		if time.Now().After(deadline) {
++			t.Fatal("verified piece did not become evictable")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	if store.Completion().Complete || tor.PieceState(0).Complete {
++		t.Fatal("complete eviction retained completion")
++	}
++	receiveDiscardChunk(t, tor, data, 0)
++	r := tor.NewReader()
++	r.SetReadahead(0)
++	r.SetResponsive()
++	defer r.Close()
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	b := make([]byte, 16<<10)
++	if n, err := r.ReadContext(ctx, b); err != nil || n != len(b) || !bytes.Equal(b, data[:len(b)]) {
++		t.Fatalf("complete-piece refetch mismatch n=%d err=%v", n, err)
++	}
++}
+diff --git a/request_pipeline_floor_test.go b/request_pipeline_floor_test.go
+new file mode 100644
+--- /dev/null
++++ b/request_pipeline_floor_test.go
+@@ -0,0 +1,45 @@
++package torrent
++
++import (
++	"testing"
++	"time"
++)
++
++func TestRequestPipelineColdFloor32AndRemoteReqq(t *testing.T) {
++	tor := &Torrent{requestStrategy: 3, duplicateRequestTimeout: time.Second}
++	for _, remote := range []int{1, 8, 16, 32, 64, 250} {
++		peer := &connection{t: tor, PeerMaxRequests: remote}
++		want := 32
++		if remote < want {
++			want = remote
++		}
++		if got := peer.nominalMaxRequests(); got != want {
++			t.Fatalf("cold remote Reqq=%d: requests=%d, want%d", remote, got, want)
++		}
++	}
++}
++func TestRequestPipelineWarmAdaptiveWindowAndRemoteReqq(t *testing.T) {
++	tor := &Torrent{requestStrategy: 3, duplicateRequestTimeout: time.Second}
++	// The existing formula yields200; the minimum must not turn into a cap.
++	peer := &connection{t: tor, PeerMaxRequests: 250, chunksReceivedWhileExpecting: 100, cumulativeExpectedToReceiveChunks: 250 * time.Millisecond}
++	if got := peer.nominalMaxRequests(); got != 200 {
++		t.Fatalf("warm adaptive window=%d, want200", got)
++	}
++	for _, remote := range []int{1, 8, 64} {
++		peer.PeerMaxRequests = remote
++		if got := peer.nominalMaxRequests(); got != remote {
++			t.Fatalf("warm remote Reqq=%d: requests=%d", remote, got)
++		}
++	}
++}
++func TestRequestPipelineOtherStrategyUnchanged(t *testing.T) {
++	peer := &connection{t: &Torrent{requestStrategy: 2}, PeerMaxRequests: 250}
++	if got := peer.nominalMaxRequests(); got != 64 {
++		t.Fatalf("strategy2 cold window=%d, want64", got)
++	}
++	peer.stats.ChunksReadUseful.Add(120)
++	peer.stats.ChunksRead.Add(130)
++	if got := peer.nominalMaxRequests(); got != 110 {
++		t.Fatalf("strategy2 adaptive window=%d, want110", got)
++	}
++}

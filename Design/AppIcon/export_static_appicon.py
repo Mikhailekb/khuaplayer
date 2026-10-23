@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the production Khua AppIcon from its 1024 px master."""
+"""Export the Kinolet prism AppIcon without altering its source artwork."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import struct
 import tempfile
 from pathlib import Path
 
@@ -20,10 +21,16 @@ except ModuleNotFoundError as error:
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_MASTER = ROOT / "KhuaPlayer-StaticMaster-1024.png"
+DEFAULT_MASTER = ROOT / "Kinolet-Prism-Master.png"
 DEFAULT_OUTPUT = ROOT / "AppIcon.appiconset"
 DEFAULT_MANIFEST = ROOT / "export-manifest.json"
+DEFAULT_ICNS = ROOT / "AppIcon.icns"
 SIZES = (16, 32, 64, 128, 256, 512, 1024)
+ICNS_ENTRIES = (
+    (b"icp4", 16), (b"icp5", 32),
+    (b"ic07", 128), (b"ic08", 256), (b"ic09", 512), (b"ic10", 1024),
+    (b"ic11", 32), (b"ic12", 64), (b"ic13", 256), (b"ic14", 512),
+)
 
 CONTENTS = {
     "images": [
@@ -80,16 +87,36 @@ def save_png(image: Image.Image, path: Path) -> None:
 def validate_master(master_path: Path) -> Image.Image:
     source = Image.open(master_path)
     source.load()
-    if source.size != (1024, 1024):
-        raise SystemExit(f"Master must be 1024x1024; found {source.size}")
-    if source.mode != "RGB":
-        raise SystemExit(f"Master must be an opaque RGB PNG; found {source.mode}")
-    if "srgb" not in source.info and "icc_profile" not in source.info:
-        raise SystemExit("Master must declare an sRGB color profile")
+    if source.width != source.height or source.width < 1024:
+        raise SystemExit(f"Master must be square and at least 1024 px; found {source.size}")
+    if source.mode != "RGBA":
+        raise SystemExit(f"Master must be an RGBA PNG; found {source.mode}")
+    alpha = source.getchannel("A")
+    corners = ((0, 0), (source.width - 1, 0),
+               (0, source.height - 1), (source.width - 1, source.height - 1))
+    if alpha.getextrema() != (0, 255) or any(alpha.getpixel(point) for point in corners):
+        raise SystemExit("Master must preserve transparent corners and visible opaque artwork")
     return source
 
 
-def render(master_path: Path, output: Path) -> dict[str, object]:
+def write_icns(output: Path, icns_path: Path) -> dict[str, object]:
+    # ICNS accepts PNG-backed entries. Wrapping the canonical PNG bytes directly
+    # avoids platform-dependent re-encoding and retains alpha at every size.
+    chunks = []
+    for kind, size in ICNS_ENTRIES:
+        png = (output / f"AppIcon-{size}.png").read_bytes()
+        chunks.append(kind + struct.pack(">I", len(png) + 8) + png)
+    payload = b"".join(chunks)
+    atomic_write(icns_path, b"icns" + struct.pack(">I", len(payload) + 8) + payload)
+    return {
+        "file": icns_path.name,
+        "sha256": sha256(icns_path),
+        "format": "ICNS with unchanged canonical PNG entries",
+        "entries": [kind.decode("ascii") for kind, _ in ICNS_ENTRIES],
+    }
+
+
+def render(master_path: Path, output: Path, icns_path: Path) -> dict[str, object]:
     output.mkdir(parents=True, exist_ok=True)
     master = validate_master(master_path)
 
@@ -97,11 +124,9 @@ def render(master_path: Path, output: Path) -> dict[str, object]:
     for size in SIZES:
         image = (
             master.copy()
-            if size == 1024
+            if master.size == (size, size)
             else master.resize((size, size), Image.Resampling.LANCZOS)
         )
-        if image.mode != "RGB":
-            image = image.convert("RGB")
         destination = output / f"AppIcon-{size}.png"
         save_png(image, destination)
         files.append(
@@ -110,28 +135,29 @@ def render(master_path: Path, output: Path) -> dict[str, object]:
                 "sha256": sha256(destination),
                 "width": size,
                 "height": size,
-                "mode": "RGB",
+                "mode": "RGBA",
             }
         )
 
     atomic_write(output / "Contents.json", stable_json(CONTENTS))
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "source": {
             "file": master_path.name,
             "sha256": sha256(master_path),
-            "width": 1024,
-            "height": 1024,
-            "mode": "RGB",
-            "colorSpace": "sRGB IEC61966-2.1",
+            "width": master.width,
+            "height": master.height,
+            "mode": "RGBA",
+            "colorSpace": "untagged; interpreted as sRGB",
         },
         "export": {
-            "alpha": False,
+            "alpha": True,
             "colorSpace": "sRGB IEC61966-2.1",
-            "resampling": "Pillow LANCZOS; every size is rendered directly from the 1024 px master",
+            "resampling": "Pillow LANCZOS; every size is rendered directly from the unchanged RGBA master",
             "pillowVersion": PIL.__version__,
         },
         "files": files,
+        "icns": write_icns(output, icns_path),
     }
 
 
@@ -143,11 +169,12 @@ def compare_file(expected: Path, actual: Path) -> list[str]:
     return []
 
 
-def check(master: Path, output: Path, manifest: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix="khua-appicon-check.") as temporary:
+def check(master: Path, output: Path, manifest: Path, icns_path: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="kinolet-appicon-check.") as temporary:
         expected_output = Path(temporary) / "AppIcon.appiconset"
         expected_manifest = Path(temporary) / "export-manifest.json"
-        manifest_value = render(master, expected_output)
+        expected_icns = Path(temporary) / icns_path.name
+        manifest_value = render(master, expected_output, expected_icns)
         atomic_write(expected_manifest, stable_json(manifest_value))
 
         errors: list[str] = []
@@ -156,6 +183,7 @@ def check(master: Path, output: Path, manifest: Path) -> None:
             errors.extend(compare_file(expected_output / filename, output / filename))
         errors.extend(compare_file(expected_output / "Contents.json", output / "Contents.json"))
         errors.extend(compare_file(expected_manifest, manifest))
+        errors.extend(compare_file(expected_icns, icns_path))
 
         expected_pngs = {f"AppIcon-{size}.png" for size in SIZES}
         actual_pngs = {path.name for path in output.glob("*.png")}
@@ -173,6 +201,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master", type=Path, default=DEFAULT_MASTER)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--icns", type=Path, default=DEFAULT_ICNS)
     parser.add_argument(
         "--check",
         action="store_true",
@@ -186,11 +215,12 @@ def main() -> None:
     master = arguments.master.resolve()
     output = arguments.output.resolve()
     manifest = arguments.manifest.resolve()
+    icns_path = arguments.icns.resolve()
     if arguments.check:
-        check(master, output, manifest)
+        check(master, output, manifest, icns_path)
         return
 
-    manifest_value = render(master, output)
+    manifest_value = render(master, output, icns_path)
     atomic_write(manifest, stable_json(manifest_value))
     print(f"Exported AppIcon: {output}")
     print(f"Wrote deterministic manifest: {manifest}")

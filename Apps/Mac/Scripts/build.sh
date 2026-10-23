@@ -1,5 +1,5 @@
 #!/bin/bash
-# Khua Mac product build. Usage: Apps/Mac/Scripts/build.sh [Debug|Release]
+# Kinolet Mac product build. Usage: Apps/Mac/Scripts/build.sh [Debug|Release]
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 
@@ -31,16 +31,16 @@ echo "==> Verifying/building the self-contained subtitle stack"
 echo "==> Verifying/building Sparkle for optional direct-distribution updates"
 ./Scripts/build_sparkle.sh
 
-SPARKLE_FEED_URL="${KHUA_SPARKLE_FEED_URL:-}"
-SPARKLE_PUBLIC_ED_KEY="${KHUA_SPARKLE_PUBLIC_ED_KEY:-}"
+SPARKLE_FEED_URL="${KINOLET_SPARKLE_FEED_URL:-}"
+SPARKLE_PUBLIC_ED_KEY="${KINOLET_SPARKLE_PUBLIC_ED_KEY:-}"
 if { [ -n "$SPARKLE_FEED_URL" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ]; } ||
    { [ -z "$SPARKLE_FEED_URL" ] && [ -n "$SPARKLE_PUBLIC_ED_KEY" ]; }; then
-  echo "error: KHUA_SPARKLE_FEED_URL and KHUA_SPARKLE_PUBLIC_ED_KEY must be supplied together" >&2
+  echo "error: KINOLET_SPARKLE_FEED_URL and KINOLET_SPARKLE_PUBLIC_ED_KEY must be supplied together" >&2
   exit 2
 fi
 export KHUA_ENABLE_SPARKLE=true
-export KHUA_SPARKLE_FEED_URL="$SPARKLE_FEED_URL"
-export KHUA_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY"
+export KINOLET_SPARKLE_FEED_URL="$SPARKLE_FEED_URL"
+export KINOLET_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY"
 
 echo "==> Generating the Xcode project (xcodegen)"
 "$XCODEGEN" generate --spec Apps/Mac/project.yml --project Apps/Mac --quiet
@@ -53,7 +53,7 @@ xcodebuild -project Apps/Mac/KhuaPlayer.xcodeproj \
            REGISTER_WITH_LAUNCH_SERVICES=NO \
            build
 
-APP=.build/Build/Products/$CONFIG/Khua.app
+APP=.build/Build/Products/$CONFIG/Kinolet.app
 
 # Bundle libass and its dependency stack. FFmpeg is linked statically, so the
 # resulting app is self-contained.
@@ -80,22 +80,22 @@ if [ "$CONFIG" = "Release" ]; then
   source "$(pwd)/Scripts/lib/build_common.sh"
   ROOT_DIR="$(pwd -P)"
   verify_deployed_app() { codesign --verify --deep --strict "$1"; }
-  sp_recover_atomic_directory "$ROOT_DIR/Khua.app" "$ROOT_DIR" verify_deployed_app
+  sp_recover_atomic_directory "$ROOT_DIR/Kinolet.app" "$ROOT_DIR" verify_deployed_app
   CLEANROOM="$(mktemp -d)"
   DEPLOY_TMP="$(mktemp -d "$ROOT_DIR/.khuaplayer-deploy.XXXXXX")"
   trap 'rm -rf "$CLEANROOM" "$DEPLOY_TMP"' EXIT
   cp -R "$APP" "$CLEANROOM/"
-  xattr -cr "$CLEANROOM/Khua.app"
-  codesign --verify --strict "$CLEANROOM/Khua.app" || { echo "Signature verification failed before deployment"; exit 1; }
-  mv "$CLEANROOM/Khua.app" "$DEPLOY_TMP/Khua.app"
-  sp_atomic_replace_directory "$DEPLOY_TMP/Khua.app" "$ROOT_DIR/Khua.app" "$ROOT_DIR" verify_deployed_app
+  xattr -cr "$CLEANROOM/Kinolet.app"
+  codesign --verify --strict "$CLEANROOM/Kinolet.app" || { echo "Signature verification failed before deployment"; exit 1; }
+  mv "$CLEANROOM/Kinolet.app" "$DEPLOY_TMP/Kinolet.app"
+  sp_atomic_replace_directory "$DEPLOY_TMP/Kinolet.app" "$ROOT_DIR/Kinolet.app" "$ROOT_DIR" verify_deployed_app
   rm -rf "$CLEANROOM" "$DEPLOY_TMP"
   trap - EXIT
 
   # Xcode build products and archive intermediates must not accumulate as
   # duplicate Quick Look registrations. Keep only the published root app.
-  QL_IDENTIFIER="app.khuaplayer.KhuaPlayer.QuickLook"
-  QL_APPEX="$ROOT_DIR/Khua.app/Contents/PlugIns/KhuaPlayerQuickLook.appex"
+  QL_IDENTIFIER="app.kinolet.player.QuickLook"
+  QL_APPEX="$ROOT_DIR/Kinolet.app/Contents/PlugIns/KhuaPlayerQuickLook.appex"
   LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
   registered_ql_paths() {
@@ -117,7 +117,7 @@ if [ "$CONFIG" = "Release" ]; then
   }
 
   register_release_app() {
-    "$LSREGISTER" -f -R -trusted "$ROOT_DIR/Khua.app"
+    "$LSREGISTER" -f -R -trusted "$ROOT_DIR/Kinolet.app"
     pluginkit -a "$QL_APPEX"
     pluginkit -e use -i "$QL_IDENTIFIER" 2>/dev/null || true
   }
@@ -139,5 +139,5 @@ if [ "$CONFIG" = "Release" ]; then
     printf '%s\n' "$REGISTERED_QL_PATHS" >&2
     exit 1
   fi
-  echo "==> Deployed: $ROOT_DIR/Khua.app"
+  echo "==> Deployed: $ROOT_DIR/Kinolet.app"
 fi

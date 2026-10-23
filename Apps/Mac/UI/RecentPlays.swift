@@ -6,12 +6,40 @@ extension Notification.Name {
     static let spRecentPlaysChanged = Notification.Name("sp.recentPlaysChanged")
 }
 
-struct RecentPlay: Codable {
+struct RecentPlay: Codable, Sendable {
     let path: String
     let title: String
     var position: Double
     var duration: Double
     var lastPlayedAt: Double
+    let torrent: SPTorrentResumeReference?
+
+    init(path: String, title: String, position: Double, duration: Double,
+         lastPlayedAt: Double, torrent: SPTorrentResumeReference? = nil) {
+        self.path = path
+        self.title = title
+        self.position = position
+        self.duration = duration
+        self.lastPlayedAt = lastPlayedAt
+        self.torrent = torrent
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case path, title, position, duration, lastPlayedAt, torrent
+    }
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        path = try values.decode(String.self, forKey: .path)
+        title = try values.decode(String.self, forKey: .title)
+        position = try values.decode(Double.self, forKey: .position)
+        duration = try values.decode(Double.self, forKey: .duration)
+        lastPlayedAt = try values.decode(Double.self, forKey: .lastPlayedAt)
+        // A damaged optional source must not erase the user's existing row or
+        // the other local files in a legacy ledger. The open path reports an
+        // unavailable source for an untyped managed torrent identity.
+        torrent = try? values.decodeIfPresent(SPTorrentResumeReference.self, forKey: .torrent)
+    }
 
     var isFinished: Bool {
         Self.isFinished(position: position, duration: duration)
@@ -171,29 +199,55 @@ enum RecentPlays {
     static let capacity = 10
     private static let key = "sp.recent"
 
+    private struct DecodedEntry: Decodable {
+        let value: RecentPlay?
+        init(from decoder: any Decoder) throws {
+            value = try? RecentPlay(from: decoder)
+        }
+    }
+
     static func load(defaults: UserDefaults = .standard) -> [RecentPlay] {
         guard let data = defaults.data(forKey: key),
-              let list = try? JSONDecoder().decode([RecentPlay].self, from: data) else { return [] }
-        return list.sorted { $0.lastPlayedAt > $1.lastPlayedAt }
+              let decoded = try? JSONDecoder().decode([DecodedEntry].self, from: data) else { return [] }
+        return Array(decoded.compactMap(\.value).sorted { $0.lastPlayedAt > $1.lastPlayedAt }.prefix(capacity))
     }
 
     static func record(path: String, title: String, position: Double, duration: Double,
-                       insert: Bool = true, defaults: UserDefaults = .standard) {
+                       insert: Bool = true, torrent: SPTorrentResumeReference? = nil,
+                       defaults: UserDefaults = .standard,
+                       torrentStore: SPTorrentResumeStore = .shared) {
         let existing = load(defaults: defaults)
         if !insert && !existing.contains(where: { $0.path == path }) {
             SPResumePositionIndex.touch(path: path, defaults: defaults)
+            // Preparing a checkpoint can have created a sidecar just after
+            // history was cleared. Closing the player must not resurrect it.
+            torrentStore.prune(keeping: existing.compactMap(\.torrent))
             return
+        }
+        let previousReference = existing.first(where: { $0.path == path })?.torrent
+        var reference = torrent ?? previousReference
+        if let previousReference, case .metainfo = previousReference.source,
+           let torrent, case .magnet = torrent.source,
+           previousReference.hash == torrent.hash,
+           previousReference.filePath == torrent.filePath,
+           previousReference.length == torrent.length,
+           (try? torrentStore.resolve(previousReference)) != nil {
+            // An older magnet lease can outlive a second window's metainfo
+            // upgrade. Keep that durable source while it is still healthy.
+            reference = previousReference
         }
         var list = existing.filter { $0.path != path }
         list.insert(RecentPlay(path: path, title: title, position: position,
                                duration: duration,
-                               lastPlayedAt: Date().timeIntervalSince1970), at: 0)
+                               lastPlayedAt: Date().timeIntervalSince1970,
+                               torrent: reference), at: 0)
         if list.count > capacity { list.removeLast(list.count - capacity) }
-        save(list, defaults: defaults)
+        save(list, defaults: defaults, torrentStore: torrentStore)
         SPResumePositionIndex.touch(path: path, defaults: defaults)
     }
 
-    static func rename(from old: String, to new: String, title: String, defaults: UserDefaults = .standard) {
+    static func rename(from old: String, to new: String, title: String, defaults: UserDefaults = .standard,
+                       torrentStore: SPTorrentResumeStore = .shared) {
         guard old != new else { return }
         var list = load(defaults: defaults)
         if let i = list.firstIndex(where: { $0.path == old }) {
@@ -201,9 +255,9 @@ enum RecentPlays {
             list.removeAll { $0.path == new }
             if let j = list.firstIndex(where: { $0.path == old }) {
                 list[j] = RecentPlay(path: new, title: title, position: e.position, duration: e.duration,
-                                     lastPlayedAt: e.lastPlayedAt)
+                                     lastPlayedAt: e.lastPlayedAt, torrent: e.torrent)
             }
-            save(list, defaults: defaults)
+            save(list, defaults: defaults, torrentStore: torrentStore)
         }
 #if SP_APP_STORE
         SPRecentBookmarks.rename(from: old, to: new)
@@ -217,8 +271,9 @@ enum RecentPlays {
         }
     }
 
-    static func remove(path: String, defaults: UserDefaults = .standard) {
-        save(load(defaults: defaults).filter { $0.path != path }, defaults: defaults)
+    static func remove(path: String, defaults: UserDefaults = .standard,
+                       torrentStore: SPTorrentResumeStore = .shared) {
+        save(load(defaults: defaults).filter { $0.path != path }, defaults: defaults, torrentStore: torrentStore)
 #if SP_APP_STORE
         SPRecentBookmarks.forget(path: path)
 #endif
@@ -226,8 +281,9 @@ enum RecentPlays {
 
     /// Clear the ledger and notify every window. Callers use the same serialized
     /// queue as record so storage and visible lists remain consistently ordered.
-    static func clear(defaults: UserDefaults = .standard) {
+    static func clear(defaults: UserDefaults = .standard, torrentStore: SPTorrentResumeStore = .shared) {
         defaults.removeObject(forKey: key)
+        torrentStore.prune(keeping: [])
 #if SP_APP_STORE
         SPRecentBookmarks.clear()
 #endif
@@ -236,9 +292,13 @@ enum RecentPlays {
         }
     }
 
-    private static func save(_ list: [RecentPlay], defaults: UserDefaults = .standard) {
+    private static func save(_ list: [RecentPlay], defaults: UserDefaults,
+                             torrentStore: SPTorrentResumeStore) {
         if let data = try? JSONEncoder().encode(list) {
             defaults.set(data, forKey: key)
+            torrentStore.prune(keeping: list.compactMap(\.torrent))
+        } else {
+            torrentStore.prune(keeping: load(defaults: defaults).compactMap(\.torrent))
         }
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: .spRecentPlaysChanged, object: nil)

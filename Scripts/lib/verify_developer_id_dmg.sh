@@ -82,9 +82,9 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 cleanup() {
   if [ "$ATTACHED" -eq 1 ]; then
     pluginkit -r \
-      "$MOUNT_POINT/Khua.app/Contents/PlugIns/KhuaPlayerQuickLook.appex" \
+      "$MOUNT_POINT/Kinolet.app/Contents/PlugIns/KhuaPlayerQuickLook.appex" \
       >/dev/null 2>&1 || true
-    "$LSREGISTER" -u "$MOUNT_POINT/Khua.app" >/dev/null 2>&1 || true
+    "$LSREGISTER" -u "$MOUNT_POINT/Kinolet.app" >/dev/null 2>&1 || true
     hdiutil detach "$MOUNT_POINT" -quiet >/dev/null 2>&1 || \
       hdiutil detach "$MOUNT_POINT" -force -quiet >/dev/null 2>&1 || true
   fi
@@ -125,15 +125,15 @@ ATTACHED=1
 
 [ "$(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -print | \
       wc -l | tr -d ' ')" = "2" ] || \
-  die "disk image root must contain only Khua.app and Applications"
-[ -d "$MOUNT_POINT/Khua.app" ] || \
-  die "disk image does not contain Khua.app"
+  die "disk image root must contain only Kinolet.app and Applications"
+[ -d "$MOUNT_POINT/Kinolet.app" ] || \
+  die "disk image does not contain Kinolet.app"
 [ -L "$MOUNT_POINT/Applications" ] || \
   die "disk image Applications entry is not a symbolic link"
 [ "$(readlink "$MOUNT_POINT/Applications")" = "/Applications" ] || \
   die "disk image Applications link does not target /Applications"
 
-CONTAINED_APP="$MOUNT_POINT/Khua.app"
+CONTAINED_APP="$MOUNT_POINT/Kinolet.app"
 if [ -z "$BUNDLE_ID" ]; then
   BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
     "$CONTAINED_APP/Contents/Info.plist")"

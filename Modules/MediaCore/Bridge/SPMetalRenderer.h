@@ -92,6 +92,10 @@
 - (BOOL)displayEdrCapable;
 // Current display headroom, at least one.
 - (CGFloat)displayEDRHeadroom;
+// Thread-safe HDR viewing preference, applied after HDR display mapping and
+// before manual picture adjustments. Retained across media changes.
+- (void)setHdrShadowLiftEnabled:(BOOL)enabled;
+- (BOOL)hdrShadowLiftEnabled;
 // Sample aspect ratio; display ratio is pixel width times SAR divided by height.
 - (void)setSampleAspect:(float)sar;
 // Container orientation (display matrix) for the current item, applied before

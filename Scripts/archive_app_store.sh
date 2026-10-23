@@ -50,7 +50,7 @@ TEAM_ID=""
 BUNDLE_ID=""
 MARKETING_VERSION=""
 BUILD_NUMBER=""
-ARCHIVE_PATH=".build/AppStore/Khua.xcarchive"
+ARCHIVE_PATH=".build/AppStore/Kinolet.xcarchive"
 DERIVED_DATA_PATH=".build/AppStore/DerivedData"
 ALLOW_PROVISIONING_UPDATES=0
 
@@ -132,8 +132,8 @@ unregister_archive_products() {
   local lsregister
   lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
   for app in \
-    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/KhuaPlayer/InstallationBuildProductsLocation/Applications/Khua.app" \
-    "$ARCHIVE_PATH/Products/Applications/Khua.app"; do
+    "$DERIVED_DATA_PATH/Build/Intermediates.noindex/ArchiveIntermediates/KhuaPlayer/InstallationBuildProductsLocation/Applications/Kinolet.app" \
+    "$ARCHIVE_PATH/Products/Applications/Kinolet.app"; do
     pluginkit -r "$app/Contents/PlugIns/KhuaPlayerQuickLook.appex" 2>/dev/null || true
     "$lsregister" -u "$app" 2>/dev/null || true
   done
@@ -153,8 +153,9 @@ echo "==> Building pinned subtitle dependencies"
 "$ROOT/Scripts/build_subtitle_libs.sh"
 echo "==> Generating Apps/Mac/KhuaPlayer.xcodeproj"
 KHUA_ENABLE_SPARKLE=false \
-KHUA_SPARKLE_FEED_URL= \
-KHUA_SPARKLE_PUBLIC_ED_KEY= \
+KINOLET_ENABLE_AUTOMATIC_UPDATES=false \
+KINOLET_SPARKLE_FEED_URL= \
+KINOLET_SPARKLE_PUBLIC_ED_KEY= \
   "$XCODEGEN_BIN" generate --spec Apps/Mac/project.yml --project Apps/Mac --quiet
 
 XCODEBUILD_ARGS=(

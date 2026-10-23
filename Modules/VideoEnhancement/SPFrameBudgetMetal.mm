@@ -2,6 +2,7 @@
 #import "SPFrameBudgetPlanner.hpp"
 #import "SPMotionFrameCompatibility.hpp"
 #import "SPPlanarPixelFormat.h"
+#include "ShaderSource.h"
 
 #include <algorithm>
 #include <mutex>
@@ -156,7 +157,17 @@ static NSError *SPBudgetMetalError(NSInteger code, NSString *message) {
 - (BOOL)enableDoviReconstructionWithError:(NSError **)error {
     if (_doviReconstruction) return YES;
     NSURL *url = [[NSBundle bundleForClass:self.class] URLForResource:@"default" withExtension:@"metallib"];
-    id<MTLLibrary> library = url ? [_device newLibraryWithURL:url error:error] : nil;
+    NSError *libraryError = nil;
+    id<MTLLibrary> library = url ? [_device newLibraryWithURL:url error:&libraryError] : nil;
+    // Match the renderer's source fallback when an offline shader library is
+    // unavailable, keeping the DV motion path on the same uniform definitions.
+    if (!library) {
+        library = [_device newLibraryWithSource:@(kSPShaderSource) options:nil error:&libraryError];
+    }
+    if (!library) {
+        if (error) *error = libraryError ?: SPBudgetMetalError(6, @"DV reconstruction shader library");
+        return NO;
+    }
     id<MTLFunction> fn = [library newFunctionWithName:@"doviFrameToRGBA"];
     _doviToRGBA = fn ? [_device newComputePipelineStateWithFunction:fn error:error] : nil;
     if (!_doviToRGBA) {

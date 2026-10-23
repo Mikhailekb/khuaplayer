@@ -1,0 +1,4247 @@
+diff --git a/server/torr/apihelper.go b/server/torr/apihelper.go
+--- a/server/torr/apihelper.go
++++ b/server/torr/apihelper.go
+@@ -13,6 +13,7 @@
+ 
+ 	"server/log"
+ 	sets "server/settings"
++	"server/torr/storage/torrstor"
+ 	"server/torr/utils"
+ )
+ 
+@@ -350,3 +351,16 @@
+ 	}
+ 	torr.Preload(index, size)
+ }
++
++func RemovePlaybackWindow(hash metainfo.Hash, consumer string, revision uint64) (torrstor.PlaybackWindow, error) {
++	if bts == nil {
++		return torrstor.PlaybackWindow{}, torrstor.ErrPlaybackCacheClosed
++	}
++	bts.mu.RLock()
++	storage := bts.storage
++	bts.mu.RUnlock()
++	if storage == nil {
++		return torrstor.PlaybackWindow{}, torrstor.ErrPlaybackCacheClosed
++	}
++	return storage.RemovePlaybackWindow(hash, consumer, revision)
++}
+diff --git a/server/torr/playback_lifetime_test.go b/server/torr/playback_lifetime_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/playback_lifetime_test.go
+@@ -0,0 +1,50 @@
++package torr
++
++import (
++	"testing"
++	"time"
++)
++
++// A playback window is explicit ownership of a paused session, independent of
++// short-lived HTTP range readers. Simulate a pause longer than the timeout
++// without status polling or a download reader keeping the torrent alive.
++func TestPlaybackWindowOwnsTorrentAcrossDisconnectTimeout(t *testing.T) {
++	_, tor := newSeasonTorrent(t)
++	cache := tor.GetCache()
++	file := tor.Files()[0]
++	if cache.Readers() != 0 {
++		t.Fatal("fixture unexpectedly owns an HTTP reader")
++	}
++	tor.muTorrent.Lock()
++	tor.expiredTime = time.Now().Add(-time.Hour)
++	tor.muTorrent.Unlock()
++	if !tor.expired() {
++		t.Fatal("unowned idle torrent must remain eligible for expiry")
++	}
++	for _, consumer := range []string{"paused-a", "paused-b"} {
++		if _, err := cache.UpdatePlaybackWindow(1, file.Offset(), file.Length(), consumer, 0, 1, file.Length(), 1, false); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if tor.expired() {
++		t.Fatal("paused session expired despite retained playback windows")
++	}
++	// The production watchdog must not drop the cache even with no readers and
++	// an arbitrarily old deadline. It must still retire after final release.
++	tor.progressEvent()
++	if tor.GetCache() != cache || tor.Torrent == nil {
++		t.Fatal("watchdog dropped the paused cache")
++	}
++	if _, err := cache.UpdatePlaybackWindow(0, 0, 0, "paused-a", 0, 0, 0, 2, true); err != nil {
++		t.Fatal(err)
++	}
++	if tor.expired() {
++		t.Fatal("one session released another paused session")
++	}
++	if _, err := cache.UpdatePlaybackWindow(0, 0, 0, "paused-b", 0, 0, 0, 2, true); err != nil {
++		t.Fatal(err)
++	}
++	if !tor.expired() {
++		t.Fatal("final release kept an otherwise idle torrent alive")
++	}
++}
+diff --git a/server/torr/prefetch_capacity_http_test.go b/server/torr/prefetch_capacity_http_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/prefetch_capacity_http_test.go
+@@ -0,0 +1,487 @@
++package torr
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha1"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"os/exec"
++	"testing"
++	"time"
++
++	"github.com/anacrolix/torrent"
++	"github.com/anacrolix/torrent/bencode"
++	"github.com/anacrolix/torrent/metainfo"
++	"server/settings"
++	"server/torr/state"
++	"server/torr/storage/torrstor"
++)
++
++const capacityHTTPNonce = "0ab12cd3-4567-489a-bcde-0123456789ab"
++
++type capacityHTTPFixture struct {
++	torrent *Torrent
++	cache   *torrstor.Cache
++	payload []byte
++	quota   int64
++	length  int64
++	window  torrstor.PlaybackWindow
++}
++
++// This fixture uses real library piece verification and worker storage. Only
++// the retained window is populated; no tracker or peer can fill missing data.
++func newCapacityHTTPFixture(t *testing.T, length, quota int64) *capacityHTTPFixture {
++	t.Helper()
++	return newCapacityHTTPFixtureAt(t, length, quota, 0)
++}
++
++func newCapacityHTTPFixtureAt(t *testing.T, length, quota, current int64) *capacityHTTPFixture {
++	t.Helper()
++	const pieceLength = 64 << 10
++	payload := make([]byte, length)
++	for i := range payload {
++		payload[i] = byte(i*31 + i/251)
++	}
++	info := metainfo.Info{Name: "capacity.mkv", Length: length, PieceLength: pieceLength}
++	for offset := int64(0); offset < length; offset += pieceLength {
++		hash := sha1.Sum(payload[offset:min(offset+pieceLength, length)])
++		info.Pieces = append(info.Pieces, hash[:]...)
++	}
++	mi := metainfo.MetaInfo{InfoBytes: bencode.MustMarshal(info)}
++	spec := &torrent.TorrentSpec{InfoHash: mi.HashInfoBytes(), InfoBytes: mi.InfoBytes, DisplayName: info.Name}
++	store := torrstor.NewStorage(quota)
++	config := torrent.NewDefaultClientConfig()
++	config.DefaultStorage = store
++	config.DataDir = t.TempDir()
++	config.DisableTCP = true
++	config.DisableUTP = true
++	config.NoDHT = true
++	config.DisableTrackers = true
++	config.DisablePEX = true
++	config.NoDefaultPortForwarding = true
++	client, err := torrent.NewClient(config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { client.Close() })
++	backend, _, err := client.AddTorrentSpec(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cache := store.GetCache(spec.InfoHash)
++	if cache == nil {
++		t.Fatal("known metainfo did not create storage")
++	}
++	cache.SetTorrent(backend)
++	window, err := cache.UpdatePlaybackWindow(1, 0, length, "capacity-http", current, current, length, 1, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if window.Lower != current || window.Current != current || window.Upper != min(current+quota, length) {
++		t.Fatalf("expected physical quota %d at %d, got %+v", quota, current, window)
++	}
++	for i := int(current / pieceLength); int64(i)*pieceLength < window.Upper; i++ {
++		start := int64(i) * pieceLength
++		data := payload[start:min(start+pieceLength, length)]
++		if n, err := cache.Piece(info.Piece(i)).WriteAt(data, 0); n != len(data) || err != nil {
++			t.Fatalf("seed piece %d: n=%d err=%v", i, n, err)
++		}
++		backend.Piece(i).VerifyData()
++		if !backend.PieceState(i).Complete {
++			t.Fatalf("seeded piece %d failed SHA1 verification", i)
++		}
++	}
++	return &capacityHTTPFixture{
++		torrent: &Torrent{Torrent: backend, TorrentSpec: spec, Stat: state.TorrentWorking,
++			cache: cache, closed: backend.Closed(), Timestamp: time.Now().Unix()},
++		cache: cache, payload: payload, length: length, quota: quota, window: window,
++	}
++}
++
++func (f *capacityHTTPFixture) ack(t *testing.T) torrstor.PlaybackWindow {
++	t.Helper()
++	ack, err := f.cache.UpdatePlaybackWindow(1, 0, f.length, "capacity-http", f.window.Lower, f.window.Current, f.length, f.window.Revision+1, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	f.window = ack
++	return ack
++}
++
++func capacityHTTPRequest(t *testing.T, base, consumer, nonce string, start, end int64) *http.Request {
++	t.Helper()
++	query := url.Values{"playback_consumer": {consumer}, "playback_prefetch": {"1"}, "playback_prefetch_request": {nonce}}
++	req, err := http.NewRequest(http.MethodGet, base+"/stream/capacity.mkv?"+query.Encode(), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end-1))
++	return req
++}
++
++func (f *capacityHTTPFixture) get(t *testing.T, consumer, nonce string, start, end int64) (*http.Response, []byte, error) {
++	t.Helper()
++	handlerDone := make(chan error, 1)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		handlerDone <- f.torrent.Stream(1, req, w)
++	}))
++	defer server.Close()
++	client := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, Timeout: 3 * time.Second}
++	defer client.CloseIdleConnections()
++	response, err := client.Do(capacityHTTPRequest(t, server.URL, consumer, nonce, start, end))
++	if err != nil {
++		t.Fatal(err)
++	}
++	data, readErr := io.ReadAll(response.Body)
++	response.Body.Close()
++	if err := <-handlerDone; err != nil {
++		t.Fatalf("Stream: %v", err)
++	}
++	if f.cache.Readers() != 0 || GetActiveStreams() != 0 {
++		t.Fatal("Stream returned without releasing its HTTP reader")
++	}
++	return response, data, readErr
++}
++
++func assertNoCapacityHTTPProof(t *testing.T, f *capacityHTTPFixture) {
++	t.Helper()
++	assertNoCapacityHTTPACK(t, f.ack(t))
++}
++
++func assertNoCapacityHTTPACK(t *testing.T, ack torrstor.PlaybackWindow) {
++	t.Helper()
++	if ack.PrefetchStop != nil {
++		t.Fatalf("non-capacity termination produced a stop: %+v", ack.PrefetchStop)
++	}
++	encoded, err := json.Marshal(ack)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if bytes.Contains(encoded, []byte(`"prefetch_stop"`)) {
++		t.Fatalf("absent proof leaked into ACK JSON: %s", encoded)
++	}
++}
++
++// Stream writes the process-wide Viewed database. Its settings and background
++// cache goroutines must live in a separate process from other package tests.
++func TestStreamPrefetchCapacityProof(t *testing.T) {
++	const childKey = "KHUA_STREAM_CAPACITY_HTTP_TEST_CHILD"
++	if os.Getenv(childKey) != "1" {
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStreamPrefetchCapacityProof$", "-test.v")
++		cmd.Env = append(os.Environ(), childKey+"=1")
++		output, err := cmd.CombinedOutput()
++		if err != nil {
++			t.Fatalf("isolated capacity HTTP test: %v\n%s", err, output)
++		}
++		t.Logf("isolated capacity HTTP test:\n%s", output)
++		return
++	}
++	settings.Path = t.TempDir()
++	settings.Args = &settings.ExecArgs{}
++	if err := settings.InitSets(false, false); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(settings.CloseDB)
++	settings.BTsets.ReaderReadAHead = 95
++	settings.BTsets.TorrentDisconnectTimeout = 30
++	settings.BTsets.ConnectionsLimit = 25
++	settings.BTsets.UseDisk = false
++	settings.BTsets.ResponsiveMode = true
++	settings.BTsets.TrackTimecode = false
++	const length, quota = int64(512 << 10), int64(256 << 10)
++	const start, end = int64(32<<10 + 17), int64(448<<10 + 31)
++
++	t.Run("paused-midfile-repeated-suffix-keeps-final-piece-credit", func(t *testing.T) {
++		const piece = int64(64 << 10)
++		const lower, upper = 4 * piece, 12 * piece
++		f := newCapacityHTTPFixtureAt(t, 16*piece, 8*piece, lower)
++		if f.cache.GetState().Filled != 8*piece {
++			t.Fatal("paused midfile window was not fully resident")
++		}
++		for retry := 0; retry < 4; retry++ {
++			nonce := fmt.Sprintf("0ab12cd3-4567-489a-bcde-%012x", retry+1)
++			// The paused ACK grants exactly this last piece of credit. Creating
++			// a fresh HTTP reader must not charge a phantom piece at offset zero.
++			response, data, err := f.get(t, "capacity-http", nonce, 11*piece, upper)
++			if response.StatusCode != http.StatusPartialContent || response.ContentLength != piece || err != nil || !bytes.Equal(data, f.payload[11*piece:upper]) {
++				t.Fatalf("suffix retry %d: status=%d promised=%d actual=%d err=%v; paused ACK=%+v", retry, response.StatusCode, response.ContentLength, len(data), err, f.window)
++			}
++			ack := f.ack(t)
++			if ack.Lower != lower || ack.Current != lower || ack.Upper != upper || ack.Revision != uint64(retry+2) {
++				t.Fatalf("suffix retry %d changed the paused window: %+v", retry, ack)
++			}
++			assertNoCapacityHTTPACK(t, ack)
++			if resident := f.cache.GetState(); resident.Filled != 8*piece {
++				t.Fatalf("suffix retry %d lost retained paused bytes: filled=%d pieces=%+v", retry, resident.Filled, resident.Pieces)
++			}
++			t.Logf("suffix retry=%d full_bytes=%d paused_window=[%d,%d) revision=%d no_capacity_stop", retry, len(data), ack.Lower, ack.Upper, ack.Revision)
++		}
++	})
++
++	t.Run("quota-short-206-publishes-exact-proof", func(t *testing.T) {
++		f := newCapacityHTTPFixture(t, length, quota)
++		response, data, err := f.get(t, "capacity-http", capacityHTTPNonce, start, end)
++		wantRange := fmt.Sprintf("bytes %d-%d/%d", start, end-1, length)
++		if response.StatusCode != http.StatusPartialContent || response.ContentLength != end-start || response.Header.Get("Content-Range") != wantRange {
++			t.Fatalf("HTTP status=%d length=%d range=%q", response.StatusCode, response.ContentLength, response.Header.Get("Content-Range"))
++		}
++		if !errors.Is(err, io.ErrUnexpectedEOF) || !bytes.Equal(data, f.payload[start:quota]) {
++			t.Fatalf("quota response: bytes=%d want=%d readErr=%v", len(data), quota-start, err)
++		}
++		ack := f.ack(t)
++		want := torrstor.PlaybackPrefetchStop{Reason: "capacity", RequestID: capacityHTTPNonce,
++			FileIndex: 1, RangeStart: start, RangeEnd: end, NextOffset: quota, Revision: 1}
++		if ack.Revision != 2 || ack.PrefetchStop == nil || *ack.PrefetchStop != want {
++			t.Fatalf("next ACK: %+v, stop=%+v want=%+v", ack, ack.PrefetchStop, want)
++		}
++		encoded, err := json.Marshal(ack)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var wire struct {
++			Stop struct {
++				Reason   string `json:"reason"`
++				Request  string `json:"request_id"`
++				File     int    `json:"file_index"`
++				Start    int64  `json:"range_start"`
++				End      int64  `json:"range_end"`
++				Next     int64  `json:"next_offset"`
++				Revision uint64 `json:"revision"`
++			} `json:"prefetch_stop"`
++		}
++		if err := json.Unmarshal(encoded, &wire); err != nil {
++			t.Fatal(err)
++		}
++		if wire.Stop.Reason != "capacity" || wire.Stop.Request != capacityHTTPNonce || wire.Stop.File != 1 || wire.Stop.Start != start || wire.Stop.End != end || wire.Stop.Next != start+int64(len(data)) || wire.Stop.Revision != 1 {
++			t.Fatalf("incorrect wire proof: %s", encoded)
++		}
++		t.Logf("HTTP206 promised=%d actual=%d error=%v ACK=%s", response.ContentLength, len(data), err, encoded)
++	})
++
++	t.Run("generic-missing-window-short-response", func(t *testing.T) {
++		f := newCapacityHTTPFixture(t, length, quota)
++		response, data, err := f.get(t, "unmatched-consumer", capacityHTTPNonce, start, end)
++		if response.StatusCode != http.StatusPartialContent || len(data) != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
++			t.Fatalf("generic short response: status=%d bytes=%d err=%v", response.StatusCode, len(data), err)
++		}
++		ack, updateErr := f.cache.UpdatePlaybackWindow(1, 0, length, "unmatched-consumer", 0, 0, length, 2, false)
++		if updateErr != nil {
++			t.Fatal(updateErr)
++		}
++		assertNoCapacityHTTPACK(t, ack)
++	})
++
++	t.Run("completed-requested-range", func(t *testing.T) {
++		f := newCapacityHTTPFixture(t, length, quota)
++		response, data, err := f.get(t, "capacity-http", capacityHTTPNonce, start, quota)
++		if response.StatusCode != http.StatusPartialContent || err != nil || !bytes.Equal(data, f.payload[start:quota]) {
++			t.Fatalf("complete response: status=%d bytes=%d err=%v", response.StatusCode, len(data), err)
++		}
++		assertNoCapacityHTTPProof(t, f)
++	})
++
++	t.Run("file-eof", func(t *testing.T) {
++		f := newCapacityHTTPFixture(t, quota, quota)
++		response, data, err := f.get(t, "capacity-http", capacityHTTPNonce, start, end)
++		if response.StatusCode != http.StatusPartialContent || response.ContentLength != quota-start || err != nil || !bytes.Equal(data, f.payload[start:quota]) {
++			t.Fatalf("file EOF response: status=%d length=%d bytes=%d err=%v", response.StatusCode, response.ContentLength, len(data), err)
++		}
++		assertNoCapacityHTTPProof(t, f)
++	})
++
++	for _, invalid := range []string{"", "not-a-uuid", "0ab12cd3-4567-489a-bcde-0123456789ag"} {
++		t.Run("invalid-request-id/"+invalid, func(t *testing.T) {
++			f := newCapacityHTTPFixture(t, length, quota)
++			response, data, err := f.get(t, "capacity-http", invalid, start, end)
++			if response.StatusCode != http.StatusPartialContent || !errors.Is(err, io.ErrUnexpectedEOF) || !bytes.Equal(data, f.payload[start:quota]) {
++				t.Fatalf("unidentified response: status=%d bytes=%d err=%v", response.StatusCode, len(data), err)
++			}
++			assertNoCapacityHTTPProof(t, f)
++		})
++	}
++
++	for _, mode := range []string{"writer-error", "short-write", "context-canceled"} {
++		t.Run(mode, func(t *testing.T) {
++			f := newCapacityHTTPFixture(t, length, quota)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			req := capacityHTTPRequest(t, "http://localhost", "capacity-http", capacityHTTPNonce, start, end).WithContext(ctx)
++			writer := &capacityHTTPFaultWriter{ResponseRecorder: httptest.NewRecorder(), mode: mode, cancel: cancel}
++			if err := f.torrent.Stream(1, req, writer); err != nil {
++				t.Fatal(err)
++			}
++			if writer.Code != http.StatusPartialContent || writer.calls == 0 {
++				t.Fatalf("fault path not exercised: status=%d calls=%d", writer.Code, writer.calls)
++			}
++			if mode == "context-canceled" && !errors.Is(req.Context().Err(), context.Canceled) {
++				t.Fatal("request was not canceled")
++			}
++			assertNoCapacityHTTPProof(t, f)
++		})
++	}
++
++	t.Run("cancel-after-capacity-source-eof", func(t *testing.T) {
++		f := newCapacityHTTPFixture(t, length, quota)
++		base, cancel := context.WithCancel(context.Background())
++		defer cancel()
++		ctx := &capacityHTTPPublicationCancelContext{Context: base, cancel: cancel}
++		req := capacityHTTPRequest(t, "http://localhost", "capacity-http", capacityHTTPNonce, start, end).WithContext(ctx)
++		writer := httptest.NewRecorder()
++		if err := f.torrent.Stream(1, req, writer); err != nil {
++			t.Fatal(err)
++		}
++		if writer.Code != http.StatusPartialContent || !bytes.Equal(writer.Body.Bytes(), f.payload[start:quota]) {
++			t.Fatalf("late cancel did not follow the full quota prefix: status=%d bytes=%d", writer.Code, writer.Body.Len())
++		}
++		if ctx.calls != 1 || !errors.Is(base.Err(), context.Canceled) {
++			t.Fatalf("publication boundary was not canceled: checks=%d err=%v", ctx.calls, base.Err())
++		}
++		assertNoCapacityHTTPProof(t, f)
++	})
++
++	t.Run("actual-http-client-disconnect", func(t *testing.T) {
++		f := newCapacityHTTPFixture(t, length, quota)
++		handlerDone := make(chan error, 1)
++		disconnected := make(chan struct{}, 1)
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++			writer := &capacityHTTPDisconnectWriter{ResponseWriter: w, context: req.Context(), disconnected: disconnected}
++			handlerDone <- f.torrent.Stream(1, req, writer)
++		}))
++		defer server.Close()
++		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++		defer cancel()
++		req := capacityHTTPRequest(t, server.URL, "capacity-http", capacityHTTPNonce, start, end).WithContext(ctx)
++		client := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
++		defer client.CloseIdleConnections()
++		response, err := client.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer response.Body.Close()
++		first := make([]byte, 1)
++		if response.StatusCode != http.StatusPartialContent {
++			t.Fatalf("disconnect response status=%d", response.StatusCode)
++		}
++		if _, err := io.ReadFull(response.Body, first); err != nil || first[0] != f.payload[start] {
++			t.Fatalf("disconnect before actual payload: first=%v err=%v", first, err)
++		}
++		cancel()
++		select {
++		case <-disconnected:
++		case <-time.After(3 * time.Second):
++			t.Fatal("server did not observe the real client's disconnect")
++		}
++		if err := <-handlerDone; err != nil {
++			t.Fatal(err)
++		}
++		if f.cache.Readers() != 0 || GetActiveStreams() != 0 {
++			t.Fatal("disconnected Stream retained its HTTP reader")
++		}
++		assertNoCapacityHTTPProof(t, f)
++	})
++}
++
++// Request cancellation can race the end of ServeContent. Cancel exactly when
++// Stream checks the context after the complete quota prefix and capacity EOF,
++// before it can publish the otherwise-valid proof. Done/Err remain consistent.
++type capacityHTTPPublicationCancelContext struct {
++	context.Context
++	cancel context.CancelFunc
++	calls  int
++}
++
++func (c *capacityHTTPPublicationCancelContext) Err() error {
++	c.calls++
++	c.cancel()
++	return c.Context.Err()
++}
++
++func TestPrefetchCapacityResponseWriterCountsActualPrefix(t *testing.T) {
++	for _, mode := range []string{"writer-error", "short-write", "writer-error-after-all-bytes"} {
++		t.Run(mode, func(t *testing.T) {
++			fault := &capacityHTTPFaultWriter{ResponseRecorder: httptest.NewRecorder(), mode: mode}
++			writer := &prefetchResponseWriter{ResponseWriter: fault, status: http.StatusOK}
++			writer.WriteHeader(http.StatusPartialContent)
++			data := bytes.Repeat([]byte{23}, 32)
++			n, err := writer.Write(data)
++			want := len(data) / 2
++			if mode == "writer-error-after-all-bytes" {
++				want = len(data)
++			}
++			if n != want || writer.written != int64(want) || !writer.failed || writer.status != http.StatusPartialContent {
++				t.Fatalf("mode=%s n=%d count=%d failed=%v status=%d", mode, n, writer.written, writer.failed, writer.status)
++			}
++			if (mode != "short-write") != errors.Is(err, io.ErrClosedPipe) {
++				t.Fatalf("mode=%s err=%v", mode, err)
++			}
++		})
++	}
++	t.Run("successful-prefix", func(t *testing.T) {
++		writer := &prefetchResponseWriter{ResponseWriter: httptest.NewRecorder(), status: http.StatusOK}
++		writer.WriteHeader(http.StatusPartialContent)
++		if n, err := writer.Write([]byte("actual prefix")); n != 13 || err != nil || writer.written != 13 || writer.failed {
++			t.Fatalf("n=%d err=%v count=%d failed=%v", n, err, writer.written, writer.failed)
++		}
++	})
++}
++
++// Flush a real TCP response prefix and hold the handler until the remote client
++// cancels. This makes disconnect ordering deterministic even with a RAM source.
++type capacityHTTPDisconnectWriter struct {
++	http.ResponseWriter
++	context      context.Context
++	disconnected chan<- struct{}
++}
++
++func (w *capacityHTTPDisconnectWriter) Write(p []byte) (int, error) {
++	n, err := w.ResponseWriter.Write(p)
++	if err != nil {
++		return n, err
++	}
++	w.ResponseWriter.(http.Flusher).Flush()
++	select {
++	case <-w.context.Done():
++		w.disconnected <- struct{}{}
++		return n, w.context.Err()
++	case <-time.After(3 * time.Second):
++		return n, errors.New("client did not disconnect")
++	}
++}
++
++// Force HTTP write and cancellation failures after a real source read. The
++// worker's buffered source may already have advanced farther than these writes.
++type capacityHTTPFaultWriter struct {
++	*httptest.ResponseRecorder
++	mode   string
++	cancel context.CancelFunc
++	calls  int
++}
++
++func (w *capacityHTTPFaultWriter) Write(p []byte) (int, error) {
++	w.calls++
++	switch w.mode {
++	case "writer-error":
++		n, _ := w.ResponseRecorder.Write(p[:len(p)/2])
++		return n, io.ErrClosedPipe
++	case "writer-error-after-all-bytes":
++		n, _ := w.ResponseRecorder.Write(p)
++		return n, io.ErrClosedPipe
++	case "short-write":
++		return w.ResponseRecorder.Write(p[:len(p)/2])
++	case "context-canceled":
++		n, err := w.ResponseRecorder.Write(p)
++		w.cancel()
++		return n, err
++	default:
++		panic("unknown fault mode")
++	}
++}
+diff --git a/server/torr/storage/torrstor/cache.go b/server/torr/storage/torrstor/cache.go
+--- a/server/torr/storage/torrstor/cache.go
++++ b/server/torr/storage/torrstor/cache.go
+@@ -27,8 +27,14 @@
+ 	filled   int64
+ 	hash     metainfo.Hash
+ 
+-	pieceLength int64
+-	pieceCount  int
++	pieceLength      int64
++	pieceCount       int
++	totalLength      int64
++	muPolicy         sync.Mutex
++	windows          map[string]*playbackWindow
++	prefetchStops    map[string]PlaybackPrefetchStop
++	prefetchRequests map[string]string
++	managedPolicy    bool
+ 
+ 	// pieces content is immutable after Init; muPieces guards the map
+ 	// reference itself (nilled in Close), so holders of a snapshot may
+@@ -39,9 +45,10 @@
+ 	readers   map[*Reader]struct{}
+ 	muReaders sync.RWMutex
+ 
+-	isRemove atomic.Bool
+-	isClosed atomic.Bool
+-	muRemove sync.Mutex
++	isRemove    atomic.Bool
++	isClosed    atomic.Bool
++	retryQueued atomic.Bool
++	muRemove    sync.Mutex
+ 	// muPrio serializes clearPriority and setLoadPriority so that the priority
+ 	// reset of a reader that has just closed cannot wipe the priorities a
+ 	// freshly created reader has already set.
+@@ -56,6 +63,7 @@
+ 		pieces:   make(map[int]*Piece),
+ 		storage:  storage,
+ 		readers:  make(map[*Reader]struct{}),
++		windows:  make(map[string]*playbackWindow),
+ 	}
+ 
+ 	return ret
+@@ -69,6 +77,7 @@
+ 
+ 	c.pieceLength = info.PieceLength
+ 	c.pieceCount = info.NumPieces()
++	c.totalLength = info.TotalLength()
+ 	c.hash = hash
+ 
+ 	if settings.BTsets.UseDisk {
+@@ -105,7 +114,7 @@
+ 			continue
+ 		}
+ 		if c.GetUseReaders() > 0 {
+-			c.getRemPieces()
++			c.cleanPieces()
+ 		}
+ 	}
+ }
+@@ -199,14 +208,15 @@
+ 	var fill int64 = 0
+ 
+ 	for _, p := range c.getPieces() {
+-		if p.Size > 0 {
+-			fill += p.Size
++		ps := p.snapshot()
++		if ps.size > 0 {
++			fill += ps.size
+ 			piecesState[p.Id] = state.ItemState{
+ 				Id:        p.Id,
+-				Size:      p.Size,
++				Size:      ps.size,
+ 				Length:    c.pieceLength,
+-				Completed: p.Complete,
+-				Priority:  int(c.torrent.PieceState(p.Id).Priority),
++				Completed: ps.complete,
++				Priority:  c.piecePriority(p.Id),
+ 			}
+ 		}
+ 	}
+@@ -223,7 +233,6 @@
+ 		})
+ 	}
+ 
+-	c.filled = fill
+ 	cState.Capacity = c.capacity
+ 	cState.PiecesLength = c.pieceLength
+ 	cState.PiecesCount = c.pieceCount
+@@ -235,95 +244,94 @@
+ }
+ 
+ func (c *Cache) cleanPieces() {
+-	if c.isRemove.Load() || c.isClosed.Load() {
+-		return
+-	}
+-
+-	// Protection against concurrent deletion
+-	if !c.muRemove.TryLock() {
+-		return // Cleanup is already in progress in another goroutine
++	if c.isClosed.Load() || !c.muRemove.TryLock() {
++		return
+ 	}
+ 	defer c.muRemove.Unlock()
+-
+-	c.isRemove.Store(true)
+-	defer func() { c.isRemove.Store(false) }()
+-
+-	remPieces := c.getRemPieces()
+-	if c.filled > c.capacity {
+-		rems := (c.filled-c.capacity)/c.pieceLength + 1
+-		for _, p := range remPieces {
+-			c.removePiece(p)
+-			rems--
+-			if rems <= 0 {
+-				utils.FreeOSMemGC()
+-				return
+-			}
+-		}
+-	}
++	c.cleanPiecesLocked()
++}
++func (c *Cache) cleanPiecesSync() {
++	if c.isClosed.Load() {
++		return
++	}
++	c.muRemove.Lock()
++	defer c.muRemove.Unlock()
++	c.cleanPiecesLocked()
++}
++func (c *Cache) cleanPiecesLocked() {
++	for _, r := range c.readersSnapshot() {
++		r.checkReader()
++	}
++	c.muPolicy.Lock()
++	for pass := 0; pass < 2; pass++ {
++		c.replanWindowsLocked()
++		candidates, filled := c.remPiecesLocked()
++		for _, p := range candidates {
++			if !c.managedPolicy && filled <= c.capacity {
++				continue
++			}
++			if size, ok := p.releaseCached(); ok {
++				filled -= size
++			} else if c.managedPolicy && p.snapshot().size > 0 {
++				// A pending library write/hash/current reader may temporarily refuse an
++				// orphan eviction. Retry after it settles even when every HTTP reader is
++				// already closed; no new download priorities are created by this retry.
++				c.scheduleCleanupRetry()
++			}
++		}
++	}
++	c.replanWindowsLocked()
++	c.muPolicy.Unlock()
++	c.applyReaderReadahead()
++	c.clearPriority()
++	c.setLoadPriority(nil)
+ }
+ 
+ func (c *Cache) getRemPieces() []*Piece {
+-	readers := c.readersSnapshot()
+-
+-	// Collect read ranges from active readers
+-	ranges := make([]Range, 0)
+-	for _, r := range readers {
+-		r.checkReader()
+-		if r.isUse {
+-			ranges = append(ranges, r.getPiecesRange())
+-		}
+-	}
+-	ranges = mergeRange(ranges)
+-
++	c.muPolicy.Lock()
++	defer c.muPolicy.Unlock()
++	candidates, _ := c.remPiecesLocked()
++	return candidates
++}
++
++func (c *Cache) remPiecesLocked() ([]*Piece, int64) {
++	ranges := c.protectionRangesLocked()
+ 	piecesRemove := make([]*Piece, 0)
+ 	fill := int64(0)
+-
+-	// Determine which chunks can be deleted
+ 	for id, p := range c.getPieces() {
+-		if p.Size > 0 {
+-			fill += p.Size
+-		}
+-		if len(ranges) > 0 {
+-			if !inRanges(ranges, id) {
+-				if p.Size > 0 && !c.isIdInFileBE(ranges, id) {
+-					piecesRemove = append(piecesRemove, p)
+-				}
+-			}
+-		} else {
+-			// When preloading, clear everything except the beginning and end of the file
+-			if p.Size > 0 && !c.isIdInFileBE(ranges, id) {
+-				piecesRemove = append(piecesRemove, p)
+-			}
+-		}
+-	}
+-
+-	c.clearPriority()
+-	c.setLoadPriority(ranges)
+-
+-	// Complete pieces first, oldest first; a piece still downloading goes last. The torrent
+-	// client never re-requests chunks it has received, so evicting their bytes makes a
+-	// responsive reader that comes back to them read zeros.
++		ps := p.snapshot()
++		fill += ps.size
++		if ps.size > 0 && (ps.complete || c.supportsPartialDiscard()) && !inRanges(ranges, id) && !c.isIdInFileBE(ranges, id) {
++			piecesRemove = append(piecesRemove, p)
++		}
++	}
+ 	sort.Slice(piecesRemove, func(i, j int) bool {
+-		if piecesRemove[i].Complete != piecesRemove[j].Complete {
+-			return piecesRemove[i].Complete
+-		}
+-		return piecesRemove[i].Accessed < piecesRemove[j].Accessed
++		wi, wj := c.watchedPieceLocked(piecesRemove[i].Id), c.watchedPieceLocked(piecesRemove[j].Id)
++		if wi != wj {
++			return wi
++		}
++		return piecesRemove[i].snapshot().accessed < piecesRemove[j].snapshot().accessed
+ 	})
+-
+-	c.filled = fill
+-	return piecesRemove
++	return piecesRemove, fill
++}
++
++func (c *Cache) piecePriority(id int) int {
++	if c.torrent == nil {
++		return 0
++	}
++	return int(c.torrent.PieceState(id).Priority)
+ }
+ 
+ func (c *Cache) setLoadPriority(ranges []Range) {
+ 	readers := c.readersSnapshot()
+ 	pieces := c.getPieces()
+-	if len(readers) == 0 || pieces == nil {
++	if len(readers) == 0 || pieces == nil || c.torrent == nil {
+ 		return
+ 	}
+ 	c.muPrio.Lock()
+ 	defer c.muPrio.Unlock()
+ 	for _, r := range readers {
+-		if !r.isUse {
++		if !r.active() || r.consumer != "" {
+ 			continue
+ 		}
+ 		if c.isIdInFileBE(ranges, r.getReaderPiece()) {
+@@ -331,11 +339,11 @@
+ 		}
+ 		readerPos := r.getReaderPiece()
+ 		readerRAHPos := r.getReaderRAHPiece()
+-		end := r.getPiecesRange().End
++		end := r.getLoadRange().End
+ 		count := settings.BTsets.ConnectionsLimit / len(readers) // max concurrent loading blocks
+ 		limit := 0
+-		for i := readerPos; i < end && limit < count; i++ {
+-			if !pieces[i].Complete {
++		for i := readerPos; i <= end && i < c.pieceCount && limit < count; i++ {
++			if i >= 0 && !pieces[i].snapshot().complete {
+ 				if i == readerPos {
+ 					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityNow)
+ 				} else if i == readerPos+1 {
+@@ -361,6 +369,9 @@
+ 	}
+ 
+ 	for _, rng := range ranges {
++		if rng.File == nil {
++			continue
++		}
+ 		ss := int(rng.File.Offset() / c.pieceLength)
+ 		se := int((rng.File.Offset() + FileRangeNotDelete) / c.pieceLength)
+ 
+@@ -379,18 +390,27 @@
+ ////////
+ 
+ func (c *Cache) NewReader(file *torrent.File) *Reader {
+-	return newReader(file, c)
++	return newReader(file, c, "")
++}
++
++func (c *Cache) NewPlaybackReader(file *torrent.File, consumer string) *Reader {
++	return newReader(file, c, consumer)
++}
++
++// NewPrefetchReaderAt binds a finite request's validated starting position
++// before policy registration. No cache quota is spent on a temporary byte-zero
++// cursor, and missing data is requested only by the first actual Read.
++func (c *Cache) NewPrefetchReaderAt(file *torrent.File, consumer string, start int64) *Reader {
++	return newReaderAt(file, c, consumer, start, true)
+ }
+ 
+ func (c *Cache) GetUseReaders() int {
+ 	if c == nil {
+ 		return 0
+ 	}
+-	c.muReaders.RLock()
+-	defer c.muReaders.RUnlock()
+ 	readers := 0
+-	for reader := range c.readers {
+-		if reader.isUse {
++	for _, reader := range c.readersSnapshot() {
++		if reader.active() {
+ 			readers++
+ 		}
+ 	}
+@@ -425,14 +445,14 @@
+ 	// player. A mutex provides the same ordering without the race window.
+ 	c.muPrio.Lock()
+ 	defer c.muPrio.Unlock()
++	c.muPolicy.Lock()
+ 	ranges := make([]Range, 0)
+ 	for _, r := range c.readersSnapshot() {
+-		r.checkReader()
+-		if r.isUse {
+-			ranges = append(ranges, r.getPiecesRange())
+-		}
+-	}
+-	ranges = mergeRange(ranges)
++		if r.active() {
++			ranges = append(ranges, r.getLoadRange())
++		}
++	}
++	c.muPolicy.Unlock()
+ 
+ 	for id := range c.getPieces() {
+ 		if len(ranges) > 0 {
+@@ -455,3 +475,23 @@
+ 	}
+ 	return c.capacity
+ }
++
++func (c *Cache) supportsPartialDiscard() bool {
++	if c.torrent == nil || c.pieceCount == 0 {
++		return false
++	}
++	_, ok := any(c.torrent.Piece(0)).(pieceDiscarder)
++	return ok
++}
++
++func (c *Cache) scheduleCleanupRetry() {
++	if c.isClosed.Load() || !c.retryQueued.CompareAndSwap(false, true) {
++		return
++	}
++	time.AfterFunc(100*time.Millisecond, func() {
++		c.retryQueued.Store(false)
++		if !c.isClosed.Load() {
++			c.cleanPieces()
++		}
++	})
++}
+diff --git a/server/torr/storage/torrstor/diskpiece.go b/server/torr/storage/torrstor/diskpiece.go
+--- a/server/torr/storage/torrstor/diskpiece.go
++++ b/server/torr/storage/torrstor/diskpiece.go
+@@ -5,7 +5,6 @@
+ 	"os"
+ 	"path/filepath"
+ 	"strconv"
+-	"sync"
+ 	"time"
+ 
+ 	"server/log"
+@@ -16,8 +15,6 @@
+ 	piece *Piece
+ 
+ 	name string
+-
+-	mu sync.RWMutex
+ }
+ 
+ func NewDiskPiece(p *Piece) *DiskPiece {
+@@ -32,8 +29,8 @@
+ }
+ 
+ func (p *DiskPiece) WriteAt(b []byte, off int64) (n int, err error) {
+-	p.mu.Lock()
+-	defer p.mu.Unlock()
++	p.piece.mu.Lock()
++	defer p.piece.mu.Unlock()
+ 
+ 	ff, err := os.OpenFile(p.name, os.O_RDWR|os.O_CREATE, 0o666)
+ 	if err != nil {
+@@ -52,8 +49,8 @@
+ }
+ 
+ func (p *DiskPiece) ReadAt(b []byte, off int64) (n int, err error) {
+-	p.mu.Lock()
+-	defer p.mu.Unlock()
++	p.piece.mu.Lock()
++	defer p.piece.mu.Unlock()
+ 
+ 	ff, err := os.OpenFile(p.name, os.O_RDONLY, 0o666)
+ 	if os.IsNotExist(err) {
+@@ -74,12 +71,5 @@
+ 	return n, err
+ }
+ 
+-func (p *DiskPiece) Release() {
+-	p.mu.Lock()
+-	defer p.mu.Unlock()
+-
+-	p.piece.Size = 0
+-	p.piece.Complete = false
+-
+-	os.Remove(p.name)
+-}
++func (p *DiskPiece) releaseLocked() { os.Remove(p.name) }
++func (p *DiskPiece) Release()       { p.piece.Release() }
+diff --git a/server/torr/storage/torrstor/eviction_test.go b/server/torr/storage/torrstor/eviction_test.go
+--- a/server/torr/storage/torrstor/eviction_test.go
++++ b/server/torr/storage/torrstor/eviction_test.go
+@@ -2,32 +2,20 @@
+ 
+ import "testing"
+ 
+-// A piece that is still downloading is offered for eviction only after every complete one,
+-// even when it is older. The torrent client keeps counting the chunks it has already
+-// received as present and never requests them again, so once their bytes are dropped a
+-// responsive reader that comes back to that spot is served zeros.
+-func TestGetRemPiecesEvictsDownloadingPiecesLast(t *testing.T) {
+-	c := &Cache{
+-		pieces:  make(map[int]*Piece),
+-		readers: make(map[*Reader]struct{}),
+-	}
+-	// Pieces 0 and 1 are the oldest and only partly downloaded.
++// Incomplete chunks must never be offered for eviction: anacrolix remembers
++// received chunks and can serve zeroes if their backing bytes are discarded.
++func TestGetRemPiecesNeverEvictsDownloadingPieces(t *testing.T) {
++	c := &Cache{pieces: make(map[int]*Piece), readers: make(map[*Reader]struct{})}
+ 	for id := 0; id < 6; id++ {
+ 		c.pieces[id] = &Piece{Id: id, Size: 1 << 10, Complete: id >= 2, Accessed: int64(id), cache: c}
+ 	}
+-
+ 	order := c.getRemPieces()
+-
+-	if len(order) != len(c.pieces) {
+-		t.Fatalf("got %d eviction candidates, want %d", len(order), len(c.pieces))
++	if len(order) != 4 {
++		t.Fatalf("candidates %v, want complete 2..5 only", ids(order))
+ 	}
+-	complete := len(order) - 2
+ 	for i, p := range order {
+-		if (i < complete) != p.Complete {
+-			t.Fatalf("eviction order %v: piece %d (complete=%v) at position %d", ids(order), p.Id, p.Complete, i)
+-		}
+-		if i > 0 && order[i-1].Complete == p.Complete && order[i-1].Accessed > p.Accessed {
+-			t.Fatalf("eviction order %v is not oldest first within a group", ids(order))
++		if p.Id != i+2 {
++			t.Fatalf("order %v, want complete pieces oldest first", ids(order))
+ 		}
+ 	}
+ }
+diff --git a/server/torr/storage/torrstor/mempiece.go b/server/torr/storage/torrstor/mempiece.go
+--- a/server/torr/storage/torrstor/mempiece.go
++++ b/server/torr/storage/torrstor/mempiece.go
+@@ -2,7 +2,6 @@
+ 
+ import (
+ 	"io"
+-	"sync"
+ 	"time"
+ )
+ 
+@@ -10,7 +9,6 @@
+ 	piece *Piece
+ 
+ 	buffer []byte
+-	mu     sync.RWMutex
+ }
+ 
+ func NewMemPiece(p *Piece) *MemPiece {
+@@ -18,8 +16,8 @@
+ }
+ 
+ func (p *MemPiece) WriteAt(b []byte, off int64) (n int, err error) {
+-	p.mu.Lock()
+-	defer p.mu.Unlock()
++	p.piece.mu.Lock()
++	defer p.piece.mu.Unlock()
+ 
+ 	if p.buffer == nil {
+ 		go p.piece.cache.cleanPieces()
+@@ -35,8 +33,8 @@
+ }
+ 
+ func (p *MemPiece) ReadAt(b []byte, off int64) (n int, err error) {
+-	p.mu.RLock()
+-	defer p.mu.RUnlock()
++	p.piece.mu.Lock()
++	defer p.piece.mu.Unlock()
+ 
+ 	size := len(b)
+ 	if size+int(off) > len(p.buffer) {
+@@ -59,12 +57,5 @@
+ 	return n, nil
+ }
+ 
+-func (p *MemPiece) Release() {
+-	p.mu.Lock()
+-	defer p.mu.Unlock()
+-	if p.buffer != nil {
+-		p.buffer = nil
+-	}
+-	p.piece.Size = 0
+-	p.piece.Complete = false
+-}
++func (p *MemPiece) releaseLocked() { p.buffer = nil }
++func (p *MemPiece) Release()       { p.piece.Release() }
+diff --git a/server/torr/storage/torrstor/piece.go b/server/torr/storage/torrstor/piece.go
+--- a/server/torr/storage/torrstor/piece.go
++++ b/server/torr/storage/torrstor/piece.go
+@@ -4,6 +4,7 @@
+ 	"github.com/anacrolix/torrent"
+ 	"github.com/anacrolix/torrent/storage"
+ 	"server/settings"
++	"sync"
+ )
+ 
+ type Piece struct {
+@@ -19,6 +20,7 @@
+ 	dPiece *DiskPiece `json:"-"`
+ 
+ 	cache *Cache `json:"-"`
++	mu    sync.Mutex
+ }
+ 
+ func NewPiece(id int, cache *Cache) *Piece {
+@@ -52,30 +54,87 @@
+ }
+ 
+ func (p *Piece) MarkComplete() error {
++	p.mu.Lock()
+ 	p.Complete = true
++	p.mu.Unlock()
++	go p.cache.cleanPieces()
+ 	return nil
+ }
+ 
+ func (p *Piece) MarkNotComplete() error {
++	p.mu.Lock()
+ 	p.Complete = false
++	p.mu.Unlock()
+ 	return nil
+ }
+ 
+ func (p *Piece) Completion() storage.Completion {
++	p.mu.Lock()
++	defer p.mu.Unlock()
+ 	return storage.Completion{
+ 		Complete: p.Complete,
+ 		Ok:       true,
+ 	}
+ }
+ 
+-func (p *Piece) Release() {
+-	if !settings.BTsets.UseDisk {
+-		p.mPiece.Release()
+-	} else {
+-		p.dPiece.Release()
++type pieceSnapshot struct {
++	size     int64
++	complete bool
++	accessed int64
++}
++
++func (p *Piece) snapshot() pieceSnapshot {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return pieceSnapshot{p.Size, p.Complete, p.Accessed}
++}
++
++// The pinned worker extension atomically cancels/resets the library
++// chunk state before discarded partial data can be read or requested again.
++type pieceDiscarder interface{ TryDiscardData(func() bool) bool }
++
++func (p *Piece) releaseCached() (int64, bool) {
++	if p.cache.torrent != nil && p.mPiece != nil {
++		if discarder, ok := any(p.cache.torrent.Piece(p.Id)).(pieceDiscarder); ok {
++			size := int64(0)
++			discarded := discarder.TryDiscardData(func() bool {
++				p.mu.Lock()
++				defer p.mu.Unlock()
++				if p.Size == 0 {
++					return false
++				}
++				size = p.Size
++				p.mPiece.releaseLocked()
++				p.Size = 0
++				p.Complete = false
++				return true
++			})
++			return size, discarded
++		}
+ 	}
+-	// if !p.cache.isClosed {
+-	p.cache.torrent.Piece(p.Id).SetPriority(torrent.PiecePriorityNone)
+-	p.cache.torrent.Piece(p.Id).UpdateCompletion()
+-	//}
++	// Stock upstream has no atomic dirty-chunk reset. Never discard a partial
++	// payload through this compatibility path.
++	return p.releaseComplete()
+ }
++func (p *Piece) releaseComplete() (int64, bool) {
++	p.mu.Lock()
++	if !p.Complete || p.Size == 0 {
++		p.mu.Unlock()
++		return 0, false
++	}
++	size := p.Size
++	if p.mPiece != nil {
++		p.mPiece.releaseLocked()
++	} else if p.dPiece != nil {
++		p.dPiece.releaseLocked()
++	}
++	p.Size = 0
++	p.Complete = false
++	p.mu.Unlock()
++	if p.cache.torrent != nil {
++		p.cache.torrent.Piece(p.Id).SetPriority(torrent.PiecePriorityNone)
++		p.cache.torrent.Piece(p.Id).UpdateCompletion()
++	}
++	return size, true
++}
++func (p *Piece) Release() { p.releaseCached() }
+diff --git a/server/torr/storage/torrstor/playback_window.go b/server/torr/storage/torrstor/playback_window.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/storage/torrstor/playback_window.go
+@@ -0,0 +1,404 @@
++package torrstor
++
++import (
++	"errors"
++	"sort"
++)
++
++var (
++	ErrStalePlaybackRevision = errors.New("playback window revision is stale")
++	ErrInvalidPlaybackWindow = errors.New("invalid playback window")
++	ErrPlaybackCacheClosed   = errors.New("playback cache is closed")
++)
++
++// PlaybackWindow offsets are file-relative bytes. Upper is exclusive. Pieces
++// overlapping current are indivisible: their necessary overhang is retained.
++type PlaybackWindow struct {
++	Lower        int64                 `json:"lower"`
++	Current      int64                 `json:"current"`
++	Upper        int64                 `json:"upper"`
++	PieceLength  int64                 `json:"piece_length"`
++	Revision     uint64                `json:"revision"`
++	PrefetchStop *PlaybackPrefetchStop `json:"prefetch_stop,omitempty"`
++}
++
++type playbackWindow struct {
++	PlaybackWindow
++	fileIndex                      int
++	fileOffset, fileLength         int64
++	requestedLower, requestedUpper int64
++}
++
++// HasPlaybackWindows reports explicit playback-session ownership. A paused
++// session can have no HTTP readers while retaining its already cached window.
++// This ownership prevents idle expiry without requesting any missing pieces.
++func (c *Cache) HasPlaybackWindows() bool {
++	if c == nil {
++		return false
++	}
++	c.muPolicy.Lock()
++	defer c.muPolicy.Unlock()
++	return !c.isClosed.Load() && len(c.windows) > 0
++}
++
++// UpdatePlaybackWindow installs a consumer's requested range, returning the
++// authoritative, piece-rounded range after sharing the cache's forward budget.
++// Revisions remain in Storage after release/cache close, so late HTTP requests
++// cannot resurrect an older range. A higher revision may reuse a released token.
++func (c *Cache) UpdatePlaybackWindow(fileIndex int, fileOffset, fileLength int64, consumer string, lower, current, upper int64, revision uint64, remove bool) (PlaybackWindow, error) {
++	if consumer == "" || revision == 0 || (!remove && (fileIndex <= 0 || fileOffset < 0 || fileLength <= 0 || lower < 0 || lower > current || current < 0 || current >= fileLength || upper <= current || upper > fileLength)) {
++		return PlaybackWindow{}, ErrInvalidPlaybackWindow
++	}
++	c.muPolicy.Lock()
++	if c.isClosed.Load() {
++		c.muPolicy.Unlock()
++		return PlaybackWindow{}, ErrPlaybackCacheClosed
++	}
++	c.storage.muWindows.Lock()
++	revisions := c.storage.windowRevisions[c.hash]
++	if revisions == nil {
++		revisions = make(map[string]uint64)
++		c.storage.windowRevisions[c.hash] = revisions
++	}
++	if revision <= revisions[consumer] {
++		c.storage.muWindows.Unlock()
++		c.muPolicy.Unlock()
++		return PlaybackWindow{}, ErrStalePlaybackRevision
++	}
++	revisions[consumer] = revision
++	c.storage.muWindows.Unlock()
++	c.managedPolicy = true
++	if remove {
++		delete(c.prefetchStops, consumer)
++		delete(c.prefetchRequests, consumer)
++		delete(c.windows, consumer)
++	} else {
++		if old := c.windows[consumer]; old != nil && (old.fileIndex != fileIndex || old.fileOffset != fileOffset || old.fileLength != fileLength) {
++			delete(c.prefetchStops, consumer)
++			delete(c.prefetchRequests, consumer)
++		}
++		c.windows[consumer] = &playbackWindow{PlaybackWindow: PlaybackWindow{Lower: lower, Current: current, Upper: upper, PieceLength: c.pieceLength, Revision: revision}, fileIndex: fileIndex, fileOffset: fileOffset, fileLength: fileLength, requestedLower: lower, requestedUpper: upper}
++	}
++	c.replanWindowsLocked()
++	result := PlaybackWindow{PieceLength: c.pieceLength, Revision: revision}
++	if w := c.windows[consumer]; w != nil {
++		result = c.playbackWindowSnapshotLocked(consumer, w)
++	}
++	c.muPolicy.Unlock()
++	c.applyReaderReadahead()
++	c.cleanPiecesSync()
++	c.muPolicy.Lock()
++	if w := c.windows[consumer]; w != nil && w.Revision == revision {
++		result = c.playbackWindowSnapshotLocked(consumer, w)
++	}
++	c.muPolicy.Unlock()
++	return result, nil
++}
++
++func (c *Cache) pieceBytes(id int) int64 {
++	length := c.pieceLength
++	if c.totalLength > 0 && int64(id+1)*length > c.totalLength {
++		length = c.totalLength - int64(id)*length
++	}
++	if length < 0 {
++		return 0
++	}
++	return length
++}
++
++func (w *playbackWindow) currentPiece(length int64) int {
++	return int((w.fileOffset + w.Current) / length)
++}
++func (w *playbackWindow) requestedLowerPiece(length int64) int {
++	lower := int((w.fileOffset + w.requestedLower + length - 1) / length)
++	if current := w.currentPiece(length); lower > current {
++		lower = current
++	}
++	return lower
++}
++func (w *playbackWindow) lowerPiece(length int64) int { return int((w.fileOffset + w.Lower) / length) }
++func (w *playbackWindow) endPiece(length int64) int {
++	return int((w.fileOffset + w.Upper - 1) / length)
++}
++
++// muPolicy serializes windows, reader I/O registration and eviction decisions.
++// Hard current/in-flight, unmanaged readers and incomplete pieces are never
++// sacrificed to a nominal capacity. History is shortened to fit. Remaining pieces are assigned forward
++// round-robin, counting pieces shared by several consumers only once.
++func (c *Cache) replanWindowsLocked() {
++	if c.pieceLength <= 0 || len(c.windows) == 0 {
++		c.configureManagedReadersLocked()
++		return
++	}
++	kept := make(map[int]bool)
++	add := func(start, end int) {
++		for id := start; id <= end && id < c.pieceCount; id++ {
++			if id >= 0 {
++				kept[id] = true
++			}
++		}
++	}
++	for _, r := range c.readersSnapshot() {
++		r.mu.Lock()
++		if !r.isClosed && r.isUse {
++			if r.consumer == "" {
++				rng := r.offsetRangeLocked()
++				add(r.getPieceNum(rng[0]), r.getPieceNum(rng[1]))
++				// Ordinary readers retain the legacy container head/tail protection.
++				head := int64(8 << 20)
++				if head < c.pieceLength {
++					head = c.pieceLength
++				}
++				add(r.getPieceNum(0), r.getPieceNum(min(head, r.file.Length())-1))
++				add(r.getPieceNum(max(0, r.file.Length()-head)), r.getPieceNum(r.file.Length()-1))
++			} else {
++				add(r.getPieceNum(r.offset), r.getPieceNum(r.offset))
++				if r.inFlight > 0 {
++					add(r.getPieceNum(r.readStart), r.getPieceNum(max(r.readStart, r.readEnd-1)))
++				}
++			}
++		}
++		r.mu.Unlock()
++	}
++	for id, p := range c.getPieces() {
++		s := p.snapshot()
++		if s.size > 0 && !s.complete {
++			kept[id] = true
++		}
++	}
++	keys := make([]string, 0, len(c.windows))
++	for key, w := range c.windows {
++		keys = append(keys, key)
++		current := w.currentPiece(c.pieceLength)
++		add(current, current)
++		w.Lower = max(0, int64(current)*c.pieceLength-w.fileOffset)
++		w.Upper = min(w.fileLength, int64(current+1)*c.pieceLength-w.fileOffset)
++	}
++	sort.Strings(keys)
++	used := int64(0)
++	for id := range kept {
++		used += c.pieceBytes(id)
++	}
++	// Reserve useful forward data beyond the current demux/read frontier
++	// before optional history. Assign contiguous pieces so the returned upper
++	// cannot authorize gaps that were omitted from the union budget.
++	frontiers := make(map[string]int)
++	for _, key := range keys {
++		frontiers[key] = c.windows[key].currentPiece(c.pieceLength)
++	}
++	for _, r := range c.readersSnapshot() {
++		r.mu.Lock()
++		if _, ok := c.readerWindowLocked(r); ok && r.isUse && !r.isClosed {
++			at := r.offset
++			if r.inFlight > 0 {
++				at = max(at, r.readEnd-1)
++			}
++			frontiers[r.consumer] = max(frontiers[r.consumer], r.getPieceNum(at))
++		}
++		r.mu.Unlock()
++	}
++	for {
++		progress := false
++		for _, key := range keys {
++			w := c.windows[key]
++			id := w.endPiece(c.pieceLength) + 1
++			if id > frontiers[key]+1 {
++				continue
++			}
++			end := min(w.fileLength, int64(id+1)*c.pieceLength-w.fileOffset)
++			if id >= c.pieceCount || end > w.requestedUpper || end <= w.Upper {
++				continue
++			}
++			cost := c.pieceBytes(id)
++			if !kept[id] && cost > c.capacity-used {
++				continue
++			}
++			if !kept[id] {
++				kept[id] = true
++				used += cost
++			}
++			w.Upper = end
++			progress = true
++		}
++		if !progress {
++			break
++		}
++	}
++	// Retain at most the requested history: current/in-flight requirements
++	// come first, and older history is shortened when the budget is small.
++	for {
++		progress := false
++		for _, key := range keys {
++			w := c.windows[key]
++			id := w.lowerPiece(c.pieceLength) - 1
++			if id < w.requestedLowerPiece(c.pieceLength) {
++				continue
++			}
++			cost := c.pieceBytes(id)
++			if !kept[id] && cost > c.capacity-used {
++				continue
++			}
++			if !kept[id] {
++				kept[id] = true
++				used += cost
++			}
++			w.Lower = max(0, int64(id)*c.pieceLength-w.fileOffset)
++			progress = true
++		}
++		if !progress {
++			break
++		}
++	}
++	// Each pass allocates at most one next piece to each consumer. If capacity
++	// cannot cover even the required ranges, forward allocation stays at zero.
++	for {
++		progress := false
++		for _, key := range keys {
++			w := c.windows[key]
++			id := w.endPiece(c.pieceLength) + 1
++			end := int64(id+1)*c.pieceLength - w.fileOffset
++			if end > w.fileLength {
++				end = w.fileLength
++			}
++			if end > w.requestedUpper || end <= w.Upper || id >= c.pieceCount {
++				continue
++			}
++			cost := c.pieceBytes(id)
++			if !kept[id] && (cost > c.capacity-used) {
++				continue
++			}
++			if !kept[id] {
++				kept[id] = true
++				used += cost
++			}
++			w.Upper = end
++			progress = true
++		}
++		if !progress {
++			break
++		}
++	}
++	c.configureManagedReadersLocked()
++}
++
++// Caller holds muPolicy and r.mu.
++func (c *Cache) readerWindowLocked(r *Reader) (*playbackWindow, bool) {
++	w, ok := c.windows[r.consumer]
++	return w, ok && w.fileOffset == r.file.Offset() && w.fileLength == r.file.Length()
++}
++
++func (c *Cache) configureManagedReadersLocked() {
++	for _, r := range c.readersSnapshot() {
++		r.mu.Lock()
++		w, ok := c.readerWindowLocked(r)
++		r.managed = r.consumer != ""
++		if ok {
++			r.minOffset = w.Lower
++			r.maxOffset = w.Upper
++		} else if r.managed {
++			r.minOffset = r.offset
++			r.maxOffset = r.offset
++		}
++		r.mu.Unlock()
++	}
++}
++
++func (c *Cache) applyReaderReadahead() {
++	for _, r := range c.readersSnapshot() {
++		r.applyReadahead()
++	}
++}
++
++// A managed reader pins its actual read, not a percentage of the cache behind
++// the demuxer's ahead-of-playback cursor. Windows themselves protect the media
++// history and budgeted forward interval.
++func (c *Cache) protectionRangesLocked() []Range {
++	ranges := make([]Range, 0)
++	for _, r := range c.readersSnapshot() {
++		r.mu.Lock()
++		if r.isUse && !r.isClosed {
++			if r.managed {
++				first, last := r.offset, r.offset
++				if r.inFlight > 0 {
++					first = min(first, r.readStart)
++					last = max(last, r.readEnd-1)
++				}
++				ranges = append(ranges, Range{r.getPieceNum(first), r.getPieceNum(last), nil})
++			} else {
++				offsets := r.offsetRangeLocked()
++				ranges = append(ranges, Range{r.getPieceNum(offsets[0]), r.getPieceNum(offsets[1]), r.file})
++			}
++		}
++		r.mu.Unlock()
++	}
++	for _, w := range c.windows {
++		ranges = append(ranges, Range{w.lowerPiece(c.pieceLength), w.endPiece(c.pieceLength), nil})
++	}
++	return ranges
++}
++
++// Watched means wholly below every consumer cutoff touching this torrent
++// piece. Shared file-boundary pieces are retained if any consumer needs them.
++func (c *Cache) watchedPieceLocked(id int) bool {
++	matched := false
++	for _, w := range c.windows {
++		fileStart := int(w.fileOffset / c.pieceLength)
++		fileEnd := int((w.fileOffset + w.fileLength - 1) / c.pieceLength)
++		if id < fileStart || id > fileEnd {
++			continue
++		}
++		matched = true
++		if id >= w.lowerPiece(c.pieceLength) {
++			return false
++		}
++	}
++	return matched
++}
++
++// A stop is issued only for an identified finite prefetch request whose actual
++// read reached its current cache quota before the requested HTTP range ended.
++// The optional ACK proof is unrelated to generic connection or storage errors.
++type PlaybackPrefetchStop struct {
++	Reason     string `json:"reason"`
++	RequestID  string `json:"request_id"`
++	FileIndex  int    `json:"file_index"`
++	RangeStart int64  `json:"range_start"`
++	RangeEnd   int64  `json:"range_end"` // Exclusive.
++	NextOffset int64  `json:"next_offset"`
++	Revision   uint64 `json:"revision"`
++}
++
++func (c *Cache) playbackWindowSnapshotLocked(consumer string, w *playbackWindow) PlaybackWindow {
++	result := w.PlaybackWindow
++	if stop, ok := c.prefetchStops[consumer]; ok {
++		snapshot := stop
++		result.PrefetchStop = &snapshot
++	}
++	return result
++}
++
++// RecordPrefetchStop publishes a captured capacity stop after the HTTP handler
++// has successfully written exactly that validated prefix. The handler excludes
++// cancellation and writer errors. Only one terminal event is kept per consumer.
++func (c *Cache) RecordPrefetchStop(r *Reader, expectedPrefixBytes int64) bool {
++	if c == nil || r == nil || r.cache != c {
++		return false
++	}
++	c.muPolicy.Lock()
++	defer c.muPolicy.Unlock()
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if c.isClosed.Load() || r.isClosed || !r.prefetch || r.capacityStop == nil {
++		return false
++	}
++	stop := *r.capacityStop
++	w, ok := c.readerWindowLocked(r)
++	if !ok || w.fileIndex != stop.FileIndex || stop.Revision > w.Revision || c.prefetchRequests[r.consumer] != stop.RequestID || expectedPrefixBytes != stop.NextOffset-stop.RangeStart {
++		return false
++	}
++	if c.prefetchStops == nil {
++		c.prefetchStops = make(map[string]PlaybackPrefetchStop)
++	}
++	c.prefetchStops[r.consumer] = stop
++	return true
++}
+diff --git a/server/torr/storage/torrstor/playback_window_test.go b/server/torr/storage/torrstor/playback_window_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/storage/torrstor/playback_window_test.go
+@@ -0,0 +1,933 @@
++package torrstor
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"runtime"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/anacrolix/torrent"
++	"github.com/anacrolix/torrent/bencode"
++	"github.com/anacrolix/torrent/metainfo"
++)
++
++func policyCache(t *testing.T, capacity, length, piece int64) *Cache {
++	t.Helper()
++	initTestSettings(t)
++	c := NewCache(capacity, NewStorage(capacity))
++	c.pieceLength = piece
++	c.pieceCount = int((length + piece - 1) / piece)
++	c.totalLength = length
++	for id := 0; id < c.pieceCount; id++ {
++		c.pieces[id] = NewPiece(id, c)
++	}
++	return c
++}
++func putPolicyPiece(c *Cache, id int, complete bool) {
++	p := c.pieces[id]
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.Size = c.pieceBytes(id)
++	p.Complete = complete
++	p.mPiece.buffer = bytes.Repeat([]byte{byte(id + 1)}, int(c.pieceLength))
++}
++func setWindow(t *testing.T, c *Cache, key string, lower, current, upper int64, revision uint64) PlaybackWindow {
++	t.Helper()
++	w, err := c.UpdatePlaybackWindow(1, 0, c.totalLength, key, lower, current, upper, revision, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return w
++}
++func TestPlaybackWindowEvictsWatchedBelowCapacityAndRoundsUp(t *testing.T) {
++	c := policyCache(t, 100, 100, 10)
++	for id := 0; id < 8; id++ {
++		putPolicyPiece(c, id, true)
++	}
++	w := setWindow(t, c, "main", 23, 55, 100, 1)
++	if w.Lower != 30 || w.Current != 55 || w.Upper != 100 || w.PieceLength != 10 {
++		t.Fatalf("window %+v", w)
++	}
++	for id := 0; id < 8; id++ {
++		got := c.pieces[id].snapshot().size
++		if (id < 3) != (got == 0) {
++			t.Fatalf("piece %d size %d, lower boundary piece must be dropped", id, got)
++		}
++	}
++}
++func TestPlaybackWindowCurrentPieceOverhang(t *testing.T) {
++	c := policyCache(t, 20, 100, 10)
++	putPolicyPiece(c, 2, true)
++	w := setWindow(t, c, "main", 23, 25, 26, 1)
++	if w.Lower != 20 || w.Upper != 30 || c.pieces[2].snapshot().size == 0 {
++		t.Fatalf("current piece lost: %+v", w)
++	}
++}
++func TestPlaybackWindowNeverDiscardsIncompleteBytes(t *testing.T) {
++	c := policyCache(t, 10, 100, 10)
++	putPolicyPiece(c, 0, false)
++	putPolicyPiece(c, 1, true)
++	setWindow(t, c, "main", 25, 45, 100, 1)
++	if c.pieces[0].snapshot().size != 10 || c.pieces[0].snapshot().complete {
++		t.Fatal("incomplete piece lost or marked complete")
++	}
++	data := make([]byte, 10)
++	if _, err := c.pieces[0].ReadAt(data, 0); err != nil || !bytes.Equal(data, bytes.Repeat([]byte{1}, 10)) {
++		t.Fatalf("partial data changed %v %v", data, err)
++	}
++	if c.pieces[1].snapshot().size != 0 {
++		t.Fatal("old complete piece was retained")
++	}
++}
++func TestPlaybackWindowUnionBudgetAndReleaseRevision(t *testing.T) {
++	c := policyCache(t, 60, 200, 10)
++	setWindow(t, c, "a", 20, 35, 200, 1)
++	setWindow(t, c, "b", 90, 105, 200, 1)
++	c.muPolicy.Lock()
++	a, b := *c.windows["a"], *c.windows["b"]
++	ranges := c.protectionRangesLocked()
++	c.muPolicy.Unlock()
++	union := map[int]bool{}
++	for _, r := range ranges {
++		for id := r.Start; id <= r.End; id++ {
++			union[id] = true
++		}
++	}
++	if len(union) != 6 || a.Upper != 50 || b.Upper != 120 {
++		t.Fatalf("union=%v a=%+v b=%+v", union, a, b)
++	}
++	for id := 2; id < 12; id++ {
++		putPolicyPiece(c, id, true)
++	}
++	c.cleanPieces()
++	if c.pieces[2].snapshot().size == 0 || c.pieces[9].snapshot().size == 0 {
++		t.Fatal("one consumer evicted another consumer's range")
++	}
++	if _, err := c.UpdatePlaybackWindow(1, 0, 200, "a", 0, 0, 0, 2, true); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.UpdatePlaybackWindow(1, 0, 200, "a", 20, 35, 200, 1, false); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("old update resurrected consumer: %v", err)
++	}
++	if _, err := c.UpdatePlaybackWindow(1, 0, 200, "a", 0, 0, 0, 2, true); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("duplicate remove accepted: %v", err)
++	}
++	setWindow(t, c, "a", 20, 35, 200, 3)
++	if _, err := c.UpdatePlaybackWindow(1, 0, 200, "a", 0, 0, 0, 2, true); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("late remove deleted fresh window: %v", err)
++	}
++}
++func TestPlaybackWindowTombstoneSurvivesCacheReopen(t *testing.T) {
++	c := policyCache(t, 20, 100, 10)
++	if _, err := c.UpdatePlaybackWindow(1, 0, 100, "gone", 0, 0, 0, 8, true); err != nil {
++		t.Fatal(err)
++	}
++	reopened := NewCache(20, c.storage)
++	reopened.pieceLength = 10
++	reopened.pieceCount = 10
++	reopened.totalLength = 100
++	if _, err := reopened.UpdatePlaybackWindow(1, 0, 100, "gone", 0, 5, 100, 7, false); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("late old request survived reopen: %v", err)
++	}
++	if _, err := reopened.UpdatePlaybackWindow(1, 0, 100, "gone", 0, 5, 100, 9, false); err != nil {
++		t.Fatal(err)
++	}
++}
++func TestPlaybackWindowMultiFileBoundary(t *testing.T) {
++	c := policyCache(t, 40, 100, 10)
++	// File 2 starts inside the last piece of file 1. Both must count that piece once.
++	if _, err := c.UpdatePlaybackWindow(2, 25, 75, "b", 0, 0, 75, 1, false); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.UpdatePlaybackWindow(1, 0, 25, "a", 0, 5, 25, 1, false); err != nil {
++		t.Fatal(err)
++	}
++	c.muPolicy.Lock()
++	a, b := *c.windows["a"], *c.windows["b"]
++	c.muPolicy.Unlock()
++	if b.Lower != 0 || b.Upper < 5 || a.Upper != 25 {
++		t.Fatalf("unaligned file boundary a=%+v b=%+v", a, b)
++	}
++}
++func playbackTestFile(t *testing.T, length int64) *torrent.File {
++	file, _ := playbackTestTorrent(t, length, 1<<20)
++	return file
++}
++func playbackTestTorrent(t *testing.T, length, capacity int64) (*torrent.File, *Cache) {
++	t.Helper()
++	info := metainfo.Info{Name: "test.mkv", Length: length, PieceLength: 1 << 20, Pieces: make([]byte, 20*int((length+(1<<20)-1)/(1<<20)))}
++	files, cache := playbackTestTorrentFiles(t, info, capacity)
++	return files[0], cache
++}
++func playbackTestTorrentFiles(t *testing.T, info metainfo.Info, capacity int64) ([]*torrent.File, *Cache) {
++	t.Helper()
++	initTestSettings(t)
++	cfg := torrent.NewDefaultClientConfig()
++	store := NewStorage(capacity)
++	cfg.DefaultStorage = store
++	cfg.DataDir = t.TempDir()
++	cfg.DisableTCP = true
++	cfg.DisableUTP = true
++	cfg.NoDHT = true
++	cfg.DisableTrackers = true
++	cfg.NoDefaultPortForwarding = true
++	cl, err := torrent.NewClient(cfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { cl.Close() })
++	mi := metainfo.MetaInfo{InfoBytes: bencode.MustMarshal(info)}
++	tor, _, err := cl.AddTorrentSpec(&torrent.TorrentSpec{InfoHash: mi.HashInfoBytes(), InfoBytes: mi.InfoBytes})
++	if err != nil {
++		t.Fatal(err)
++	}
++	cache := store.GetCache(mi.HashInfoBytes())
++	cache.SetTorrent(tor)
++	return tor.Files(), cache
++}
++func TestPlaybackManagedReaderDoesNotPinLegacyHistoryOrHeaders(t *testing.T) {
++	const mib = 1 << 20
++	file := playbackTestFile(t, 64*mib)
++	c := policyCache(t, 16*mib, 64*mib, mib)
++	backend := &trackingReadaheadReader{}
++	r := &Reader{Reader: backend, file: file, cache: c, consumer: "main", isUse: true, offset: 32 * mib, readahead: 32 * mib}
++	c.readers[r] = struct{}{}
++	for id := 0; id < 40; id++ {
++		putPolicyPiece(c, id, true)
++	}
++	w := setWindow(t, c, "main", 30*mib+1, 32*mib+1, 64*mib, 1)
++	if c.pieces[0].snapshot().size != 0 || c.pieces[30].snapshot().size != 0 {
++		t.Fatal("managed reader retained head/legacy history")
++	}
++	if backend.readahead != w.Upper-r.offset {
++		t.Fatalf("read ahead %d is not clamped to %d", backend.readahead, w.Upper-r.offset)
++	}
++	r.mu.Lock()
++	r.offset = w.Upper - 4
++	r.mu.Unlock()
++	r.applyReadahead()
++	if backend.readahead != 4 {
++		t.Fatalf("moving demux cursor readahead=%d, want 4", backend.readahead)
++	}
++	r.mu.Lock()
++	r.offset = w.Upper + 1
++	r.mu.Unlock()
++	r.applyReadahead()
++	if backend.readahead != 0 {
++		t.Fatalf("prefetch went past upper: %d", backend.readahead)
++	}
++}
++
++type trackingReadaheadReader struct {
++	fakeTorrentReader
++	readahead int64
++}
++
++func (f *trackingReadaheadReader) SetReadahead(n int64) { f.readahead = n }
++func TestPlaybackUnmanagedSaveAndInFlightRangesStayProtected(t *testing.T) {
++	const mib = 1 << 20
++	file := playbackTestFile(t, 64*mib)
++	c := policyCache(t, 16*mib, 64*mib, mib)
++	save := &Reader{Reader: &fakeTorrentReader{}, file: file, cache: c, isUse: true, lastAccess: time.Now().Unix(), offset: 12 * mib}
++	managed := &Reader{Reader: &fakeTorrentReader{}, file: file, cache: c, consumer: "main", isUse: true, lastAccess: time.Now().Unix(), offset: 24 * mib}
++	c.readers[save] = struct{}{}
++	c.readers[managed] = struct{}{}
++	managed.beginRead(3 * mib)
++	for id := 0; id < 40; id++ {
++		putPolicyPiece(c, id, true)
++	}
++	setWindow(t, c, "main", 30*mib, 32*mib, 64*mib, 1)
++	if c.pieces[0].snapshot().size == 0 || c.pieces[12].snapshot().size == 0 {
++		t.Fatal("save reader protection was removed")
++	}
++	for id := 24; id <= 26; id++ {
++		if c.pieces[id].snapshot().size == 0 {
++			t.Fatalf("inflight piece %d removed", id)
++		}
++	}
++	managed.endIO()
++	c.CloseReader(save)
++	c.cleanPieces()
++	if c.pieces[0].snapshot().size != 0 {
++		t.Fatal("closed save reader still pins history")
++	}
++}
++func TestPlaybackConcurrentWindowsPieceIOAndState(t *testing.T) {
++	c := policyCache(t, 60, 200, 10)
++	var wg sync.WaitGroup
++	wg.Add(3)
++	go func() {
++		defer wg.Done()
++		for rev := uint64(1); rev < 100; rev++ {
++			c.UpdatePlaybackWindow(1, 0, 200, "a", 20, 35, 200, rev, false)
++		}
++	}()
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 100; i++ {
++			p := c.pieces[0]
++			p.WriteAt([]byte{1, 2}, 0)
++			p.Completion()
++			p.ReadAt(make([]byte, 2), 0)
++		}
++	}()
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 100; i++ {
++			c.GetState()
++			c.cleanPieces()
++		}
++	}()
++	wg.Wait()
++}
++
++func TestPlaybackHistoryShrinksToCapacityBeforeForward(t *testing.T) {
++	c := policyCache(t, 30, 200, 10)
++	w := setWindow(t, c, "a", 0, 95, 200, 1)
++	if w.Lower != 80 || w.Upper != 110 {
++		t.Fatalf("large history exceeded capacity: %+v", w)
++	}
++	setWindow(t, c, "b", 100, 155, 200, 1)
++	c.muPolicy.Lock()
++	a, b := *c.windows["a"], *c.windows["b"]
++	c.muPolicy.Unlock()
++	size := (a.Upper - a.Lower) + (b.Upper - b.Lower)
++	if size > 30 {
++		t.Fatalf("combined history exceeds capacity: %d a=%+v b=%+v", size, a, b)
++	}
++}
++func TestPlaybackFileSwitchEvictsOldFileBelowCapacity(t *testing.T) {
++	c := policyCache(t, 100, 200, 10)
++	setWindow(t, c, "a", 0, 5, 100, 1)
++	putPolicyPiece(c, 0, true)
++	putPolicyPiece(c, 1, true)
++	if _, err := c.UpdatePlaybackWindow(2, 100, 100, "a", 0, 5, 100, 2, false); err != nil {
++		t.Fatal(err)
++	}
++	if c.pieces[0].snapshot().size != 0 || c.pieces[1].snapshot().size != 0 {
++		t.Fatal("old episode survived file switch below capacity")
++	}
++	putPolicyPiece(c, 10, true)
++	if _, err := c.UpdatePlaybackWindow(0, 0, 0, "a", 0, 0, 0, 3, true); err != nil {
++		t.Fatal(err)
++	}
++	if c.pieces[10].snapshot().size != 0 {
++		t.Fatal("last consumer release retained unowned complete pieces")
++	}
++}
++func TestPlaybackNoCacheRemoveTombstone(t *testing.T) {
++	c := policyCache(t, 20, 100, 10)
++	if _, err := c.storage.RemovePlaybackWindow(c.hash, "released", 9); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.UpdatePlaybackWindow(1, 0, 100, "released", 0, 5, 100, 8, false); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("no-cache release lost tombstone: %v", err)
++	}
++}
++func TestPlaybackPrefetchDynamicallyCapsActualRead(t *testing.T) {
++	c := policyCache(t, 30, 100, 10)
++	r := &Reader{Reader: &fakeTorrentReader{}, cache: c, managed: true, prefetch: true, isUse: true, offset: 12, maxOffset: 20}
++	if got := r.claimIO(100, true); got != 8 {
++		t.Fatalf("read span=%d, want 8", got)
++	}
++	r.mu.Lock()
++	start, end := r.readStart, r.readEnd
++	r.mu.Unlock()
++	if start != 12 || end != 20 {
++		t.Fatalf("inflight protected [%d,%d), want [12,20)", start, end)
++	}
++	r.endIO()
++	r.mu.Lock()
++	r.maxOffset = 10
++	r.mu.Unlock()
++	if got := r.claimIO(100, true); got != 0 {
++		t.Fatalf("read past newly shrunken window: %d", got)
++	}
++	if n, err := r.Read(make([]byte, 100)); n != 0 || err == nil {
++		t.Fatalf("prefetch should reach EOF after shrink, got %d %v", n, err)
++	}
++	// Core's metadata reader may explicitly request outside the playback range.
++	r.SetPlaybackPrefetch(false)
++	if got := r.claimIO(100, true); got != 100 {
++		t.Fatalf("ordinary Core read incorrectly limited: %d", got)
++	}
++	r.endIO()
++}
++
++type cancelablePolicyReader struct {
++	fakeTorrentReader
++	entered chan struct{}
++}
++
++func (r *cancelablePolicyReader) ReadContext(ctx context.Context, _ []byte) (int, error) {
++	close(r.entered)
++	<-ctx.Done()
++	return 0, ctx.Err()
++}
++func TestPlaybackReaderCloseCancelsBlockedStorageRead(t *testing.T) {
++	c := policyCache(t, 30, 100, 10)
++	ctx, cancel := context.WithCancel(context.Background())
++	backend := &cancelablePolicyReader{entered: make(chan struct{})}
++	r := &Reader{Reader: backend, cache: c, isUse: true, readContext: ctx, cancelRead: cancel}
++	done := make(chan error, 1)
++	go func() { _, err := r.Read(make([]byte, 10)); done <- err }()
++	<-backend.entered
++	r.Close()
++	select {
++	case err := <-done:
++		if !errors.Is(err, context.Canceled) {
++			t.Fatalf("read error %v", err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("Close did not cancel blocked ReadContext")
++	}
++	r.mu.Lock()
++	inflight := r.inFlight
++	r.mu.Unlock()
++	if inflight != 0 {
++		t.Fatalf("cancelled reader pins %d in-flight ranges", inflight)
++	}
++}
++
++func TestPlaybackPatchedLibraryReclaimsOrphanPartialsWithoutCompletion(t *testing.T) {
++	const mib = 1 << 20
++	_, c := playbackTestTorrent(t, 64*mib, 8*mib)
++	if !c.supportsPartialDiscard() {
++		t.Skip("stock pinned dependency has no atomic chunk reset extension")
++	}
++	putPolicyPiece(c, 0, false)
++	putPolicyPiece(c, 1, false)
++	setWindow(t, c, "main", 30*mib, 32*mib, 64*mib, 1)
++	for _, id := range []int{0, 1} {
++		if s := c.pieces[id].snapshot(); s.size != 0 || s.complete {
++			t.Fatalf("orphan partial %d retained/marked complete: %+v", id, s)
++		}
++	}
++	if c.torrent.PieceState(0).Complete {
++		t.Fatal("discarded partial falsely marked complete in torrent library")
++	}
++}
++func TestPlaybackForwardReservePassesDemuxFrontierBeforeHistory(t *testing.T) {
++	const mib = 1 << 20
++	file := playbackTestFile(t, 64*mib)
++	c := policyCache(t, 6*mib, 64*mib, mib)
++	r := &Reader{Reader: &fakeTorrentReader{}, file: file, cache: c, consumer: "main", isUse: true, offset: 35 * mib, lastAccess: time.Now().Unix()}
++	c.readers[r] = struct{}{}
++	w := setWindow(t, c, "main", 0, 32*mib, 64*mib, 1)
++	if w.Upper < 37*mib {
++		t.Fatalf("history starved forward past demux frontier: %+v", w)
++	}
++	if w.Upper-w.Lower > 6*mib {
++		t.Fatalf("optional history exceeded capacity: %+v", w)
++	}
++}
++
++func TestPlaybackBusyOrphanIsRetriedAfterLastReaderCloses(t *testing.T) {
++	const mib = 1 << 20
++	_, c := playbackTestTorrent(t, 64*mib, 8*mib)
++	if !c.supportsPartialDiscard() {
++		t.Skip("requires atomic chunk reset extension")
++	}
++	// An actual underlying reader independently protects piece zero in the
++	// torrent library, outside the wrapper's consumer/window registry.
++	busy := c.torrent.NewReader()
++	busy.SetReadahead(0)
++	putPolicyPiece(c, 0, false)
++	setWindow(t, c, "main", 30*mib, 32*mib, 64*mib, 1)
++	if c.pieces[0].snapshot().size == 0 || !c.retryQueued.Load() {
++		t.Fatal("busy orphan was evicted or no cleanup retry was queued")
++	}
++	if _, err := c.UpdatePlaybackWindow(0, 0, 0, "main", 0, 0, 0, 2, true); err != nil {
++		t.Fatal(err)
++	}
++	busy.Close()
++	deadline := time.After(2 * time.Second)
++	tick := time.NewTicker(10 * time.Millisecond)
++	defer tick.Stop()
++	for c.pieces[0].snapshot().size > 0 {
++		select {
++		case <-tick.C:
++		case <-deadline:
++			t.Fatal("orphan was retained with no active wrapper readers after library guard settled")
++		}
++	}
++	if c.pieces[0].snapshot().complete {
++		t.Fatal("discarded orphan was marked complete")
++	}
++}
++
++// residentPayload records the allocation as well as its contents: an empty
++// interval followed by downloading the same bytes is not successful retention.
++type residentPayload struct {
++	allocation *byte
++	bytes      []byte
++}
++
++func seedRetainedPayloads(t *testing.T, c *Cache, ids ...int) map[int]residentPayload {
++	t.Helper()
++	retained := make(map[int]residentPayload, len(ids))
++	for _, id := range ids {
++		putPolicyPiece(c, id, true)
++		c.torrent.Piece(id).UpdateCompletion()
++		p := c.pieces[id]
++		p.mu.Lock()
++		retained[id] = residentPayload{allocation: &p.mPiece.buffer[0], bytes: append([]byte(nil), p.mPiece.buffer...)}
++		p.mu.Unlock()
++	}
++	return retained
++}
++func retainedPayloadError(c *Cache, retained map[int]residentPayload) error {
++	for id, before := range retained {
++		p := c.pieces[id]
++		p.mu.Lock()
++		unchanged := p.Complete && p.Size == int64(len(before.bytes)) && len(p.mPiece.buffer) == len(before.bytes) && &p.mPiece.buffer[0] == before.allocation && bytes.Equal(p.mPiece.buffer, before.bytes)
++		p.mu.Unlock()
++		if !unchanged {
++			return fmt.Errorf("overlapping resident piece %d was removed, replaced, or changed", id)
++		}
++	}
++	return nil
++}
++func assertRetainedPayloads(t *testing.T, c *Cache, retained map[int]residentPayload) {
++	t.Helper()
++	if err := retainedPayloadError(c, retained); err != nil {
++		t.Fatal(err)
++	}
++}
++func assertNoMissingPiecePriority(t *testing.T, c *Cache) {
++	t.Helper()
++	for id, p := range c.getPieces() {
++		if p.snapshot().size == 0 {
++			if priority := c.torrent.PieceState(id).Priority; priority != torrent.PiecePriorityNone {
++				t.Fatalf("retention-only paused state scheduled missing piece %d at priority %v", id, priority)
++			}
++		}
++	}
++}
++func assertPausedWindow(t *testing.T, c *Cache, consumer string, revision uint64) {
++	t.Helper()
++	c.muPolicy.Lock()
++	w := c.windows[consumer]
++	present := w != nil && w.Revision == revision && w.Lower <= w.Current && w.Current < w.Upper
++	c.muPolicy.Unlock()
++	if !present {
++		t.Fatalf("paused consumer %q lost its nonempty revision %d window", consumer, revision)
++	}
++}
++
++func TestPlaybackTinyBufferedSeekAtomicallyRetainsOverlappingPayload(t *testing.T) {
++	const mib = 1 << 20
++	file, c := playbackTestTorrent(t, 64*mib, 12*mib)
++	const initialCurrent = 24*mib + 7*mib/8
++	initial := setWindow(t, c, "paused", initialCurrent-2*mib, initialCurrent, 64*mib, 100)
++	retained := seedRetainedPayloads(t, c, 24, 25, 29)
++	assertNoMissingPiecePriority(t, c)
++
++	// Observe the same state a concurrent cleanup sees while the consumer
++	// repeatedly crosses a piece boundary by only a quarter MiB, then returns.
++	ready, stop := make(chan struct{}), make(chan struct{})
++	observations := make(chan error, 1)
++	observerDone := make(chan struct{})
++	var stopObserver sync.Once
++	defer func() { stopObserver.Do(func() { close(stop) }); <-observerDone }()
++	go func() {
++		defer close(observerDone)
++		first := true
++		for {
++			select {
++			case <-stop:
++				observations <- nil
++				return
++			default:
++			}
++			c.muPolicy.Lock()
++			w := c.windows["paused"]
++			var err error
++			if w == nil || w.Lower > w.Current || w.Current >= w.Upper {
++				err = errors.New("replacement exposed an empty consumer/window interval")
++			}
++			if err == nil {
++				err = retainedPayloadError(c, retained)
++			}
++			c.muPolicy.Unlock()
++			if first {
++				close(ready)
++				first = false
++			}
++			if err != nil {
++				observations <- err
++				return
++			}
++			runtime.Gosched()
++		}
++	}()
++	<-ready
++	for revision := uint64(101); revision <= 140; revision++ {
++		current := int64(initialCurrent)
++		if revision%2 == 1 {
++			current += mib / 4
++		}
++		next := setWindow(t, c, "paused", current-2*mib, current, 64*mib, revision)
++		if max(initial.Lower, next.Lower) >= min(initial.Upper, next.Upper) {
++			t.Fatal("test seek unexpectedly left the cached window")
++		}
++		assertPausedWindow(t, c, "paused", revision)
++		assertRetainedPayloads(t, c, retained)
++		assertNoMissingPiecePriority(t, c)
++	}
++	stopObserver.Do(func() { close(stop) })
++	if err := <-observations; err != nil {
++		t.Fatal(err)
++	}
++
++	// Read through the real patched torrent Reader, not only storage metadata.
++	// Network discovery is disabled, so retained data cannot be silently refilled.
++	reader := file.NewReader()
++	reader.SetReadahead(0)
++	defer reader.Close()
++	if _, err := reader.Seek(25*mib+127, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	got := make([]byte, 128)
++	if n, err := reader.ReadContext(ctx, got); err != nil || n != len(got) || !bytes.Equal(got, retained[25].bytes[127:255]) {
++		t.Fatalf("buffered seek lost real readable payload: n=%d err=%v", n, err)
++	}
++}
++
++func TestPlaybackLateSeekRemovalAndHintCannotEraseNewerResidentWindow(t *testing.T) {
++	const mib = 1 << 20
++	_, c := playbackTestTorrent(t, 64*mib, 12*mib)
++	const current = 24*mib + 7*mib/8
++	setWindow(t, c, "paused", current-2*mib, current, 64*mib, 10)
++	retained := seedRetainedPayloads(t, c, 24, 25, 29)
++	next := setWindow(t, c, "paused", current-2*mib+mib/4, current+mib/4, 64*mib, 30)
++
++	// A delayed clear has a revision newer than the previous ACK, but older
++	// than the replacement. The HTTP removal path reaches Storage first.
++	if _, err := c.storage.RemovePlaybackWindow(c.hash, "paused", 20); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("late clear affected replacement: %v", err)
++	}
++	if _, err := c.UpdatePlaybackWindow(1, 0, 64*mib, "paused", 0, 1, 16*mib, 29, false); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("late distant hint replaced current window: %v", err)
++	}
++	c.cleanPiecesSync()
++	assertPausedWindow(t, c, "paused", 30)
++	assertRetainedPayloads(t, c, retained)
++	c.muPolicy.Lock()
++	after := c.windows["paused"].PlaybackWindow
++	c.muPolicy.Unlock()
++	if after != next {
++		t.Fatalf("stale operations changed authoritative window: before=%+v after=%+v", next, after)
++	}
++
++	setWindow(t, c, "paused", current-2*mib, current, 64*mib, 31)
++	if _, err := c.storage.RemovePlaybackWindow(c.hash, "paused", 30); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("old forward-seek release erased backward replacement: %v", err)
++	}
++	assertPausedWindow(t, c, "paused", 31)
++	assertRetainedPayloads(t, c, retained)
++	assertNoMissingPiecePriority(t, c)
++}
++
++func TestPlaybackManagedReaderCloseRetainsPausedPayloadWithoutDownloads(t *testing.T) {
++	const mib = 1 << 20
++	file, c := playbackTestTorrent(t, 64*mib, 12*mib)
++	const current = 24*mib + 7*mib/8
++	setWindow(t, c, "paused", current-2*mib, current, 64*mib, 1)
++	retained := seedRetainedPayloads(t, c, 24, 25, 29)
++	reader := c.NewPlaybackReader(file, "paused")
++	if _, err := reader.Seek(current, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	c.CloseReader(reader)
++	// Include all synchronous work normally reached by Close's async cleanup.
++	c.cleanPiecesSync()
++	c.clearPriority()
++	if c.Readers() != 0 || c.GetUseReaders() != 0 {
++		t.Fatal("closed HTTP reader remained active")
++	}
++	assertPausedWindow(t, c, "paused", 1)
++	assertRetainedPayloads(t, c, retained)
++	assertNoMissingPiecePriority(t, c)
++}
++
++func TestPlaybackManagedReaderSixtySecondParkingRetainsPausedPayloadWithoutDownloads(t *testing.T) {
++	const mib = 1 << 20
++	file, c := playbackTestTorrent(t, 64*mib, 12*mib)
++	const current = 24*mib + 7*mib/8
++	setWindow(t, c, "paused", current-2*mib, current, 64*mib, 1)
++	retained := seedRetainedPayloads(t, c, 24, 25, 29)
++	readers := []*Reader{c.NewPlaybackReader(file, "paused"), c.NewPlaybackReader(file, "paused")}
++	for _, reader := range readers {
++		if _, err := reader.Seek(current, io.SeekStart); err != nil {
++			t.Fatal(err)
++		}
++		reader.mu.Lock()
++		reader.lastAccess = time.Now().Add(-61 * time.Second).Unix()
++		reader.mu.Unlock()
++	}
++	// Exercise the actual 60-second idle path without a wall-clock minute.
++	c.cleanPiecesSync()
++	for _, reader := range readers {
++		if reader.active() {
++			t.Fatal("expired idle managed reader was not parked")
++		}
++	}
++	assertPausedWindow(t, c, "paused", 1)
++	assertRetainedPayloads(t, c, retained)
++	assertNoMissingPiecePriority(t, c)
++	// Parking must also preserve the next logical read position. In particular,
++	// parking at EOF cannot be fixed merely by changing the parking Seek target.
++	got := make([]byte, 64)
++	if n, err := readers[0].Read(got); err != nil || n != len(got) || !bytes.Equal(got, bytes.Repeat([]byte{25}, len(got))) {
++		t.Fatalf("parked managed reader did not resume at its retained payload: n=%d err=%v", n, err)
++	}
++	for _, reader := range readers {
++		c.CloseReader(reader)
++	}
++	c.cleanPiecesSync()
++	assertRetainedPayloads(t, c, retained)
++	assertNoMissingPiecePriority(t, c)
++}
++
++func TestPlaybackFileSwitchAllowsCoreReadButPrefetchWaitsForMatchingWindow(t *testing.T) {
++	const mib = 1 << 20
++	info := metainfo.Info{Name: "episodes", PieceLength: mib, Files: []metainfo.FileInfo{
++		{Path: []string{"A.mkv"}, Length: 32 * mib},
++		{Path: []string{"B.mkv"}, Length: 16 * mib},
++	}, Pieces: make([]byte, 48*20)}
++	files, c := playbackTestTorrentFiles(t, info, 8*mib)
++	fileA, fileB := files[0], files[1]
++	if fileA.Offset() == fileB.Offset() || fileA.Length() == fileB.Length() {
++		t.Fatal("fixture must distinguish both the file offset and length")
++	}
++	if _, err := c.UpdatePlaybackWindow(1, fileA.Offset(), fileA.Length(), "same-consumer", 8*mib, 10*mib, 32*mib, 1, false); err != nil {
++		t.Fatal(err)
++	}
++	aRetained := seedRetainedPayloads(t, c, 10, 11)
++
++	reader := c.NewPlaybackReader(fileB, "same-consumer")
++	defer c.CloseReader(reader)
++	bPiece := int(fileB.Offset() / mib)
++	bRetained := seedRetainedPayloads(t, c, bPiece)
++	reader.mu.Lock()
++	managed, maxOffset := reader.managed, reader.maxOffset
++	reader.mu.Unlock()
++	if !managed || maxOffset != 0 {
++		t.Fatalf("new file unexpectedly inherited old file's window bound: managed=%v maxOffset=%d", managed, maxOffset)
++	}
++
++	// The decoder needs ordinary metadata/media reads before it can submit a
++	// coherent packet-derived window for B. A's retained window must not clip it.
++	got := make([]byte, 64)
++	if n, err := reader.Read(got); err != nil || n != len(got) || !bytes.Equal(got, bRetained[bPiece].bytes[:len(got)]) {
++		t.Fatalf("Core read of B was clipped by retained A window: n=%d err=%v", n, err)
++	}
++	assertRetainedPayloads(t, c, aRetained)
++	assertPausedWindow(t, c, "same-consumer", 1)
++
++	reader.SetPlaybackPrefetch(true)
++	before := reader.Offset()
++	if n, err := reader.Read(make([]byte, 64)); n != 0 || !errors.Is(err, io.EOF) {
++		t.Fatalf("B prefetch ran before matching ACK: n=%d err=%v", n, err)
++	}
++	if reader.Offset() != before {
++		t.Fatal("rejected prefetch advanced the decoder's file position")
++	}
++	assertRetainedPayloads(t, c, aRetained)
++	assertNoMissingPiecePriority(t, c)
++
++	// A higher revision switches ownership atomically to B. The same prefetch
++	// reader can then continue at its original B offset without being recreated.
++	ack, err := c.UpdatePlaybackWindow(2, fileB.Offset(), fileB.Length(), "same-consumer", 0, before, fileB.Length(), 2, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ack.Upper <= before {
++		t.Fatalf("matching B ACK did not authorize forward reads: %+v", ack)
++	}
++	got = make([]byte, 64)
++	if n, err := reader.Read(got); err != nil || n != len(got) || !bytes.Equal(got, bRetained[bPiece].bytes[before:before+int64(len(got))]) {
++		t.Fatalf("prefetch did not resume after matching B ACK: n=%d err=%v", n, err)
++	}
++	assertPausedWindow(t, c, "same-consumer", 2)
++	assertRetainedPayloads(t, c, bRetained)
++}
++
++type playbackRangeObservationWriter struct {
++	http.ResponseWriter
++	once    sync.Once
++	observe func()
++}
++
++func (w *playbackRangeObservationWriter) Write(p []byte) (int, error) {
++	w.once.Do(w.observe)
++	return w.ResponseWriter.Write(p)
++}
++
++// This short request has no Torrent.progressEvent timer: a real HTTP Range
++// must expose useful bounded lookahead before the first response body write.
++func TestPlaybackShortHTTPRangeImmediatelySchedulesOnlyWindowLookahead(t *testing.T) {
++	const mib = 1 << 20
++	file, c := playbackTestTorrent(t, 64*mib, 4*mib)
++	const current = 32*mib + 128*(1<<10)
++	window := setWindow(t, c, "range", 32*mib, current, 64*mib, 1)
++	if window.Upper != 36*mib {
++		t.Fatalf("window %+v", window)
++	}
++	seedRetainedPayloads(t, c, 32)
++	type observation struct {
++		future      bool
++		outOfBounds []int
++		premature   []int
++	}
++	observed := make(chan observation, 1)
++	done := make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		reader := c.NewPlaybackReader(file, "range")
++		reader.SetResponsive()
++		defer func() { c.CloseReader(reader); close(done) }()
++		initial := []int{}
++		// Byte zero is the library's necessary initial cursor. An initial lookahead
++		// must not request old missing pieces before ServeContent seeks the range.
++		for id := 1; id < 32; id++ {
++			if c.torrent.PieceState(id).Priority != torrent.PiecePriorityNone {
++				initial = append(initial, id)
++			}
++		}
++		wrapped := &playbackRangeObservationWriter{ResponseWriter: w, observe: func() {
++			got := observation{future: c.torrent.PieceState(33).Priority != torrent.PiecePriorityNone, premature: initial}
++			for id := 0; id < c.pieceCount; id++ {
++				if (id < 32 || id >= 36) && c.torrent.PieceState(id).Priority != torrent.PiecePriorityNone {
++					got.outOfBounds = append(got.outOfBounds, id)
++				}
++			}
++			observed <- got
++		}}
++		w.Header().Set("Content-Type", "video/x-matroska")
++		http.ServeContent(wrapped, req, file.Path(), time.Time{}, reader)
++	}))
++	defer server.Close()
++	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", current, current+(256<<10)-1))
++	client := server.Client()
++	client.Timeout = 5 * time.Second
++	response, err := client.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	data, err := io.ReadAll(response.Body)
++	response.Body.Close()
++	if err != nil {
++		t.Fatal(err)
++	}
++	<-done
++	if response.StatusCode != http.StatusPartialContent || len(data) != 256<<10 || !bytes.Equal(data, bytes.Repeat([]byte{33}, 256<<10)) {
++		t.Fatalf("range payload: status%d len%d", response.StatusCode, len(data))
++	}
++	got := <-observed
++	if len(got.premature) > 0 || len(got.outOfBounds) > 0 {
++		t.Fatalf("lookahead outside applied window: before seek=%v while reading=%v", got.premature, got.outOfBounds)
++	}
++	if !got.future {
++		t.Fatal("short HTTP range scheduled only its current piece until the one-second progress tick")
++	}
++	c.cleanPiecesSync()
++	c.clearPriority()
++	assertNoMissingPiecePriority(t, c)
++}
++
++// Piece-state publication preserves transient changes, unlike checking only
++// after Read returned. The sentinel flushes all preceding state publications.
++func TestPlaybackReadAdvanceDoesNotExtendRelativeLookaheadPastUpper(t *testing.T) {
++	const mib = 1 << 20
++	file, c := playbackTestTorrent(t, 64*mib, 4*mib)
++	const current = 32*mib + 128*(1<<10)
++	setWindow(t, c, "advance", 32*mib, current, 64*mib, 1)
++	seedRetainedPayloads(t, c, 32)
++	reader := c.NewPlaybackReader(file, "advance")
++	defer c.CloseReader(reader)
++	reader.SetResponsive()
++	if _, err := reader.Seek(current, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	sub := c.torrent.SubscribePieceStateChanges()
++	defer sub.Close()
++	result := make(chan []int, 1)
++	go func() {
++		outside := []int{}
++		for value := range sub.Values {
++			change := value.(torrent.PieceStateChange)
++			if change.Index == 63 && change.Priority == torrent.PiecePriorityHigh {
++				result <- outside
++				return
++			}
++			if change.Index >= 36 && change.Priority != torrent.PiecePriorityNone {
++				outside = append(outside, change.Index)
++			}
++		}
++	}()
++	data := make([]byte, 256<<10)
++	if n, err := reader.Read(data); err != nil || n != len(data) {
++		t.Fatalf("Read %d %v", n, err)
++	}
++	c.torrent.Piece(63).SetPriority(torrent.PiecePriorityHigh)
++	outside := <-result
++	c.torrent.Piece(63).SetPriority(torrent.PiecePriorityNone)
++	if len(outside) > 0 {
++		t.Fatalf("relative lookahead transiently prioritized outside upper: %v", outside)
++	}
++}
++
++func TestPlaybackPrefetchAtUpperParksAndResumesOnlyAfterExpansion(t *testing.T) {
++	const mib = 1 << 20
++	file, c := playbackTestTorrent(t, 64*mib, 4*mib)
++	setWindow(t, c, "end", 3*mib, 3*mib+3*mib/4, 64*mib, 1)
++	// Capacity bounds this window to piece 3 plus three future pieces; request a
++	// deliberately smaller upper so this read finishes at an exact boundary.
++	if _, err := c.UpdatePlaybackWindow(1, 0, 64*mib, "end", 3*mib, 3*mib+3*mib/4, 4*mib, 2, false); err != nil {
++		t.Fatal(err)
++	}
++	seedRetainedPayloads(t, c, 3)
++	reader := c.NewPlaybackReader(file, "end")
++	defer c.CloseReader(reader)
++	reader.SetResponsive()
++	reader.SetPlaybackPrefetch(true)
++	if _, err := reader.Seek(3*mib+3*mib/4, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	data := make([]byte, 256<<10)
++	if n, err := reader.Read(data); err != nil || n != len(data) {
++		t.Fatalf("bounded read %d %v", n, err)
++	}
++	if reader.Offset() != 4*mib || reader.active() {
++		t.Fatalf("fill did not park at logical upper: offset%d active%v", reader.Offset(), reader.active())
++	}
++	if pos, err := reader.Reader.Seek(0, io.SeekCurrent); err != nil || pos != file.Length() {
++		t.Fatalf("underlying reader not parked at EOF: %d %v", pos, err)
++	}
++	c.clearPriority()
++	assertNoMissingPiecePriority(t, c)
++	if n, err := reader.Read(data); n != 0 || err != io.EOF {
++		t.Fatalf("read past upper %d %v", n, err)
++	}
++	if _, err := c.UpdatePlaybackWindow(1, 0, 64*mib, "end", 3*mib, 3*mib+3*mib/4, 8*mib, 3, false); err != nil {
++		t.Fatal(err)
++	}
++	seedRetainedPayloads(t, c, 4)
++	if n, err := reader.Read(data[:64]); err != nil || n != 64 || !bytes.Equal(data[:64], bytes.Repeat([]byte{5}, 64)) {
++		t.Fatalf("expanded reader failed logical resume: %d %v", n, err)
++	}
++}
+diff --git a/server/torr/storage/torrstor/prefetch_capacity_test.go b/server/torr/storage/torrstor/prefetch_capacity_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/storage/torrstor/prefetch_capacity_test.go
+@@ -0,0 +1,279 @@
++package torrstor
++
++import (
++	"errors"
++	"io"
++	"testing"
++
++	"github.com/anacrolix/torrent"
++	"github.com/anacrolix/torrent/metainfo"
++)
++
++const (
++	prefetchCapacityMiB = int64(1 << 20)
++	prefetchRequestA    = "11111111-1111-4111-8111-111111111111"
++	prefetchRequestB    = "22222222-2222-4222-8222-222222222222"
++	capacityReadStart   = 4*prefetchCapacityMiB + 128*(1<<10)
++	capacityReadEnd     = 12 * prefetchCapacityMiB
++)
++
++func capacityFixture(t *testing.T) (*torrent.File, *Cache, PlaybackWindow) {
++	t.Helper()
++	file, cache := playbackTestTorrent(t, 16*prefetchCapacityMiB, 4*prefetchCapacityMiB)
++	window := setWindow(t, cache, "capacity", 4*prefetchCapacityMiB, capacityReadStart, 16*prefetchCapacityMiB, 1)
++	if window.Upper != 8*prefetchCapacityMiB {
++		t.Fatalf("capacity fixture window %+v", window)
++	}
++	seedRetainedPayloads(t, cache, 4, 5, 6, 7)
++	return file, cache, window
++}
++
++func capacityReader(t *testing.T, file *torrent.File, cache *Cache, requestID string, start, end int64) *Reader {
++	t.Helper()
++	reader := cache.NewPrefetchReaderAt(file, "capacity", start)
++	t.Cleanup(func() { cache.CloseReader(reader) })
++	reader.SetPrefetchRequest(requestID, start, end)
++	if _, err := reader.Seek(start, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	return reader
++}
++
++// Read the exact resident allowance first. Only the following nonempty Read is
++// stopped by policy; reaching the same offset alone is not terminal proof.
++func reachCapacityEOF(t *testing.T, reader *Reader, start, upper int64) int64 {
++	t.Helper()
++	data := make([]byte, upper-start)
++	if n, err := io.ReadFull(reader, data); err != nil || int64(n) != upper-start {
++		t.Fatalf("resident quota read: n=%d err=%v", n, err)
++	}
++	if stop := reader.PrefetchCapacityStop(); stop != nil {
++		t.Fatalf("merely reaching the quota captured an unobserved EOF: %+v", stop)
++	}
++	reader.Read(nil)
++	if stop := reader.PrefetchCapacityStop(); stop != nil {
++		t.Fatalf("an empty read fabricated capacity EOF proof: %+v", stop)
++	}
++	if n, err := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
++		t.Fatalf("actual capacity boundary: n=%d err=%v", n, err)
++	}
++	return upper - start
++}
++
++func TestPrefetchCapacityOtherConsumerShrinksQuotaWithoutOwnRevision(t *testing.T) {
++	const mib = prefetchCapacityMiB
++	file, cache := playbackTestTorrent(t, 32*mib, 8*mib)
++	initial := setWindow(t, cache, "capacity", 4*mib, capacityReadStart, 32*mib, 1)
++	if initial.Upper != 12*mib {
++		t.Fatalf("initial eight-piece window %+v", initial)
++	}
++	seedRetainedPayloads(t, cache, 4, 5, 6, 7, 8, 9, 10, 11)
++	const requestedEnd = 24 * mib
++	reader := capacityReader(t, file, cache, prefetchRequestA, capacityReadStart, requestedEnd)
++	first := make([]byte, 32<<10)
++	if n, err := reader.Read(first); err != nil || n != len(first) {
++		t.Fatalf("initial body prefix: n=%d err=%v", n, err)
++	}
++	setWindow(t, cache, "another-consumer", 20*mib, 20*mib, 32*mib, 1)
++	cache.muPolicy.Lock()
++	shrunk := cache.windows["capacity"].PlaybackWindow
++	cache.muPolicy.Unlock()
++	if shrunk.Upper >= initial.Upper || shrunk.Revision != initial.Revision {
++		t.Fatalf("fixture must reduce the quota without changing its owner's revision: before=%+v after=%+v", initial, shrunk)
++	}
++	// A subsequent finite suffix can have been planned from the old ACK at
++	// exactly the newly reduced frontier. It must report a real zero-byte
++	// quota EOF, even though this consumer's revision did not change. Do not
++	// drain toward a moving frontier here: active read-ahead itself changes
++	// the fair-share allocation and is exercised separately above.
++	reader.SetPrefetchRequest(prefetchRequestB, shrunk.Upper, requestedEnd)
++	if _, err := reader.Seek(shrunk.Upper, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	if n, err := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
++		t.Fatalf("newly reduced frontier: n=%d err=%v", n, err)
++	}
++	assertCapacityStop(t, reader.PrefetchCapacityStop(), prefetchRequestB, shrunk.Upper, requestedEnd, shrunk.Upper, 1)
++	if !cache.RecordPrefetchStop(reader, 0) {
++		t.Fatal("another consumer's quota reduction was not publishable as an actual capacity stop")
++	}
++	ack := setWindow(t, cache, "capacity", 4*mib, capacityReadStart, 32*mib, 2)
++	assertCapacityStop(t, ack.PrefetchStop, prefetchRequestB, shrunk.Upper, requestedEnd, shrunk.Upper, 1)
++}
++
++func assertCapacityStop(t *testing.T, stop *PlaybackPrefetchStop, requestID string, start, end, next int64, revision uint64) {
++	t.Helper()
++	if stop == nil || stop.Reason != "capacity" || stop.RequestID != requestID || stop.FileIndex != 1 ||
++		stop.RangeStart != start || stop.RangeEnd != end || stop.NextOffset != next || stop.Revision != revision {
++		t.Fatalf("capacity stop %+v; want id=%q file=1 range=[%d,%d) next=%d revision=%d", stop, requestID, start, end, next, revision)
++	}
++}
++
++func TestPrefetchCapacityStopPublishesBeforeOrAfterWindowACK(t *testing.T) {
++	for _, ackBeforeRecord := range []bool{false, true} {
++		name := "terminal-before-ack"
++		if ackBeforeRecord {
++			name = "ack-before-terminal"
++		}
++		t.Run(name, func(t *testing.T) {
++			file, cache, initial := capacityFixture(t)
++			reader := capacityReader(t, file, cache, prefetchRequestA, capacityReadStart, capacityReadEnd)
++			if cache.RecordPrefetchStop(reader, 0) || reader.PrefetchCapacityStop() != nil {
++				t.Fatal("an active request published capacity without observing a quota EOF")
++			}
++			prefix := reachCapacityEOF(t, reader, capacityReadStart, initial.Upper)
++			assertCapacityStop(t, reader.PrefetchCapacityStop(), prefetchRequestA, capacityReadStart, capacityReadEnd, initial.Upper, 1)
++			if cache.RecordPrefetchStop(reader, prefix-1) || cache.RecordPrefetchStop(reader, prefix+1) {
++				t.Fatal("a delivered prefix differing from the captured read frontier published capacity")
++			}
++			revision := uint64(2)
++			if ackBeforeRecord {
++				ack := setWindow(t, cache, "capacity", 4*prefetchCapacityMiB, capacityReadStart, 16*prefetchCapacityMiB, revision)
++				if ack.PrefetchStop != nil {
++					t.Fatal("an ACK preceding terminal publication fabricated a stop")
++				}
++				revision++
++			}
++			if !cache.RecordPrefetchStop(reader, prefix) {
++				t.Fatal("an exact, still-owned capacity EOF was not published")
++			}
++			if initial.PrefetchStop != nil {
++				t.Fatal("publishing rewrote an already returned ACK")
++			}
++			ack := setWindow(t, cache, "capacity", 4*prefetchCapacityMiB, capacityReadStart, 16*prefetchCapacityMiB, revision)
++			assertCapacityStop(t, ack.PrefetchStop, prefetchRequestA, capacityReadStart, capacityReadEnd, initial.Upper, 1)
++			// Exported pointers are value snapshots, never writable references into
++			// live reader/window state.
++			readerCopy := reader.PrefetchCapacityStop()
++			readerCopy.RequestID = "outside-mutation"
++			ack.PrefetchStop.NextOffset = -1
++			assertCapacityStop(t, reader.PrefetchCapacityStop(), prefetchRequestA, capacityReadStart, capacityReadEnd, initial.Upper, 1)
++			refreshed := setWindow(t, cache, "capacity", 4*prefetchCapacityMiB, capacityReadStart, 16*prefetchCapacityMiB, revision+1)
++			assertCapacityStop(t, refreshed.PrefetchStop, prefetchRequestA, capacityReadStart, capacityReadEnd, initial.Upper, 1)
++		})
++	}
++}
++
++func TestPrefetchCapacityNewestRequestOwnsPublication(t *testing.T) {
++	file, cache, initial := capacityFixture(t)
++	old := capacityReader(t, file, cache, prefetchRequestA, capacityReadStart, capacityReadEnd)
++	prefix := reachCapacityEOF(t, old, capacityReadStart, initial.Upper)
++	if !cache.RecordPrefetchStop(old, prefix) {
++		t.Fatal("first request did not publish its capacity stop")
++	}
++	newer := capacityReader(t, file, cache, prefetchRequestB, capacityReadStart, capacityReadEnd)
++	if cache.RecordPrefetchStop(old, prefix) {
++		t.Fatal("a late old request published after a newer nonce took ownership")
++	}
++	ack := setWindow(t, cache, "capacity", 4*prefetchCapacityMiB, capacityReadStart, 16*prefetchCapacityMiB, 2)
++	if ack.PrefetchStop != nil {
++		t.Fatal("a new request inherited the previous nonce's terminal event")
++	}
++	newPrefix := reachCapacityEOF(t, newer, capacityReadStart, initial.Upper)
++	if !cache.RecordPrefetchStop(newer, newPrefix) {
++		t.Fatal("the latest request could not publish its own capacity EOF")
++	}
++	if cache.RecordPrefetchStop(old, prefix) {
++		t.Fatal("a late old terminal overwrote the newest request's event")
++	}
++	ack = setWindow(t, cache, "capacity", 4*prefetchCapacityMiB, capacityReadStart, 16*prefetchCapacityMiB, 3)
++	assertCapacityStop(t, ack.PrefetchStop, prefetchRequestB, capacityReadStart, capacityReadEnd, initial.Upper, 2)
++}
++
++func TestPrefetchCapacityReleaseInvalidatesProofAndLateReader(t *testing.T) {
++	file, cache, initial := capacityFixture(t)
++	reader := capacityReader(t, file, cache, prefetchRequestA, capacityReadStart, capacityReadEnd)
++	prefix := reachCapacityEOF(t, reader, capacityReadStart, initial.Upper)
++	if !cache.RecordPrefetchStop(reader, prefix) {
++		t.Fatal("capacity stop was not initially published")
++	}
++	removed, err := cache.UpdatePlaybackWindow(0, 0, 0, "capacity", 0, 0, 0, 2, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if removed.PrefetchStop != nil || cache.RecordPrefetchStop(reader, prefix) {
++		t.Fatal("released consumer retained or republished its terminal proof")
++	}
++	ack := setWindow(t, cache, "capacity", 4*prefetchCapacityMiB, capacityReadStart, 16*prefetchCapacityMiB, 3)
++	if ack.PrefetchStop != nil || cache.RecordPrefetchStop(reader, prefix) {
++		t.Fatal("recreating a consumer resurrected an old request's stop")
++	}
++}
++
++func TestPrefetchCapacityFileSwitchInvalidatesProof(t *testing.T) {
++	const mib = prefetchCapacityMiB
++	info := metainfo.Info{Name: "files", PieceLength: mib, Files: []metainfo.FileInfo{
++		{Path: []string{"A.mkv"}, Length: 16 * mib},
++		{Path: []string{"B.mkv"}, Length: 8 * mib},
++	}, Pieces: make([]byte, 24*20)}
++	files, cache := playbackTestTorrentFiles(t, info, 4*mib)
++	initial, err := cache.UpdatePlaybackWindow(1, files[0].Offset(), files[0].Length(), "capacity", 4*mib, capacityReadStart, files[0].Length(), 1, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	seedRetainedPayloads(t, cache, 4, 5, 6, 7)
++	reader := capacityReader(t, files[0], cache, prefetchRequestA, capacityReadStart, capacityReadEnd)
++	prefix := reachCapacityEOF(t, reader, capacityReadStart, initial.Upper)
++	if !cache.RecordPrefetchStop(reader, prefix) {
++		t.Fatal("file A capacity stop did not publish")
++	}
++	switched, err := cache.UpdatePlaybackWindow(2, files[1].Offset(), files[1].Length(), "capacity", 0, 0, files[1].Length(), 2, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if switched.PrefetchStop != nil || cache.RecordPrefetchStop(reader, prefix) {
++		t.Fatal("file B inherited or republished file A's terminal proof")
++	}
++}
++
++func TestPrefetchCapacityRequiresRealQuotaEOF(t *testing.T) {
++	t.Run("closed", func(t *testing.T) {
++		file, cache, _ := capacityFixture(t)
++		reader := capacityReader(t, file, cache, prefetchRequestA, capacityReadStart, capacityReadEnd)
++		reader.Close()
++		if n, err := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
++			t.Fatalf("closed read: n=%d err=%v", n, err)
++		}
++		if reader.PrefetchCapacityStop() != nil || cache.RecordPrefetchStop(reader, 0) {
++			t.Fatal("closed reader was mislabeled as capacity")
++		}
++	})
++	t.Run("requested-range-complete", func(t *testing.T) {
++		file, cache, initial := capacityFixture(t)
++		reader := capacityReader(t, file, cache, prefetchRequestA, capacityReadStart, initial.Upper)
++		data := make([]byte, initial.Upper-capacityReadStart)
++		if _, err := io.ReadFull(reader, data); err != nil {
++			t.Fatal(err)
++		}
++		if n, err := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
++			t.Fatalf("complete range: n=%d err=%v", n, err)
++		}
++		if reader.PrefetchCapacityStop() != nil || cache.RecordPrefetchStop(reader, int64(len(data))) {
++			t.Fatal("fully delivered requested range was mislabeled as capacity")
++		}
++	})
++	t.Run("file-eof", func(t *testing.T) {
++		const length = 2 * prefetchCapacityMiB
++		file, cache := playbackTestTorrent(t, length, 4*prefetchCapacityMiB)
++		setWindow(t, cache, "capacity", 0, 0, length, 1)
++		seedRetainedPayloads(t, cache, 0, 1)
++		reader := capacityReader(t, file, cache, prefetchRequestA, 0, length)
++		n, err := io.Copy(io.Discard, reader)
++		if err != nil || n != length {
++			t.Fatalf("file EOF: n=%d err=%v", n, err)
++		}
++		if reader.PrefetchCapacityStop() != nil || cache.RecordPrefetchStop(reader, n) {
++			t.Fatal("file EOF was mislabeled as capacity")
++		}
++	})
++	t.Run("missing-window", func(t *testing.T) {
++		file, cache := playbackTestTorrent(t, 16*prefetchCapacityMiB, 4*prefetchCapacityMiB)
++		reader := capacityReader(t, file, cache, prefetchRequestA, capacityReadStart, capacityReadEnd)
++		if n, err := reader.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
++			t.Fatalf("missing window: n=%d err=%v", n, err)
++		}
++		if reader.PrefetchCapacityStop() != nil || cache.RecordPrefetchStop(reader, 0) {
++			t.Fatal("an absent window was mislabeled as capacity")
++		}
++	})
++}
+diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrstor/reader.go
+--- a/server/torr/storage/torrstor/reader.go
++++ b/server/torr/storage/torrstor/reader.go
+@@ -1,227 +1,353 @@
+ package torrstor
+ 
+ import (
++	"context"
+ 	"io"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/anacrolix/torrent"
+-
+-	"server/log"
+ 	"server/settings"
+ )
+ 
+ type Reader struct {
+ 	torrent.Reader
+-	offset    int64
+-	readahead int64
+-	file      *torrent.File
+-
+-	cache    *Cache
+-	isClosed bool
+-
+-	// inFlight counts reads and seeks inside the underlying reader; guarded by mu.
+-	inFlight int
+-
+-	///Preload
+-	lastAccess int64
+-	isUse      bool
+-	mu         sync.Mutex
+-}
+-
+-func newReader(file *torrent.File, cache *Cache) *Reader {
+-	r := new(Reader)
+-	r.file = file
+-	r.Reader = file.NewReader()
+-
+-	r.SetReadahead(0)
+-	r.cache = cache
+-	r.isUse = true
+-
++	readContext        context.Context
++	cancelRead         context.CancelFunc
++	offset, readahead  int64
++	file               *torrent.File
++	cache              *Cache
++	isClosed           bool
++	inFlight           int
++	readStart, readEnd int64
++	consumer           string
++	managed            bool
++	prefetch           bool
++	prefetchRequest    *playbackPrefetchRequest
++	capacityStop       *PlaybackPrefetchStop
++	minOffset          int64
++	maxOffset          int64
++	lastAccess         int64
++	isUse              bool
++	mu                 sync.Mutex
++}
++
++func newReader(file *torrent.File, cache *Cache, consumer string) *Reader {
++	return newReaderAt(file, cache, consumer, 0, false)
++}
++
++func newReaderAt(file *torrent.File, cache *Cache, consumer string, start int64, prefetch bool) *Reader {
++	ctx, cancel := context.WithCancel(context.Background())
++	backend := file.NewReader()
++	backend.SetReadahead(0)
++	if prefetch {
++		backend.Seek(start, io.SeekStart)
++	}
++	r := &Reader{readContext: ctx, cancelRead: cancel, Reader: backend, file: file, cache: cache, isUse: !prefetch, consumer: consumer, lastAccess: time.Now().Unix(), offset: start, prefetch: prefetch}
++	if consumer != "" {
++		// A short range request may finish before the one-second progress
++		// update. Start its lookahead immediately, within its applied window.
++		r.readahead = 16 << 20
++	}
++	r.Reader.SetReadahead(0)
++	cache.muPolicy.Lock()
+ 	cache.muReaders.Lock()
+ 	cache.readers[r] = struct{}{}
+ 	cache.muReaders.Unlock()
++	cache.replanWindowsLocked()
++	cache.muPolicy.Unlock()
++	r.applyReadahead()
+ 	return r
+ }
+ 
+ func (r *Reader) Seek(offset int64, whence int) (n int64, err error) {
+-	if r.isClosed {
++	r.mu.Lock()
++	closed := r.isClosed
++	prefetch := r.prefetch
++	r.mu.Unlock()
++	if closed {
+ 		return 0, io.EOF
+ 	}
+-	switch whence {
+-	case io.SeekStart:
+-		r.offset = offset
+-	case io.SeekCurrent:
+-		r.offset += offset
+-	case io.SeekEnd:
+-		r.offset = r.file.Length() + offset
+-	}
+-	r.beginIO()
+-	defer r.endIO()
++	// ServeContent probes length and positions before reading. Those seeks must
++	// not activate a parked prefetch or protect unrelated file-head/tail pieces.
++	if !prefetch {
++		r.beginIO()
++		defer r.endIO()
++	}
+ 	n, err = r.Reader.Seek(offset, whence)
++	r.mu.Lock()
+ 	r.offset = n
+ 	r.lastAccess = time.Now().Unix()
++	r.mu.Unlock()
++	r.applyReadahead()
+ 	return
+ }
+ 
+ func (r *Reader) Read(p []byte) (n int, err error) {
+-	err = io.EOF
+-	if r.isClosed {
+-		return
+-	}
+-	if r.file.Torrent() != nil && r.file.Torrent().Info() != nil {
+-		r.beginIO()
+-		defer r.endIO()
+-		n, err = r.Reader.Read(p)
+-
+-		// samsung tv fix xvid/divx
+-		//if r.offset == 0 && len(p) >= 192 {
+-		//	str := strings.ToLower(string(p[112:116]))
+-		//	if str == "xvid" || str == "divx" {
+-		//		p[112] = 0x4D // M
+-		//		p[113] = 0x50 // P
+-		//		p[114] = 0x34 // 4
+-		//		p[115] = 0x56 // V
+-		//	}
+-		//	str = strings.ToLower(string(p[188:192]))
+-		//	if str == "xvid" || str == "divx" {
+-		//		p[188] = 0x4D // M
+-		//		p[189] = 0x50 // P
+-		//		p[190] = 0x34 // 4
+-		//		p[191] = 0x56 // V
+-		//	}
+-		//}
+-
+-		r.offset += int64(n)
+-		r.lastAccess = time.Now().Unix()
++	r.mu.Lock()
++	closed := r.isClosed
++	r.mu.Unlock()
++	if closed {
++		return 0, io.EOF
++	}
++	length := r.claimIO(int64(len(p)), true)
++	if length == 0 {
++		return 0, io.EOF
++	}
++	p = p[:length]
++	defer r.endIO()
++	r.mu.Lock()
++	// The library advances its cursor before returning. Reserve that maximum
++	// advance now so its relative lookahead cannot cross the window meanwhile.
++	r.applyReadaheadForAdvanceLocked(length)
++	r.mu.Unlock()
++	ctx := r.readContext
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	n, err = r.Reader.ReadContext(ctx, p)
++	r.mu.Lock()
++	r.offset += int64(n)
++	r.lastAccess = time.Now().Unix()
++	if r.prefetch && !r.isClosed && r.offset >= r.maxOffset {
++		// The bounded fill is finished. EOF removes the library's mandatory
++		// current-piece priority while preserving our logical resume offset.
++		r.isUse = false
++		r.Reader.SetReadahead(0)
++		r.Reader.Seek(r.file.Length(), io.SeekStart)
+ 	} else {
+-		log.TLogln("Torrent closed and readed")
+-	}
++		r.applyReadaheadLocked()
++	}
++	r.mu.Unlock()
+ 	return
+ }
+ 
+ func (r *Reader) SetReadahead(length int64) {
++	r.mu.Lock()
++	r.readahead = length
++	r.applyReadaheadLocked()
++	r.mu.Unlock()
++}
++func (r *Reader) applyReadahead() { r.mu.Lock(); r.applyReadaheadLocked(); r.mu.Unlock() }
++func (r *Reader) applyReadaheadLocked() {
++	r.applyReadaheadForAdvanceLocked(0)
++}
++func (r *Reader) applyReadaheadForAdvanceLocked(advance int64) {
++	length := r.readahead
+ 	if r.cache != nil && length > r.cache.capacity {
+ 		length = r.cache.capacity
+ 	}
+-	if r.isUse {
+-		r.Reader.SetReadahead(length)
+-	}
+-	r.readahead = length
+-}
+-
+-func (r *Reader) Offset() int64 {
+-	return r.offset
+-}
+-
+-func (r *Reader) Readahead() int64 {
+-	return r.readahead
+-}
+-
++	if r.managed {
++		if r.offset < r.minOffset {
++			length = 0
++		} else {
++			length = min(length, max(0, r.maxOffset-r.offset-advance))
++		}
++	}
++	if !r.isUse || r.isClosed {
++		length = 0
++	}
++	r.Reader.SetReadahead(length)
++}
++func (r *Reader) Offset() int64    { r.mu.Lock(); defer r.mu.Unlock(); return r.offset }
++func (r *Reader) Readahead() int64 { r.mu.Lock(); defer r.mu.Unlock(); return r.readahead }
++func (r *Reader) active() bool     { r.mu.Lock(); defer r.mu.Unlock(); return r.isUse && !r.isClosed }
+ func (r *Reader) Close() {
+-	// file reader close in gotorrent
+-	// this struct close in cache
++	r.mu.Lock()
++	if r.isClosed {
++		r.mu.Unlock()
++		return
++	}
+ 	r.isClosed = true
+-	if len(r.file.Torrent().Files()) > 0 {
+-		r.Reader.Close()
+-	}
+-	go r.cache.getRemPieces()
+-}
+-
++	r.isUse = false
++	r.mu.Unlock()
++	if r.cancelRead != nil {
++		r.cancelRead()
++	}
++	r.Reader.Close()
++	go r.cache.cleanPieces()
++}
+ func (r *Reader) getPiecesRange() Range {
+-	startOff, endOff := r.getOffsetRange()
+-	return Range{r.getPieceNum(startOff), r.getPieceNum(endOff), r.file}
+-}
+-
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	off := r.offsetRangeLocked()
++	if r.managed {
++		off = [2]int64{r.offset, r.offset}
++		if r.inFlight > 0 {
++			off[0] = min(off[0], r.readStart)
++			off[1] = max(off[1], r.readEnd-1)
++		}
++	}
++	return Range{r.getPieceNum(off[0]), r.getPieceNum(off[1]), r.file}
++}
++func (r *Reader) getLoadRange() Range {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	off := r.offsetRangeLocked()
++	if r.managed {
++		off[0] = r.offset
++		off[1] = max(r.offset, r.maxOffset-1)
++	}
++	return Range{r.getPieceNum(off[0]), r.getPieceNum(off[1]), r.file}
++}
+ func (r *Reader) getReaderPiece() int {
++	r.mu.Lock()
++	defer r.mu.Unlock()
+ 	return r.getPieceNum(r.offset)
+ }
+-
+ func (r *Reader) getReaderRAHPiece() int {
+-	return r.getPieceNum(r.offset + r.readahead)
+-}
+-
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	end := r.offset + r.readahead
++	if r.managed {
++		end = min(end, max(r.offset, r.maxOffset-1))
++	}
++	return r.getPieceNum(end)
++}
+ func (r *Reader) getPieceNum(offset int64) int {
+-	return int((offset + r.file.Offset()) / r.cache.pieceLength)
+-}
+-
++	return int((min(max(0, offset), max(0, r.file.Length()-1)) + r.file.Offset()) / r.cache.pieceLength)
++}
+ func (r *Reader) getOffsetRange() (int64, int64) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	off := r.offsetRangeLocked()
++	return off[0], off[1]
++}
++func (r *Reader) offsetRangeLocked() [2]int64 {
+ 	prc := int64(settings.BTsets.ReaderReadAHead)
+-	readers := int64(r.getUseReaders())
+-	if readers == 0 {
++	// Counting readers here must not take reader locks recursively.
++	readers := int64(r.cache.Readers())
++	if readers < 1 {
+ 		readers = 1
+ 	}
+-
+-	beginOffset := r.offset - (r.cache.capacity/readers)*(100-prc)/100
+-	endOffset := r.offset + (r.cache.capacity/readers)*prc/100
+-
+-	if beginOffset < 0 {
+-		beginOffset = 0
+-	}
+-
+-	if endOffset > r.file.Length() {
+-		endOffset = r.file.Length()
+-	}
+-	return beginOffset, endOffset
+-}
+-
++	return [2]int64{max(0, r.offset-(r.cache.capacity/readers)*(100-prc)/100), min(r.file.Length(), r.offset+(r.cache.capacity/readers)*prc/100)}
++}
+ func (r *Reader) checkReader() {
+-	if time.Now().Unix() > r.lastAccess+60 && r.cache.Readers() > 1 {
+-		r.readerOff()
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	// Test and resume under the same lock: a completed prefetch can park
++	// between separate check/resume locks, then be reactivated at its upper.
++	if r.prefetch && !r.isUse {
++		return
++	}
++	idle := time.Now().Unix() > r.lastAccess+60
++	if idle && r.cache.Readers() > 1 {
++		r.readerOffLocked()
+ 	} else {
++		r.resume()
++	}
++}
++func (r *Reader) SetPlaybackPrefetch(prefetch bool) {
++	r.mu.Lock()
++	r.prefetch = prefetch
++	r.mu.Unlock()
++}
++func (r *Reader) beginIO()               { r.claimIO(1, false) }
++func (r *Reader) beginRead(length int64) { r.claimIO(length, false) }
++func (r *Reader) claimIO(length int64, limit bool) int64 {
++	if r.cache != nil {
++		r.cache.muPolicy.Lock()
++	}
++	r.mu.Lock()
++	if limit && r.prefetch {
++		requestedLength := length
++		length = min(length, max(0, r.maxOffset-r.offset))
++		if length == 0 && requestedLength > 0 && !r.isClosed && r.managed && r.prefetchRequest != nil && r.cache != nil {
++			request := r.prefetchRequest
++			if w, ok := r.cache.readerWindowLocked(r); ok && r.offset >= w.Upper && r.offset >= request.start && r.offset < request.end && r.offset < r.file.Length() {
++				r.capacityStop = &PlaybackPrefetchStop{Reason: "capacity", RequestID: request.id, FileIndex: w.fileIndex, RangeStart: request.start, RangeEnd: request.end, NextOffset: r.offset, Revision: w.Revision}
++			}
++		}
++	}
++	if length > 0 {
++		r.inFlight++
++		r.readStart = r.offset
++		r.readEnd = r.offset + length
++	}
++	r.mu.Unlock()
++	if r.cache != nil {
++		r.cache.muPolicy.Unlock()
++	}
++	if length > 0 {
+ 		r.readerOn()
+ 	}
+-}
+-
+-// beginIO claims the reader for one read or seek and resumes it if the sweep parked it.
+-// Registering under mu is what keeps readerOff from parking it until endIO.
+-func (r *Reader) beginIO() {
+-	r.mu.Lock()
+-	defer r.mu.Unlock()
+-	r.inFlight++
+-	r.resume()
+-}
+-
+-func (r *Reader) endIO() {
+-	r.mu.Lock()
+-	r.inFlight--
+-	r.mu.Unlock()
+-}
+-
+-func (r *Reader) readerOn() {
+-	r.mu.Lock()
+-	defer r.mu.Unlock()
+-	r.resume()
+-}
++	return length
++}
++func (r *Reader) endIO()    { r.mu.Lock(); r.inFlight--; r.mu.Unlock() }
++func (r *Reader) readerOn() { r.mu.Lock(); defer r.mu.Unlock(); r.resume() }
+ 
+ // resume must be called with mu held.
+ func (r *Reader) resume() {
+-	if !r.isUse {
+-		if pos, err := r.Reader.Seek(0, io.SeekCurrent); err == nil && pos == 0 {
++	if !r.isUse && !r.isClosed {
++		if r.managed {
+ 			r.Reader.Seek(r.offset, io.SeekStart)
+-		}
+-		r.SetReadahead(r.readahead)
++		} else if pos, err := r.Reader.Seek(0, io.SeekCurrent); err == nil && pos == 0 {
++			r.Reader.Seek(r.offset, io.SeekStart)
++		}
+ 		r.isUse = true
+-	}
+-}
+-
++		r.applyReadaheadLocked()
++	}
++}
+ func (r *Reader) readerOff() {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+-	// lastAccess is stamped only when a read returns, so a read blocked on the swarm makes a
+-	// busy reader look idle; seeking the anacrolix reader under it moves that read.
+-	if r.inFlight > 0 {
++	r.readerOffLocked()
++}
++func (r *Reader) readerOffLocked() {
++	if r.inFlight > 0 || r.isClosed {
+ 		return
+ 	}
+ 	if r.isUse {
+-		r.SetReadahead(0)
+ 		r.isUse = false
+-		if r.offset > 0 {
++		r.applyReadaheadLocked()
++		if r.managed {
++			// Readahead zero still requests the current piece in the torrent
++			// library. EOF has an empty piece range, so a parked playback
++			// reader cannot restart downloading the file's first piece.
++			r.Reader.Seek(r.file.Length(), io.SeekStart)
++		} else if r.offset > 0 {
+ 			r.Reader.Seek(0, io.SeekStart)
+ 		}
+ 	}
+ }
+-
+-func (r *Reader) getUseReaders() int {
+-	return r.cache.GetUseReaders()
+-}
++func (r *Reader) getUseReaders() int { return r.cache.GetUseReaders() }
++
++type playbackPrefetchRequest struct {
++	id         string
++	start, end int64
++}
++
++// SetPrefetchRequest identifies the caller's finite HTTP range. Its UUID is
++// validated by the HTTP handler and is never reused across retries or sources.
++func (r *Reader) SetPrefetchRequest(requestID string, start, end int64) {
++	if r.cache != nil {
++		r.cache.muPolicy.Lock()
++		defer r.cache.muPolicy.Unlock()
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.capacityStop = nil
++	if requestID == "" || start < 0 || end <= start {
++		r.prefetchRequest = nil
++		return
++	}
++	r.prefetchRequest = &playbackPrefetchRequest{id: requestID, start: start, end: end}
++	if r.cache != nil && r.prefetch && r.managed && !r.isClosed {
++		if _, ok := r.cache.readerWindowLocked(r); ok {
++			if r.cache.prefetchRequests == nil {
++				r.cache.prefetchRequests = make(map[string]string)
++			}
++			r.cache.prefetchRequests[r.consumer] = requestID
++			delete(r.cache.prefetchStops, r.consumer)
++		}
++	}
++}
++func (r *Reader) PrefetchCapacityStop() *PlaybackPrefetchStop {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.capacityStop == nil {
++		return nil
++	}
++	snapshot := *r.capacityStop
++	return &snapshot
++}
+diff --git a/server/torr/storage/torrstor/storage.go b/server/torr/storage/torrstor/storage.go
+--- a/server/torr/storage/torrstor/storage.go
++++ b/server/torr/storage/torrstor/storage.go
+@@ -15,12 +15,16 @@
+ 	caches   map[metainfo.Hash]*Cache
+ 	capacity int64
+ 	mu       sync.Mutex
++
++	muWindows       sync.Mutex
++	windowRevisions map[metainfo.Hash]map[string]uint64
+ }
+ 
+ func NewStorage(capacity int64) *Storage {
+ 	stor := new(Storage)
+ 	stor.capacity = capacity
+ 	stor.caches = make(map[metainfo.Hash]*Cache)
++	stor.windowRevisions = make(map[metainfo.Hash]map[string]uint64)
+ 	return stor
+ }
+ 
+@@ -86,3 +90,29 @@
+ 	}
+ 	return nil
+ }
++
++// RemovePlaybackWindow records releases even after the last torrent reader/cache
++// has closed. The revision tombstone is scoped to this worker's storage/hash.
++func (s *Storage) RemovePlaybackWindow(hash metainfo.Hash, consumer string, revision uint64) (PlaybackWindow, error) {
++	if consumer == "" || revision == 0 {
++		return PlaybackWindow{}, ErrInvalidPlaybackWindow
++	}
++	if c := s.GetCache(hash); c != nil && !c.isClosed.Load() {
++		result, err := c.UpdatePlaybackWindow(0, 0, 0, consumer, 0, 0, 0, revision, true)
++		if err != ErrPlaybackCacheClosed {
++			return result, err
++		}
++	}
++	s.muWindows.Lock()
++	defer s.muWindows.Unlock()
++	revisions := s.windowRevisions[hash]
++	if revisions == nil {
++		revisions = make(map[string]uint64)
++		s.windowRevisions[hash] = revisions
++	}
++	if revision <= revisions[consumer] {
++		return PlaybackWindow{}, ErrStalePlaybackRevision
++	}
++	revisions[consumer] = revision
++	return PlaybackWindow{Revision: revision}, nil
++}
+diff --git a/server/torr/stream.go b/server/torr/stream.go
+--- a/server/torr/stream.go
++++ b/server/torr/stream.go
+@@ -8,6 +8,8 @@
+ 	"log"
+ 	"net"
+ 	"net/http"
++	"strconv"
++	"strings"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -18,6 +20,7 @@
+ 	mt "server/mimetype"
+ 	sets "server/settings"
+ 	"server/torr/state"
++	"server/torr/storage/torrstor"
+ )
+ 
+ // Add atomic counter for concurrent streams
+@@ -88,7 +91,15 @@
+ 		return err
+ 	}
+ 	// Create reader with context for timeout
+-	reader := t.NewReader(file)
++	consumer := req.URL.Query().Get("playback_consumer")
++	prefetch := req.URL.Query().Get("playback_prefetch") == "1" && consumer != ""
++	start, end, finiteRange := finitePrefetchRange(req.Header.Get("Range"))
++	var reader *torrstor.Reader
++	if prefetch && req.Method == http.MethodGet && finiteRange {
++		reader = t.newPrefetchStreamReader(file, consumer, start)
++	} else {
++		reader = t.newStreamReader(file, consumer)
++	}
+ 	if reader == nil {
+ 		// NewReader returns nil only for a torrent closed after the GotInfo check above
+ 		err := errors.New("cannot create torrent reader")
+@@ -96,7 +107,25 @@
+ 		return err
+ 	}
+ 	// Ensure reader is always closed
++	reader.SetPlaybackPrefetch(prefetch)
++	var prefetchResponse *prefetchResponseWriter
++	if id := req.URL.Query().Get("playback_prefetch_request"); prefetch && req.Method == http.MethodGet && validPlaybackPrefetchRequestID(id) {
++		if finiteRange {
++			reader.SetPrefetchRequest(id, start, end)
++			prefetchResponse = &prefetchResponseWriter{ResponseWriter: resp, status: http.StatusOK}
++			resp = prefetchResponse
++		}
++	}
+ 	defer t.CloseReader(reader)
++	streamDone := make(chan struct{})
++	defer close(streamDone)
++	go func() {
++		select {
++		case <-req.Context().Done():
++			reader.Close()
++		case <-streamDone:
++		}
++	}()
+ 
+ 	if sets.BTsets.ResponsiveMode {
+ 		reader.SetResponsive()
+@@ -128,7 +157,9 @@
+ 	})
+ 
+ 	// Set response headers
+-	resp.Header().Set("Connection", "close")
++	if !keepPlaybackRangeAlive(req) {
++		resp.Header().Set("Connection", "close")
++	}
+ 	// Set response header for Kodi
+ 	resp.Header().Set("Server", "TorrServer (Portable SDK for UPnP devices)")
+ 	// Add timeout header if configured
+@@ -173,6 +204,11 @@
+ 	// http.ServeContent(wrappedResp, req, file.Path(), time.Unix(t.Timestamp, 0), reader)
+ 
+ 	http.ServeContent(resp, req, file.Path(), time.Unix(t.Timestamp, 0), newBufferedStreamReader(reader, 1<<20))
++	if prefetchResponse != nil && prefetchResponse.status == http.StatusPartialContent && !prefetchResponse.failed && req.Context().Err() == nil {
++		if cache := t.GetCache(); cache != nil {
++			cache.RecordPrefetchStop(reader, prefetchResponse.written)
++		}
++	}
+ 
+ 	if sets.BTsets.EnableDebug {
+ 		if clerr != nil {
+@@ -188,3 +224,85 @@
+ func GetActiveStreams() int32 {
+ 	return atomic.LoadInt32(&activeStreams)
+ }
++
++// Core reads finite ranges repeatedly. Keeping their TCP connection alive avoids
++// another connection handshake for bytes that are already available in RAM.
++// The torrent reader still closes when each individual response finishes.
++func keepPlaybackRangeAlive(req *http.Request) bool {
++	if req.Method != http.MethodGet || req.URL.Query().Get("playback_consumer") == "" || req.URL.Query().Get("playback_prefetch") == "1" {
++		return false
++	}
++	value, ok := strings.CutPrefix(req.Header.Get("Range"), "bytes=")
++	if !ok {
++		return false
++	}
++	first, last, ok := strings.Cut(value, "-")
++	if !ok || first == "" || last == "" || strings.Trim(first, "0123456789") != "" || strings.Trim(last, "0123456789") != "" {
++		return false
++	}
++	lower, err := strconv.ParseInt(first, 10, 64)
++	if err != nil {
++		return false
++	}
++	upper, err := strconv.ParseInt(last, 10, 64)
++	return err == nil && upper >= lower
++}
++
++// This wrapper is used only for nonce-tagged prefetch requests. It records the
++// actual successful HTTP prefix, independently of buffered source lookahead.
++type prefetchResponseWriter struct {
++	http.ResponseWriter
++	written int64
++	failed  bool
++	status  int
++}
++
++func (w *prefetchResponseWriter) WriteHeader(status int) {
++	w.status = status
++	w.ResponseWriter.WriteHeader(status)
++}
++func (w *prefetchResponseWriter) Write(p []byte) (int, error) {
++	n, err := w.ResponseWriter.Write(p)
++	w.written += int64(n)
++	if err != nil || n != len(p) {
++		w.failed = true
++	}
++	return n, err
++}
++
++func validPlaybackPrefetchRequestID(id string) bool {
++	if len(id) != 36 {
++		return false
++	}
++	for i, c := range id {
++		if i == 8 || i == 13 || i == 18 || i == 23 {
++			if c != '-' {
++				return false
++			}
++			continue
++		}
++		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
++			return false
++		}
++	}
++	return true
++}
++func finitePrefetchRange(value string) (int64, int64, bool) {
++	value, ok := strings.CutPrefix(value, "bytes=")
++	if !ok {
++		return 0, 0, false
++	}
++	first, last, ok := strings.Cut(value, "-")
++	if !ok || first == "" || last == "" || strings.Trim(first, "0123456789") != "" || strings.Trim(last, "0123456789") != "" {
++		return 0, 0, false
++	}
++	start, err := strconv.ParseInt(first, 10, 64)
++	if err != nil {
++		return 0, 0, false
++	}
++	end, err := strconv.ParseInt(last, 10, 64)
++	if err != nil || end < start || end == 1<<63-1 {
++		return 0, 0, false
++	}
++	return start, end + 1, true
++}
+diff --git a/server/torr/stream_keepalive_test.go b/server/torr/stream_keepalive_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/stream_keepalive_test.go
+@@ -0,0 +1,199 @@
++package torr
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha1"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/anacrolix/torrent"
++	"github.com/anacrolix/torrent/bencode"
++	"github.com/anacrolix/torrent/metainfo"
++	"server/settings"
++	"server/torr/state"
++	"server/torr/storage/torrstor"
++)
++
++func TestKeepPlaybackRangeAliveScope(t *testing.T) {
++	for _, test := range []struct {
++		name, method, query, byteRange string
++		want                           bool
++	}{
++		{"finite range", "GET", "playback_consumer=core", "bytes=10-20", true},
++		{"first byte", "GET", "playback_consumer=core", "bytes=0-0", true},
++		{"leading zeroes", "GET", "playback_consumer=core", "bytes=001-002", true},
++		{"head", "HEAD", "playback_consumer=core", "bytes=10-20", false},
++		{"post", "POST", "playback_consumer=core", "bytes=10-20", false},
++		{"save without consumer", "GET", "", "bytes=10-20", false},
++		{"empty consumer", "GET", "playback_consumer=", "bytes=10-20", false},
++		{"prefetch", "GET", "playback_consumer=core&playback_prefetch=1", "bytes=10-20", false},
++		{"no range", "GET", "playback_consumer=core", "", false},
++		{"open ended", "GET", "playback_consumer=core", "bytes=10-", false},
++		{"suffix", "GET", "playback_consumer=core", "bytes=-20", false},
++		{"multiple ranges", "GET", "playback_consumer=core", "bytes=0-1,4-5", false},
++		{"reversed range", "GET", "playback_consumer=core", "bytes=20-10", false},
++		{"leading whitespace", "GET", "playback_consumer=core", " bytes=10-20", false},
++		{"range whitespace", "GET", "playback_consumer=core", "bytes=10-20 ", false},
++		{"positive sign", "GET", "playback_consumer=core", "bytes=+10-20", false},
++		{"wrong unit", "GET", "playback_consumer=core", "items=10-20", false},
++		{"integer overflow", "GET", "playback_consumer=core", "bytes=0-9223372036854775808", false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			req := httptest.NewRequest(test.method, "/stream/movie.mkv?"+test.query, nil)
++			req.Header.Set("Range", test.byteRange)
++			if got := keepPlaybackRangeAlive(req); got != test.want {
++				t.Fatalf("keepPlaybackRangeAlive(%s %q, %q)=%v, want %v", test.method, test.query, test.byteRange, got, test.want)
++			}
++		})
++	}
++}
++
++// Stream updates the process-wide Viewed database. Run this integration test in
++// its own test process so InitSets and background cache readers cannot race or
++// change the settings of another package test.
++func TestStreamManagedFiniteRangesReuseConnection(t *testing.T) {
++	const childKey = "KHUA_STREAM_KEEPALIVE_TEST_CHILD"
++	if os.Getenv(childKey) != "1" {
++		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++		defer cancel()
++		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStreamManagedFiniteRangesReuseConnection$", "-test.v")
++		cmd.Env = append(os.Environ(), childKey+"=1")
++		if output, err := cmd.CombinedOutput(); err != nil {
++			t.Fatalf("isolated Stream integration test: %v\n%s", err, output)
++		}
++		return
++	}
++
++	settings.Path = t.TempDir()
++	settings.Args = &settings.ExecArgs{}
++	if err := settings.InitSets(false, false); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(settings.CloseDB)
++	settings.BTsets.CacheSize = 4 << 20
++	settings.BTsets.ReaderReadAHead = 95
++	settings.BTsets.TorrentDisconnectTimeout = 30
++	settings.BTsets.ConnectionsLimit = 25
++	settings.BTsets.UseDisk = false
++	settings.BTsets.ResponsiveMode = true
++	settings.BTsets.TrackTimecode = false
++
++	payload := make([]byte, 1<<20)
++	for i := range payload {
++		payload[i] = byte(i*31 + i/256)
++	}
++	const pieceLength = 64 << 10
++	info := metainfo.Info{Name: "movie.mkv", Length: int64(len(payload)), PieceLength: pieceLength}
++	for offset := 0; offset < len(payload); offset += pieceLength {
++		hash := sha1.Sum(payload[offset : offset+pieceLength])
++		info.Pieces = append(info.Pieces, hash[:]...)
++	}
++	mi := metainfo.MetaInfo{InfoBytes: bencode.MustMarshal(info)}
++	spec := &torrent.TorrentSpec{InfoHash: mi.HashInfoBytes(), InfoBytes: mi.InfoBytes, DisplayName: info.Name}
++	store := torrstor.NewStorage(settings.BTsets.CacheSize)
++	config := torrent.NewDefaultClientConfig()
++	config.DefaultStorage = store
++	config.DataDir = t.TempDir()
++	config.DisableTCP = true
++	config.DisableUTP = true
++	config.NoDHT = true
++	config.DisableTrackers = true
++	config.NoDefaultPortForwarding = true
++	client, err := torrent.NewClient(config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { client.Close() })
++	backend, _, err := client.AddTorrentSpec(spec)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cache := store.GetCache(spec.InfoHash)
++	if cache == nil {
++		t.Fatal("known metainfo did not create its cache")
++	}
++	cache.SetTorrent(backend)
++	for i := 0; i < info.NumPieces(); i++ {
++		data := payload[i*pieceLength : (i+1)*pieceLength]
++		if n, err := cache.Piece(info.Piece(i)).WriteAt(data, 0); err != nil || n != len(data) {
++			t.Fatalf("seed piece %d: n=%d err=%v", i, n, err)
++		}
++		backend.Piece(i).VerifyData()
++		if !backend.PieceState(i).Complete {
++			t.Fatalf("seeded piece %d failed its actual SHA1 verification", i)
++		}
++	}
++	if _, err := cache.UpdatePlaybackWindow(1, 0, int64(len(payload)), "core-test", 0, 0, int64(len(payload)), 1, false); err != nil {
++		t.Fatal(err)
++	}
++	wrapped := &Torrent{Torrent: backend, TorrentSpec: spec, Stat: state.TorrentWorking,
++		cache: cache, closed: backend.Closed(), Timestamp: time.Now().Unix()}
++	var connections atomic.Int32
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		if err := wrapped.Stream(1, req, w); err != nil {
++			t.Errorf("Stream: %v", err)
++		}
++	}))
++	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
++		if state == http.StateNew {
++			connections.Add(1)
++		}
++	}
++	server.Start()
++	t.Cleanup(server.Close)
++	transport := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 1}
++	t.Cleanup(transport.CloseIdleConnections)
++	httpClient := &http.Client{Transport: transport, Timeout: 3 * time.Second}
++	getRange := func(start, end int, closeRequest bool) bool {
++		t.Helper()
++		req, err := http.NewRequest(http.MethodGet, server.URL+"/stream/movie.mkv?playback_consumer=core-test", nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
++		req.Close = closeRequest
++		response, err := httpClient.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		data, err := io.ReadAll(response.Body)
++		response.Body.Close()
++		if err != nil {
++			t.Fatal(err)
++		}
++		wantRange := fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload))
++		if response.StatusCode != http.StatusPartialContent || response.Header.Get("Content-Range") != wantRange || !bytes.Equal(data, payload[start:end+1]) {
++			t.Fatalf("range %d-%d: status=%d Content-Range=%q bytes=%d", start, end, response.StatusCode, response.Header.Get("Content-Range"), len(data))
++		}
++		deadline := time.Now().Add(time.Second)
++		for (cache.Readers() != 0 || GetActiveStreams() != 0) && time.Now().Before(deadline) {
++			time.Sleep(time.Millisecond)
++		}
++		if cache.Readers() != 0 || GetActiveStreams() != 0 {
++			t.Fatal("finished finite response retained its torrent reader or active stream")
++		}
++		return response.Close
++	}
++	firstClosed := getRange(64<<10+17, 320<<10+16, false)
++	secondClosed := getRange(512<<10+29, 768<<10+28, false)
++	if connections.Load() != 1 || firstClosed || secondClosed {
++		t.Fatalf("two managed finite responses used %d TCP connections (response.Close=%v/%v), want one reusable connection", connections.Load(), firstClosed, secondClosed)
++	}
++	if !getRange(0, 65535, true) {
++		t.Fatal("an explicit request.Close was not honored")
++	}
++	before := connections.Load()
++	getRange(900000, 901023, false)
++	if connections.Load() != before+1 {
++		t.Fatalf("GET after explicit close did not create one fresh TCP connection: before=%d after=%d", before, connections.Load())
++	}
++}
+diff --git a/server/torr/torrent.go b/server/torr/torrent.go
+--- a/server/torr/torrent.go
++++ b/server/torr/torrent.go
+@@ -151,8 +151,10 @@
+ 					// torrent was dropped while waiting for info: CloseHash already removed the cache
+ 					return false
+ 				}
++				cache.SetTorrent(t.Torrent)
++				t.muTorrent.Lock()
+ 				t.cache = cache
+-				cache.SetTorrent(t.Torrent)
++				t.muTorrent.Unlock()
+ 			}
+ 		}
+ 		return true
+@@ -259,9 +261,9 @@
+ 		t.DownloadSpeed = 0
+ 		t.UploadSpeed = 0
+ 	}
+-	t.muTorrent.Unlock()
+-
+ 	t.lastTimeSpeed = time.Now()
++	t.muTorrent.Unlock()
++
+ 	t.updateRA()
+ }
+ 
+@@ -280,17 +282,16 @@
+ 	// 	go t.cache.AdjustRA(adj)
+ 	// }
+ 	adj := int64(16 << 20) // 16 MB fixed RA
+-	go t.cache.AdjustRA(adj)
++	if cache := t.GetCache(); cache != nil {
++		go cache.AdjustRA(adj)
++	}
+ }
+ 
+ func (t *Torrent) expired() bool {
+-	if t.cache == nil {
+-		return false
+-	}
+-	t.muTorrent.Lock()
+-	stat, expiredTime := t.Stat, t.expiredTime
+-	t.muTorrent.Unlock()
+-	return t.cache.Readers() == 0 && expiredTime.Before(time.Now()) && (stat == state.TorrentWorking || stat == state.TorrentClosed)
++	t.muTorrent.Lock()
++	cache, stat, expiredTime := t.cache, t.Stat, t.expiredTime
++	t.muTorrent.Unlock()
++	return cache != nil && cache.Readers() == 0 && !cache.HasPlaybackWindows() && expiredTime.Before(time.Now()) && (stat == state.TorrentWorking || stat == state.TorrentClosed)
+ }
+ 
+ func (t *Torrent) Files() []*torrent.File {
+@@ -319,19 +320,49 @@
+ }
+ 
+ func (t *Torrent) NewReader(file *torrent.File) *torrstor.Reader {
+-	if t.Stat == state.TorrentClosed {
++	t.muTorrent.Lock()
++	stat, cache := t.Stat, t.cache
++	t.muTorrent.Unlock()
++	if stat == state.TorrentClosed || cache == nil {
+ 		return nil
+ 	}
+-	reader := t.cache.NewReader(file)
++	reader := cache.NewReader(file)
+ 	return reader
+ }
+ 
++func (t *Torrent) newStreamReader(file *torrent.File, consumer string) *torrstor.Reader {
++	t.muTorrent.Lock()
++	stat, cache := t.Stat, t.cache
++	t.muTorrent.Unlock()
++	if stat == state.TorrentClosed || cache == nil {
++		return nil
++	}
++	if consumer != "" {
++		return cache.NewPlaybackReader(file, consumer)
++	}
++	return cache.NewReader(file)
++}
++
++func (t *Torrent) newPrefetchStreamReader(file *torrent.File, consumer string, start int64) *torrstor.Reader {
++	t.muTorrent.Lock()
++	stat, cache := t.Stat, t.cache
++	t.muTorrent.Unlock()
++	if stat == state.TorrentClosed || cache == nil {
++		return nil
++	}
++	return cache.NewPrefetchReaderAt(file, consumer, start)
++}
++
+ func (t *Torrent) CloseReader(reader *torrstor.Reader) {
+-	t.cache.CloseReader(reader)
++	if cache := t.GetCache(); cache != nil {
++		cache.CloseReader(reader)
++	}
+ 	t.AddExpiredTime(time.Second * time.Duration(settings.BTsets.TorrentDisconnectTimeout))
+ }
+ 
+ func (t *Torrent) GetCache() *torrstor.Cache {
++	t.muTorrent.Lock()
++	defer t.muTorrent.Unlock()
+ 	return t.cache
+ }
+ 
+diff --git a/server/web/api/playback_retention_test.go b/server/web/api/playback_retention_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/web/api/playback_retention_test.go
+@@ -0,0 +1,140 @@
++package api
++
++import (
++	"bytes"
++	"crypto/sha1"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/anacrolix/torrent"
++	"github.com/anacrolix/torrent/bencode"
++	"github.com/anacrolix/torrent/metainfo"
++	"github.com/gin-gonic/gin"
++	config "server/settings"
++	"server/torr"
++	"server/torr/storage/torrstor"
++	"server/web/auth"
++)
++
++// Exercise the production HTTP route, file lookup, real in-memory torrent
++// storage, and one-second idle watchdog. No status polling or HTTP download
++// reader is allowed to mask expiry while the paused playback window owns RAM.
++func TestPlaybackWindowHTTPRetainsIdleCacheAcrossTinySeeks(t *testing.T) {
++	const piece = int64(64 << 10)
++	const pieces = 16
++	gin.SetMode(gin.TestMode)
++	// Background tracker/watchdog goroutines retain the process globals, so keep
++	// this isolated test package's configuration alive until process exit.
++	config.Args = &config.ExecArgs{}
++	config.BTsets = &config.BTSets{CacheSize: 8 * piece, TorrentDisconnectTimeout: 1, DisableTCP: true, DisableUTP: true, DisableDHT: true, DisablePEX: true, DisableUPNP: true, DisableUpload: true, ConnectionsLimit: 1}
++	config.PubIPv4 = "203.0.113.1"
++	config.HttpAuth = true
++	bt := torr.NewBTS()
++	if err := bt.Connect(); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(bt.Disconnect)
++	info := metainfo.Info{Name: "paused.mkv", Length: pieces * piece, PieceLength: piece}
++	payloads := make([][]byte, pieces)
++	for id := range payloads {
++		payloads[id] = bytes.Repeat([]byte{byte(id + 1)}, int(piece))
++		sum := sha1.Sum(payloads[id])
++		info.Pieces = append(info.Pieces, sum[:]...)
++	}
++	mi := metainfo.MetaInfo{InfoBytes: bencode.MustMarshal(info)}
++	tor, err := torr.NewTorrent(&torrent.TorrentSpec{InfoHash: mi.HashInfoBytes(), InfoBytes: mi.InfoBytes}, bt)
++	if err != nil || !tor.GotInfo() {
++		t.Fatalf("new torrent: %v", err)
++	}
++	cache := tor.GetCache()
++	router := gin.New()
++	router.Use(auth.BasicAuth(gin.Accounts{"test": "private"}))
++	SetupRoute(router)
++	server := httptest.NewServer(router)
++	t.Cleanup(server.Close)
++	client := server.Client()
++	client.Timeout = 5 * time.Second
++	post := func(body string, status int) torrstor.PlaybackWindow {
++		t.Helper()
++		req, err := http.NewRequest(http.MethodPost, server.URL+"/playback/window", bytes.NewBufferString(body))
++		if err != nil {
++			t.Fatal(err)
++		}
++		req.Header.Set("Content-Type", "application/json")
++		req.SetBasicAuth("test", "private")
++		resp, err := client.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer resp.Body.Close()
++		var result torrstor.PlaybackWindow
++		if resp.StatusCode != status {
++			t.Fatalf("window status %d, want %d", resp.StatusCode, status)
++		}
++		if status == http.StatusOK {
++			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
++				t.Fatal(err)
++			}
++		}
++		return result
++	}
++	update := func(revision int, current int64) torrstor.PlaybackWindow {
++		return post(fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"paused","revision":%d,"lower":%d,"current":%d,"upper":%d}`, mi.HashInfoBytes().HexString(), revision, 4*piece, current, info.Length), http.StatusOK)
++	}
++	initial := update(1, 6*piece+32)
++	if initial.Lower != 4*piece || initial.Upper != 12*piece {
++		t.Fatalf("initial window %+v", initial)
++	}
++	for id := 4; id < 12; id++ {
++		backing := cache.Piece(info.Piece(id))
++		if n, err := backing.WriteAt(payloads[id], 0); err != nil || n != int(piece) {
++			t.Fatalf("seed piece %d: %d %v", id, n, err)
++		}
++		if err := backing.MarkComplete(); err != nil {
++			t.Fatal(err)
++		}
++		tor.Torrent.Piece(id).VerifyData()
++	}
++	check := func() {
++		t.Helper()
++		state := cache.GetState()
++		if state.Filled != 8*piece || cache.Readers() != 0 {
++			t.Fatalf("paused filled=%d readers=%d", state.Filled, cache.Readers())
++		}
++		for id := 4; id < 12; id++ {
++			if state.Pieces[id].Size != piece || !state.Pieces[id].Completed {
++				t.Fatalf("resident piece %d lost: %+v", id, state.Pieces[id])
++			}
++			data := make([]byte, piece)
++			if n, err := cache.Piece(info.Piece(id)).ReadAt(data, 0); err != nil || n != int(piece) || !bytes.Equal(data, payloads[id]) {
++				t.Fatalf("piece %d payload changed: %d %v", id, n, err)
++			}
++		}
++	}
++	check()
++	// Longer than both the configured deadline and the watchdog tick, without
++	// any request that could extend Torrent.expiredTime.
++	time.Sleep(2200 * time.Millisecond)
++	check()
++	for _, step := range []struct {
++		revision int
++		current  int64
++	}{{2, 6*piece + 64}, {3, 6*piece + 16}, {4, 6*piece + 33}} {
++		got := update(step.revision, step.current)
++		if got.Lower != initial.Lower || got.Upper != initial.Upper {
++			t.Fatalf("tiny seek changed coverage: %+v", got)
++		}
++		check()
++	}
++	// A delayed older release/update cannot remove the replacement window.
++	post(fmt.Sprintf(`{"hash":%q,"consumer":"paused","revision":2,"remove":true}`, mi.HashInfoBytes().HexString()), http.StatusConflict)
++	check()
++	post(fmt.Sprintf(`{"hash":%q,"consumer":"paused","revision":5,"remove":true}`, mi.HashInfoBytes().HexString()), http.StatusOK)
++	if filled := cache.GetState().Filled; filled != 0 {
++		t.Fatalf("explicit final release retained %d bytes", filled)
++	}
++}
+diff --git a/server/web/api/playback_window.go b/server/web/api/playback_window.go
+new file mode 100644
+--- /dev/null
++++ b/server/web/api/playback_window.go
+@@ -0,0 +1,94 @@
++package api
++
++import (
++	"encoding/hex"
++	"errors"
++	"net/http"
++	"regexp"
++
++	"github.com/anacrolix/torrent/metainfo"
++	"github.com/gin-gonic/gin"
++	"server/torr"
++	"server/torr/storage/torrstor"
++)
++
++type playbackWindowRequest struct {
++	Hash      string `json:"hash"`
++	FileIndex int    `json:"file_index"`
++	Consumer  string `json:"consumer"`
++	Lower     *int64 `json:"lower"`
++	Current   *int64 `json:"current"`
++	Upper     *int64 `json:"upper"`
++	Revision  uint64 `json:"revision"`
++	Remove    bool   `json:"remove"`
++}
++
++var playbackConsumerPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
++
++// playbackWindow manages retention only; it never requests missing pieces.
++// Offsets are file-relative bytes, with exclusive upper. File indices are the
++// sorted, 1-based IDs used by /play. Managed stream URLs carry
++// ?playback_consumer=<consumer>; ordinary/save URLs keep independent protection.
++func playbackWindow(c *gin.Context) { handlePlaybackWindow(c, applyPlaybackWindow) }
++
++func handlePlaybackWindow(c *gin.Context, apply func(playbackWindowRequest) (torrstor.PlaybackWindow, error)) {
++	var req playbackWindowRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid playback window JSON"})
++		return
++	}
++	hash, err := hex.DecodeString(req.Hash)
++	if err != nil || len(hash) != 20 || (!req.Remove && req.FileIndex <= 0) || !playbackConsumerPattern.MatchString(req.Consumer) || req.Revision == 0 || (!req.Remove && (req.Lower == nil || req.Current == nil || req.Upper == nil || *req.Lower < 0 || *req.Lower > *req.Current || *req.Current < 0 || *req.Upper <= *req.Current)) {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid playback window"})
++		return
++	}
++	result, err := apply(req)
++	if err != nil {
++		status := http.StatusBadRequest
++		if errors.Is(err, torrstor.ErrStalePlaybackRevision) {
++			status = http.StatusConflict
++		}
++		if errors.Is(err, torrstor.ErrPlaybackCacheClosed) || errors.Is(err, errPlaybackNotFound) {
++			status = http.StatusNotFound
++		}
++		c.JSON(status, gin.H{"error": err.Error()})
++		return
++	}
++	c.JSON(http.StatusOK, result)
++}
++
++func applyPlaybackWindow(req playbackWindowRequest) (torrstor.PlaybackWindow, error) {
++	if req.Remove {
++		return torr.RemovePlaybackWindow(metainfo.NewHashFromHex(req.Hash), req.Consumer, req.Revision)
++	}
++	tor := torr.GetTorrent(req.Hash)
++	if tor == nil || tor.Torrent == nil || tor.Info() == nil || tor.GetCache() == nil {
++		return torrstor.PlaybackWindow{}, errPlaybackNotFound
++	}
++	fileOffset, fileLength := int64(0), int64(0)
++	found := false
++	for _, st := range tor.Status().FileStats {
++		if st.Id != req.FileIndex {
++			continue
++		}
++		for _, file := range tor.Files() {
++			if file.Path() == st.Path {
++				fileOffset = file.Offset()
++				fileLength = file.Length()
++				found = true
++				break
++			}
++		}
++		break
++	}
++	if !found {
++		return torrstor.PlaybackWindow{}, errPlaybackNotFound
++	}
++	lower, current, upper := int64(0), int64(0), int64(0)
++	if !req.Remove {
++		lower, current, upper = *req.Lower, *req.Current, *req.Upper
++	}
++	return tor.GetCache().UpdatePlaybackWindow(req.FileIndex, fileOffset, fileLength, req.Consumer, lower, current, upper, req.Revision, req.Remove)
++}
++
++var errPlaybackNotFound = errors.New("torrent cache or file not found")
+diff --git a/server/web/api/playback_window_test.go b/server/web/api/playback_window_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/web/api/playback_window_test.go
+@@ -0,0 +1,107 @@
++package api
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	config "server/settings"
++	"server/torr/storage/torrstor"
++	"server/web/auth"
++)
++
++const playbackTestHash = "0123456789012345678901234567890123456789"
++
++func TestPlaybackWindowHTTPValidationAndResponses(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	tests := []struct {
++		name, body string
++		code       int
++	}{
++		{"malformed", "{", 400},
++		{"missing", "{}", 400},
++		{"bad hash", `{"hash":"xyz","file_index":1,"consumer":"a","revision":1,"lower":0,"current":1,"upper":10}`, 400},
++		{"missing lower", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":1,"current":1,"upper":10}`, playbackTestHash), 400},
++		{"negative lower", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":1,"lower":-1,"current":1,"upper":10}`, playbackTestHash), 400},
++		{"unordered", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":1,"lower":2,"current":1,"upper":10}`, playbackTestHash), 400},
++		{"empty window", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":1,"lower":0,"current":10,"upper":10}`, playbackTestHash), 400},
++		{"missing revision", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","lower":0,"current":1,"upper":10}`, playbackTestHash), 400},
++		{"bad consumer", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a/b","revision":1,"lower":0,"current":1,"upper":10}`, playbackTestHash), 400},
++		{"negative revision", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":-1,"remove":true}`, playbackTestHash), 400},
++		{"zero file id", fmt.Sprintf(`{"hash":%q,"file_index":0,"consumer":"a","revision":1,"lower":0,"current":1,"upper":10}`, playbackTestHash), 400},
++		{"valid", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":1,"lower":0,"current":1,"upper":10}`, playbackTestHash), 200},
++		{"exact remove payload", fmt.Sprintf(`{"hash":%q,"consumer":"a","revision":2,"remove":true}`, playbackTestHash), 200},
++		{"remove without offsets", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":2,"remove":true}`, playbackTestHash), 200},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			calls := 0
++			r := gin.New()
++			r.POST("/playback/window", func(c *gin.Context) {
++				handlePlaybackWindow(c, func(req playbackWindowRequest) (torrstor.PlaybackWindow, error) {
++					calls++
++					return torrstor.PlaybackWindow{Lower: 0, Current: 1, Upper: 10, PieceLength: 10, Revision: req.Revision}, nil
++				})
++			})
++			req := httptest.NewRequest("POST", "/playback/window", strings.NewReader(tt.body))
++			req.Header.Set("Content-Type", "application/json")
++			w := httptest.NewRecorder()
++			r.ServeHTTP(w, req)
++			if w.Code != tt.code {
++				t.Fatalf("status %d body %s", w.Code, w.Body)
++			}
++			if tt.code == 200 {
++				var data map[string]any
++				if err := json.Unmarshal(w.Body.Bytes(), &data); err != nil {
++					t.Fatal(err)
++				}
++				if len(data) != 5 || data["piece_length"] != float64(10) {
++					t.Fatalf("unexpected JSON %v", data)
++				}
++			} else if calls != 0 {
++				t.Fatal("invalid request reached cache")
++			}
++		})
++	}
++	for _, tc := range []struct {
++		err    error
++		status int
++	}{{torrstor.ErrStalePlaybackRevision, 409}, {torrstor.ErrInvalidPlaybackWindow, 400}, {torrstor.ErrPlaybackCacheClosed, 404}, {errPlaybackNotFound, 404}} {
++		r := gin.New()
++		r.POST("/playback/window", func(c *gin.Context) {
++			handlePlaybackWindow(c, func(playbackWindowRequest) (torrstor.PlaybackWindow, error) { return torrstor.PlaybackWindow{}, tc.err })
++		})
++		req := httptest.NewRequest("POST", "/playback/window", strings.NewReader(fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":2,"remove":true}`, playbackTestHash)))
++		w := httptest.NewRecorder()
++		r.ServeHTTP(w, req)
++		if w.Code != tc.status {
++			t.Fatalf("%v status %d", tc.err, w.Code)
++		}
++	}
++}
++func TestPlaybackWindowProductionRouteRequiresAuthentication(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	previous := config.HttpAuth
++	config.HttpAuth = true
++	t.Cleanup(func() { config.HttpAuth = previous })
++	r := gin.New()
++	r.Use(auth.BasicAuth(gin.Accounts{"user": "secret"}))
++	SetupRoute(r)
++	req := httptest.NewRequest(http.MethodPost, "/playback/window", strings.NewReader("{}"))
++	w := httptest.NewRecorder()
++	r.ServeHTTP(w, req)
++	if w.Code != 401 {
++		t.Fatalf("unauthenticated mutation status %d", w.Code)
++	}
++	req = httptest.NewRequest(http.MethodPost, "/playback/window", strings.NewReader("{}"))
++	req.SetBasicAuth("user", "secret")
++	w = httptest.NewRecorder()
++	r.ServeHTTP(w, req)
++	if w.Code != 400 {
++		t.Fatalf("authenticated route status %d, want validation", w.Code)
++	}
++}
+diff --git a/server/web/api/route.go b/server/web/api/route.go
+--- a/server/web/api/route.go
++++ b/server/web/api/route.go
+@@ -28,6 +28,7 @@
+ 	authorized.POST("/torrent/upload", torrentUpload)
+ 
+ 	authorized.POST("/cache", cache)
++	authorized.POST("/playback/window", playbackWindow)
+ 
+ 	route.HEAD("/stream", stream)
+ 	route.GET("/stream", stream)

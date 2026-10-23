@@ -3,21 +3,24 @@ import QuartzCore
 
 /// Compact custom slider for the -100...100 percent adjustments.
 ///
-/// A CALayer track with a white knob, matching the chrome's hand-drawn control
-/// style instead of a themed NSSlider. Clicking jumps to the position, dragging
+/// A CALayer track with a neutral marker and a warm adjustment fill.
+/// The control supports pointer, keyboard and accessibility interaction. Clicking jumps to the position, dragging
 /// moves continuously, and a double-click resets to the default.
 final class SPColorSlider: NSControl {
     var onValueChange: ((Double) -> Void)?
     var onDoubleClick: (() -> Void)?
 
     private enum Metric {
-        static let trackHeight: CGFloat = 4
-        static let knobSize: CGFloat = 12
+        static let trackHeight: CGFloat = 3.5
+        static let knobSize: CGFloat = 15
+        static let neutralHeight: CGFloat = 13
     }
 
     private let trackLayer = CALayer()
     private let fillLayer = CALayer()
-    private let knobLayer = CALayer()
+    private let knobLayer = CAGradientLayer()
+    private let neutralLayer = CALayer()
+    private let focusLayer = CALayer()
     private var dragging = false
     private(set) var percent: Double = 0
 
@@ -26,18 +29,35 @@ final class SPColorSlider: NSControl {
         wantsLayer = true
 
         trackLayer.cornerRadius = Metric.trackHeight / 2
-        trackLayer.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        trackLayer.backgroundColor = NSColor(srgbRed: 0.35, green: 0.35, blue: 0.35, alpha: 1).cgColor
         fillLayer.cornerRadius = Metric.trackHeight / 2
-        fillLayer.backgroundColor = NSColor.white.cgColor
+        fillLayer.backgroundColor = NSColor(srgbRed: 1, green: 193.0 / 255, blue: 102.0 / 255, alpha: 1).cgColor
+        neutralLayer.backgroundColor = NSColor.white.withAlphaComponent(0.30).cgColor
+        focusLayer.borderColor = NSColor(srgbRed: 1, green: 193.0 / 255, blue: 102.0 / 255, alpha: 0.8).cgColor
+        focusLayer.borderWidth = 2
+        focusLayer.cornerRadius = Metric.knobSize / 2 + 3
+        focusLayer.isHidden = true
         knobLayer.cornerRadius = Metric.knobSize / 2
-        knobLayer.backgroundColor = NSColor.white.cgColor
+        knobLayer.colors = [
+            NSColor(srgbRed: 0.99, green: 0.99, blue: 0.97, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.94, green: 0.94, blue: 0.92, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.85, green: 0.85, blue: 0.83, alpha: 1).cgColor
+        ]
+        knobLayer.locations = [0, 0.55, 1]
+        knobLayer.startPoint = CGPoint(x: 0.5, y: 1)
+        knobLayer.endPoint = CGPoint(x: 0.5, y: 0)
+        knobLayer.borderColor = NSColor.black.withAlphaComponent(0.6).cgColor
+        knobLayer.borderWidth = 0.5
         knobLayer.shadowColor = NSColor.black.cgColor
-        knobLayer.shadowOpacity = 0.35
-        knobLayer.shadowRadius = 2
+        knobLayer.shadowOpacity = 0.5
+        knobLayer.shadowRadius = 1.5
         knobLayer.shadowOffset = CGSize(width: 0, height: -1)
         layer?.addSublayer(trackLayer)
+        layer?.addSublayer(neutralLayer)
         layer?.addSublayer(fillLayer)
         layer?.addSublayer(knobLayer)
+        layer?.addSublayer(focusLayer)
+        focusRingType = .none
 
         setAccessibilityRole(.slider)
     }
@@ -49,10 +69,10 @@ final class SPColorSlider: NSControl {
     func setPercentSilently(_ value: Double) {
         percent = SPColorAdjust.clamp(value)
         needsLayout = true
-        setAccessibilityValue("\(Int(percent))")
+        setAccessibilityValue(NSNumber(value: percent))
     }
 
-    override var acceptsFirstResponder: Bool { true }
+    override var acceptsFirstResponder: Bool { isEnabled }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private var trackFrame: NSRect {
@@ -71,6 +91,10 @@ final class SPColorSlider: NSControl {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         trackLayer.frame = track
+        neutralLayer.frame = NSRect(x: track.midX - 0.5,
+                                   y: track.midY - Metric.neutralHeight / 2,
+                                   width: 1,
+                                   height: Metric.neutralHeight)
         let t = fraction(for: percent)
         fillLayer.frame = NSRect(x: track.minX + min(t, 0.5) * track.width,
                                  y: track.minY,
@@ -81,7 +105,50 @@ final class SPColorSlider: NSControl {
                                  y: (bounds.height - Metric.knobSize) / 2,
                                  width: Metric.knobSize,
                                  height: Metric.knobSize)
+        knobLayer.shadowPath = CGPath(ellipseIn: knobLayer.bounds, transform: nil)
+        focusLayer.frame = knobLayer.frame.insetBy(dx: -3, dy: -3)
+        focusLayer.isHidden = window?.firstResponder !== self
+        layer?.opacity = isEnabled ? 1 : 0.35
         CATransaction.commit()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        needsLayout = true
+        return super.becomeFirstResponder()
+    }
+
+    override func resignFirstResponder() -> Bool {
+        needsLayout = true
+        return super.resignFirstResponder()
+    }
+
+    override func accessibilityMinValue() -> Any? { NSNumber(value: -100) }
+    override func accessibilityMaxValue() -> Any? { NSNumber(value: 100) }
+    override func accessibilityPerformIncrement() -> Bool {
+        guard isEnabled else { return false }; changeValue(by: 1); return true
+    }
+    override func accessibilityPerformDecrement() -> Bool {
+        guard isEnabled else { return false }; changeValue(by: -1); return true
+    }
+
+    private func changeValue(by delta: Double) {
+        let next = SPColorAdjust.clamp(percent + delta)
+        guard next != percent else { return }
+        setPercentSilently(next)
+        onValueChange?(next)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        let step: Double = event.modifierFlags.contains(.shift) ? 10 : 1
+        switch event.keyCode {
+        case 123, 125: changeValue(by: -step)
+        case 124, 126: changeValue(by: step)
+        case 115: changeValue(by: -100 - percent)
+        case 119: changeValue(by: 100 - percent)
+        case 36, 76: onDoubleClick?()
+        default: super.keyDown(with: event)
+        }
     }
 
     private func percent(at point: NSPoint) -> Double {
@@ -101,6 +168,7 @@ final class SPColorSlider: NSControl {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
         if event.clickCount >= 2 {
             onDoubleClick?()
             return
@@ -111,225 +179,11 @@ final class SPColorSlider: NSControl {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard dragging else { return }
+        guard dragging, isEnabled else { return }
         applyMouseEvent(event)
     }
 
     override func mouseUp(with event: NSEvent) {
         dragging = false
-    }
-}
-
-/// Floating dark card with one slider row per picture adjustment.
-///
-/// Mirrors the playback notice's overlay pattern: a lazily created subview
-/// placed above the video, faded in and out, laid out by the owning controller.
-final class SPColorPanelView: NSView {
-    private enum Metric {
-        static let width: CGFloat = 336
-        static let sidePadding: CGFloat = 16
-        static let rowHeight: CGFloat = 30
-        static let rowGap: CGFloat = 4
-        static let labelWidth: CGFloat = 98
-        static let valueWidth: CGFloat = 44
-        static let resetSize: CGFloat = 24
-        static let sliderGap: CGFloat = 10
-        static let footerHeight: CGFloat = 30
-        static let fade: CFTimeInterval = 0.15
-    }
-
-    private struct Row {
-        let field: SPColorAdjust.Field
-        let label: NSTextField
-        let slider: SPColorSlider
-        let value: NSTextField
-        let reset: NSButton
-    }
-
-    var onChange: ((_ field: SPColorAdjust.Field, _ percent: Double) -> Void)?
-    var onResetField: ((_ field: SPColorAdjust.Field) -> Void)?
-    var onResetAll: (() -> Void)?
-
-    private var rows: [Row] = []
-    private let resetAllButton = NSButton(title: "", target: nil, action: nil)
-    // Local swap-builds link the UI against a prebuilt framework that may
-    // predate the hue setter; the row is hidden instead of crashing there.
-    private var hueAvailable = true
-
-    private var visibleRows: [Row] {
-        rows.filter { $0.field != .hue || hueAvailable }
-    }
-
-    private var panelHeight: CGFloat {
-        let count = visibleRows.count
-        return CGFloat(count) * Metric.rowHeight
-            + CGFloat(max(count - 1, 0)) * Metric.rowGap + Metric.footerHeight
-    }
-
-    func setHueAvailable(_ available: Bool) {
-        guard hueAvailable != available else { return }
-        hueAvailable = available
-        if let row = rows.first(where: { $0.field == .hue }) {
-            row.label.isHidden = !available
-            row.slider.isHidden = !available
-            row.value.isHidden = !available
-            row.reset.isHidden = !available
-        }
-        setFrameSize(NSSize(width: Metric.width, height: panelHeight))
-        needsLayout = true
-    }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
-        layer?.cornerRadius = 14
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
-        layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowOpacity = 0.4
-        layer?.shadowRadius = 12
-        layer?.shadowOffset = CGSize(width: 0, height: -4)
-
-        let entries: [SPColorAdjust.Field] = [.brightness, .contrast, .saturation, .gamma, .hue]
-        for field in entries {
-            let labelText: String
-            switch field {
-            case .brightness: labelText = L("color.brightness")
-            case .contrast: labelText = L("color.contrast")
-            case .saturation: labelText = L("color.saturation")
-            case .gamma: labelText = L("color.gamma")
-            case .hue: labelText = L("color.hue")
-            }
-            let label = NSTextField(labelWithString: labelText)
-            label.font = .systemFont(ofSize: 13, weight: .medium)
-            label.textColor = .white
-
-            let slider = SPColorSlider(frame: .zero)
-            slider.setAccessibilityLabel(labelText)
-            slider.onValueChange = { [weak self] value in
-                self?.onChange?(field, value)
-            }
-            slider.onDoubleClick = { [weak self] in
-                self?.onResetField?(field)
-            }
-
-            let value = NSTextField(labelWithString: "")
-            value.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-            value.textColor = NSColor.white.withAlphaComponent(0.6)
-            value.alignment = .right
-
-            let reset = NSButton(title: "", target: self,
-                                 action: #selector(resetFieldAction(_:)))
-            if let resetImage = NSImage(systemSymbolName: "arrow.counterclockwise",
-                                        accessibilityDescription: L("color.reset")) {
-                reset.image = resetImage
-            }
-            reset.isBordered = false
-            reset.tag = field.rawValue
-
-            addSubview(label)
-            addSubview(slider)
-            addSubview(value)
-            addSubview(reset)
-            rows.append(Row(field: field, label: label, slider: slider,
-                            value: value, reset: reset))
-        }
-
-        resetAllButton.title = L("color.resetAll")
-        resetAllButton.target = self
-        resetAllButton.action = #selector(resetAllAction(_:))
-        resetAllButton.isBordered = false
-        resetAllButton.font = .systemFont(ofSize: 11, weight: .medium)
-        resetAllButton.contentTintColor = NSColor.white.withAlphaComponent(0.7)
-        addSubview(resetAllButton)
-
-        isHidden = true
-        alphaValue = 0
-        needsLayout = true
-        configure(with: SPColorAdjust())
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("SPColorPanelView: no coder path") }
-
-    @objc private func resetFieldAction(_ sender: NSButton) {
-        guard let field = SPColorAdjust.Field(rawValue: sender.tag) else { return }
-        onResetField?(field)
-    }
-
-    @objc private func resetAllAction(_ sender: NSButton) {
-        onResetAll?()
-    }
-
-    /// Sync every control from the model without emitting change callbacks.
-    func configure(with value: SPColorAdjust) {
-        for row in rows {
-            let percent = value[row.field]
-            row.slider.setPercentSilently(percent)
-            row.value.stringValue = row.field == .hue
-                ? String(format: "%+d°", Int(percent * 1.8))
-                : String(format: "%+d", Int(percent))
-            row.reset.contentTintColor = abs(percent) > 0.001
-                ? NSColor.white.withAlphaComponent(0.85)
-                : NSColor.white.withAlphaComponent(0.3)
-        }
-        resetAllButton.isEnabled = !value.isDefault
-        needsLayout = true
-    }
-
-    override func layout() {
-        let contentTop = bounds.height - Metric.footerHeight
-        for (index, row) in visibleRows.enumerated() {
-            let y = contentTop - Metric.rowHeight
-                - CGFloat(index) * (Metric.rowHeight + Metric.rowGap)
-            let sliderX = Metric.sidePadding + Metric.labelWidth + Metric.sliderGap
-            let sliderW = bounds.width - sliderX - Metric.valueWidth
-                - Metric.resetSize - Metric.sliderGap * 2 - Metric.sidePadding
-            row.label.frame = NSRect(x: Metric.sidePadding, y: y + 6,
-                                     width: Metric.labelWidth, height: 18)
-            row.slider.frame = NSRect(x: sliderX, y: y + 3,
-                                      width: sliderW, height: Metric.rowHeight - 6)
-            row.value.frame = NSRect(x: sliderX + sliderW + Metric.sliderGap, y: y + 7,
-                                     width: Metric.valueWidth, height: 16)
-            row.reset.frame = NSRect(x: bounds.width - Metric.sidePadding - Metric.resetSize,
-                                     y: y + 3, width: Metric.resetSize, height: Metric.resetSize)
-        }
-        let buttonSize = resetAllButton.intrinsicContentSize
-        resetAllButton.frame = NSRect(
-            x: (bounds.width - buttonSize.width) / 2,
-            y: (Metric.footerHeight - buttonSize.height) / 2,
-            width: buttonSize.width, height: buttonSize.height)
-    }
-
-    /// Position the card at the right edge of the playback area, vertically
-    /// centered, matching the visual weight of the on-screen chrome.
-    func place(in bounds: NSRect) {
-        let height = panelHeight
-        let side: CGFloat = bounds.width > Metric.width * 2 ? 24 : 12
-        frame = NSRect(x: bounds.maxX - Metric.width - side,
-                       y: max(bounds.midY - height / 2, 12),
-                       width: Metric.width,
-                       height: height)
-    }
-
-    func setVisible(_ visible: Bool) {
-        if visible {
-            isHidden = false
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = Metric.fade
-                animator().alphaValue = 1
-            }
-        } else {
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = Metric.fade
-                animator().alphaValue = 0
-            }, completionHandler: { [weak self] in
-                MainActor.assumeIsolated {
-                    guard let self, self.alphaValue == 0 else { return }
-                    self.isHidden = true
-                }
-            })
-        }
     }
 }

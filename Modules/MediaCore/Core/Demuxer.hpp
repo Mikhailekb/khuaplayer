@@ -30,6 +30,7 @@ namespace spresil { struct MkvContentMap; struct Mp4KeyEntry; }
 namespace sp {
 
 struct LocalFileIO;
+class HTTPRangeIO;
 
 struct SourceGrowthPub {
     std::atomic<uint8_t> mode{0};              // spgrow::Mode（SPSourceGrowthPolicy.hpp）
@@ -185,7 +186,7 @@ public:
 
     int64_t timelineOriginUs() const { return timelineOriginUs_; }
 
-    int readPacket(AVPacket* pkt);
+    int readPacket(AVPacket* pkt, bool allowHTTPYield = true);
 
     bool lastPacketIsReplay() const { return lastPacketReplay_; }
 
@@ -321,10 +322,13 @@ private:
     void computeTimelineOrigin();
     void rebuildStreamTable();
     bool attachLocalIO(const std::string& path, const std::shared_ptr<LocalFileIO>& source = {});
+    int attachHTTPIO(const std::string& url);
     void detachLocalIO();
 
     AVFormatContext* fmtCtx_ = nullptr;
     AVIOContext* avio_ = nullptr;
+    std::unique_ptr<HTTPRangeIO> httpIO_;
+    bool httpYieldAllowed_ = false; // Only the demux owner reads/writes this flag.
 
     mutable std::mutex ioMtx_;
     std::shared_ptr<LocalFileIO> localIO_;

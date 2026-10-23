@@ -1,68 +1,85 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "source": {
-    "file": "KhuaPlayer-StaticMaster-1024.png",
-    "sha256": "e0840f48d183a096ad5a3f5bcc824f78646fa6ac3dea8a97b3b2bbd16959342b",
-    "width": 1024,
-    "height": 1024,
-    "mode": "RGB",
-    "colorSpace": "sRGB IEC61966-2.1"
+    "file": "Kinolet-Prism-Master.png",
+    "sha256": "f1b2bbd50bd38eb6fea31f5522714d18e0e8c9f05a45a6dbeb7dc61621f25b41",
+    "width": 1254,
+    "height": 1254,
+    "mode": "RGBA",
+    "colorSpace": "untagged; interpreted as sRGB"
   },
   "export": {
-    "alpha": false,
+    "alpha": true,
     "colorSpace": "sRGB IEC61966-2.1",
-    "resampling": "Pillow LANCZOS; every size is rendered directly from the 1024 px master",
+    "resampling": "Pillow LANCZOS; every size is rendered directly from the unchanged RGBA master",
     "pillowVersion": "12.3.0"
   },
   "files": [
     {
       "file": "AppIcon-16.png",
-      "sha256": "cd017832d898b062a83976cd517b6867c1ca5162245b75a28a988a065ce85679",
+      "sha256": "c2c87181311cb33320c5a0793d08dddae718888fd94f3dbfedae007a7df179ec",
       "width": 16,
       "height": 16,
-      "mode": "RGB"
+      "mode": "RGBA"
     },
     {
       "file": "AppIcon-32.png",
-      "sha256": "2589ced501237c445ca49b560b7da869b937778a827941b64f10cf399d0b8041",
+      "sha256": "646c2a30ae8be448874a9664f5d53ea52e85a71fb50c822748cbd91b1ce67f89",
       "width": 32,
       "height": 32,
-      "mode": "RGB"
+      "mode": "RGBA"
     },
     {
       "file": "AppIcon-64.png",
-      "sha256": "01d6c687c22cabe83b81e53ff9bf474b93667d34027baeca4984b729f6377358",
+      "sha256": "a6851a4e089cd97ac1fe7fedb6a084a9c932e8e2a5abc6429fc16fdbdcd7e2ab",
       "width": 64,
       "height": 64,
-      "mode": "RGB"
+      "mode": "RGBA"
     },
     {
       "file": "AppIcon-128.png",
-      "sha256": "b99717636653363f3159a2d9190d6c883acd5f12060e48290911ca91151e5f57",
+      "sha256": "9a4e6393b1b6c2061c36ca3fcf53c26fb842ed3bd537bbb0718679f31dcc1c79",
       "width": 128,
       "height": 128,
-      "mode": "RGB"
+      "mode": "RGBA"
     },
     {
       "file": "AppIcon-256.png",
-      "sha256": "b0d46719821d9e797740072b284cf46ba6b38794acadd88bd9d6bfbb350e066e",
+      "sha256": "13207a398e08771404e957903339f5af3015f493096ae5c0f20a02fef35b25e7",
       "width": 256,
       "height": 256,
-      "mode": "RGB"
+      "mode": "RGBA"
     },
     {
       "file": "AppIcon-512.png",
-      "sha256": "6bfdd25d33bd4804615117ba56ad0fffc99ddb7571274c064756904be83b7009",
+      "sha256": "93b620c76d8b0b03629845d8bffa551a84fe5030c9c8e0942950a2fc7ff61976",
       "width": 512,
       "height": 512,
-      "mode": "RGB"
+      "mode": "RGBA"
     },
     {
       "file": "AppIcon-1024.png",
-      "sha256": "2ea45d13b278d38a151c9fc6b8d99f9f0034b8e6733f19126bff95471081df88",
+      "sha256": "b65cd12859ecfb547b5dfc6cddd46d4b660ac39869c1fdd2bc6cec75c6b57ba4",
       "width": 1024,
       "height": 1024,
-      "mode": "RGB"
+      "mode": "RGBA"
     }
-  ]
+  ],
+  "icns": {
+    "file": "AppIcon.icns",
+    "sha256": "78a5d9d3d899a90524d1c8bbc217cfb874b521b890fb0d8cf2bdc8f25d49449b",
+    "format": "ICNS with unchanged canonical PNG entries",
+    "entries": [
+      "icp4",
+      "icp5",
+      "ic07",
+      "ic08",
+      "ic09",
+      "ic10",
+      "ic11",
+      "ic12",
+      "ic13",
+      "ic14"
+    ]
+  }
 }

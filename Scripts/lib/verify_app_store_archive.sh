@@ -1,5 +1,5 @@
 #!/bin/bash
-# Read-only validation for a distribution-signed Khua App Store archive.
+# Read-only validation for a distribution-signed Kinolet App Store archive.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
@@ -90,9 +90,9 @@ case "$ARCHIVE_PATH" in
   *) ARCHIVE_PATH="$ROOT/$ARCHIVE_PATH" ;;
 esac
 
-APP="$ARCHIVE_PATH/Products/Applications/Khua.app"
+APP="$ARCHIVE_PATH/Products/Applications/Kinolet.app"
 [ -d "$ARCHIVE_PATH" ] || die "archive does not exist: $ARCHIVE_PATH"
-[ -d "$APP" ] || die "archive has no Khua.app: $APP"
+[ -d "$APP" ] || die "archive has no Kinolet.app: $APP"
 
 TEMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -396,12 +396,12 @@ verify_profile() {
 
 verify_info "main app" "$MAIN_INFO" "$BUNDLE_ID"
 verify_info "Quick Look extension" "$APPEX_INFO" "$BUNDLE_ID.QuickLook"
-assert_equal "main bundle name" "$(plist_value "$MAIN_INFO" CFBundleName)" "Khua"
-assert_equal "main display name" "$(plist_value "$MAIN_INFO" CFBundleDisplayName)" "Khua"
-assert_equal "About product name" "$(plist_value "$MAIN_INFO" SPProductName)" "Khua Player"
-assert_equal "main executable name" "$(plist_value "$MAIN_INFO" CFBundleExecutable)" "Khua"
+assert_equal "main bundle name" "$(plist_value "$MAIN_INFO" CFBundleName)" "Кинолёт"
+assert_equal "main display name" "$(plist_value "$MAIN_INFO" CFBundleDisplayName)" "Кинолёт"
+assert_equal "About product name" "$(plist_value "$MAIN_INFO" SPProductName)" "Кинолёт"
+assert_equal "main executable name" "$(plist_value "$MAIN_INFO" CFBundleExecutable)" "Kinolet"
 assert_equal "Quick Look display name" \
-  "$(plist_value "$APPEX_INFO" CFBundleDisplayName)" "Khua Quick Look"
+  "$(plist_value "$APPEX_INFO" CFBundleDisplayName)" "Кинолёт Quick Look"
 [ -f "$FRAMEWORK_INFO" ] || die "media framework Info.plist is missing"
 assert_equal "media framework bundle identifier" \
   "$(plist_value "$FRAMEWORK_INFO" CFBundleIdentifier)" "$BUNDLE_ID.MediaCore"

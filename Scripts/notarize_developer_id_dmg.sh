@@ -88,9 +88,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-APP="$RELEASE_DIR/Khua.app"
-SUBMISSION_DMG="$RELEASE_DIR/Khua-notarization.dmg"
-SUBMISSION_CHECKSUM="$RELEASE_DIR/Khua-notarization.dmg.sha256"
+APP="$RELEASE_DIR/Kinolet.app"
+SUBMISSION_DMG="$RELEASE_DIR/Kinolet-notarization.dmg"
+SUBMISSION_CHECKSUM="$RELEASE_DIR/Kinolet-notarization.dmg.sha256"
 STATE_DIR="$RELEASE_DIR/DmgNotarization"
 [ -d "$APP" ] || die "prepared app is missing: $APP"
 [ -f "$SUBMISSION_DMG" ] || \
@@ -106,7 +106,7 @@ MARKETING_VERSION="$(/usr/libexec/PlistBuddy -c \
   die "app has an invalid bundle identifier: $BUNDLE_ID"
 [[ "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || \
   die "app has an invalid marketing version: $MARKETING_VERSION"
-FINAL_DMG="$RELEASE_DIR/Khua-$MARKETING_VERSION.dmg"
+FINAL_DMG="$RELEASE_DIR/Kinolet-$MARKETING_VERSION.dmg"
 FINAL_CHECKSUM="$FINAL_DMG.sha256"
 
 SUBMISSION_SHA256="$(shasum -a 256 "$SUBMISSION_DMG" | awk '{print $1}')"

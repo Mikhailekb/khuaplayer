@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 from pathlib import Path
 import plistlib
@@ -11,6 +12,7 @@ import re
 import subprocess
 import sys
 from typing import Iterable
+from urllib.parse import urlsplit
 
 import build_manifest
 
@@ -197,27 +199,42 @@ def verify_update_usage_privacy(app: Path, info: dict) -> None:
         raise BundleError("main app privacy manifest is missing or invalid") from exc
     if privacy.get("NSPrivacyTracking") is not False:
         raise BundleError("privacy manifest must not declare advertising tracking")
-    if info.get("SPUpdateUsageEnabled") is not True:
-        if privacy.get("NSPrivacyCollectedDataTypes") != []:
-            raise BundleError("inactive update statistics require the neutral privacy manifest")
+    if privacy.get("NSPrivacyCollectedDataTypes") != []:
+        raise BundleError("Kinolet requires the neutral privacy manifest without update analytics")
+    if info.get("SPUpdateUsageEnabled") is True:
+        raise BundleError("Kinolet does not enable upstream update usage statistics")
+    update_keys = ("SUFeedURL", "SUPublicEDKey", "SUEnableAutomaticChecks",
+                   "SUEnableSystemProfiling", "SUVerifyUpdateBeforeExtraction", "SURequireSignedFeed")
+    if info.get("SPEnableDistributionUpdates") is not True:
+        if any(name in info for name in update_keys):
+            raise BundleError("disabled distribution updates must not contain Sparkle configuration")
         return
-    if (info.get("SUFeedURL") != "https://khua.app/updates/appcast.xml"
-            or not info.get("SUPublicEDKey")
-            or info.get("SUEnableSystemProfiling") is not False):
-        raise BundleError("update statistics require the official feed with system profiling off")
-    declarations = privacy.get("NSPrivacyCollectedDataTypes", [])
-    expected = {"NSPrivacyCollectedDataTypeDeviceID",
-                "NSPrivacyCollectedDataTypeProductInteraction",
-                "NSPrivacyCollectedDataTypeOtherDataTypes"}
-    if not isinstance(declarations, list) or any(not isinstance(item, dict) for item in declarations):
-        raise BundleError("invalid update statistics privacy declarations")
-    if {item.get("NSPrivacyCollectedDataType") for item in declarations} != expected:
-        raise BundleError("update statistics privacy declarations are incomplete")
-    for item in declarations:
-        if (item.get("NSPrivacyCollectedDataTypeLinked") is not True
-                or item.get("NSPrivacyCollectedDataTypeTracking") is not False
-                or item.get("NSPrivacyCollectedDataTypePurposes") != ["NSPrivacyCollectedDataTypePurposeAnalytics"]):
-            raise BundleError("incorrect update statistics privacy purpose or linkage")
+    feed, key = info.get("SUFeedURL"), info.get("SUPublicEDKey")
+    if not isinstance(feed, str) or not isinstance(key, str):
+        raise BundleError("distribution updates require an own feed and public key")
+    try:
+        url = urlsplit(feed)
+        host = (url.hostname or "").lower().rstrip(".")
+        url.port
+    except ValueError as exc:
+        raise BundleError("invalid distribution update feed URL") from exc
+    if url.scheme != "https" or not host or url.username or url.password or url.fragment:
+        raise BundleError("the update feed must be HTTPS without credentials or a fragment")
+    if host == "khua.app" or host.endswith(".khua.app"):
+        raise BundleError("the upstream Khua update feed cannot be used by Kinolet")
+    if key == "d8nyI3ZvaY4fTRHzcLYyygiRagGoGRdObweyoAARQ+0=":
+        raise BundleError("the upstream Khua update key cannot be used by Kinolet")
+    try:
+        valid_key = len(base64.b64decode(key, validate=True)) == 32
+    except ValueError:
+        valid_key = False
+    if not valid_key:
+        raise BundleError("the update public key must encode a 32-byte Ed25519 key")
+    if (info.get("SUEnableAutomaticChecks") is not True
+            or info.get("SUEnableSystemProfiling") is not False
+            or info.get("SUVerifyUpdateBeforeExtraction") is not True
+            or info.get("SURequireSignedFeed") is not True):
+        raise BundleError("distribution updates require signed feeds, verified extraction and profiling off")
 
 
 def verify_bundle(
@@ -243,15 +260,15 @@ def verify_bundle(
             info = plistlib.load(handle)
     except (OSError, plistlib.InvalidFileException) as exc:
         raise BundleError(f"invalid Info.plist: {exc}") from exc
-    if str(info.get("CFBundleName", "")) != "Khua":
-        raise BundleError("Info.plist CFBundleName must be Khua")
-    if str(info.get("CFBundleDisplayName", "")) != "Khua":
-        raise BundleError("Info.plist CFBundleDisplayName must be Khua")
-    if info.get("SPProductName") != "Khua Player":
-        raise BundleError("Info.plist SPProductName must be Khua Player for About")
+    if str(info.get("CFBundleName", "")) != "Кинолёт":
+        raise BundleError("Info.plist CFBundleName must be Кинолёт")
+    if str(info.get("CFBundleDisplayName", "")) != "Кинолёт":
+        raise BundleError("Info.plist CFBundleDisplayName must be Кинолёт")
+    if info.get("SPProductName") != "Кинолёт":
+        raise BundleError("Info.plist SPProductName must be Кинолёт for About")
     executable_name = str(info.get("CFBundleExecutable", ""))
-    if executable_name != "Khua":
-        raise BundleError("Info.plist CFBundleExecutable must be Khua")
+    if executable_name != "Kinolet":
+        raise BundleError("Info.plist CFBundleExecutable must be Kinolet")
     main = app / "Contents/MacOS" / executable_name
     if not main.is_file():
         raise BundleError(f"main executable missing: {main}")
@@ -259,7 +276,10 @@ def verify_bundle(
         raise BundleError("Info.plist minimum system version does not match dependency lock")
     verify_update_usage_privacy(app, info)
 
-    captions_binary = verify_captions_framework(app, str(info.get("CFBundleIdentifier", "")))
+    main_bundle_id = str(info.get("CFBundleIdentifier", ""))
+    if main_bundle_id == "app.khuaplayer.KhuaPlayer" or main_bundle_id.startswith("app.khuaplayer.KhuaPlayer."):
+        raise BundleError("Kinolet must not use the upstream app bundle identifier")
+    captions_binary = verify_captions_framework(app, main_bundle_id)
 
     for relative in build_manifest.REQUIRED_METALLIBS:
         verify_metallib(app / relative)

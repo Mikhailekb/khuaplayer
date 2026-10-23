@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="${1:?usage: verify_app_bundle.sh <path-to-Khua.app>}"
+APP="${1:?usage: verify_app_bundle.sh <path-to-Kinolet.app>}"
 LOCK="$ROOT/ThirdParty/deps.lock.json"
 STAMPS=(
   --stamp "dav1d=$ROOT/ThirdParty/dav1d-min/.build-stamp.json"

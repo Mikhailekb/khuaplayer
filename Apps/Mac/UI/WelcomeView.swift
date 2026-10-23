@@ -9,6 +9,8 @@ final class WelcomeView: NSView {
     /// Shared limit for visible continue-watching rows and storage warming.
     static let visibleEntryCount = 6
     var onOpenFile: (() -> Void)?
+    var onOpenTorrent: (() -> Void)?
+    var onOpenMagnet: (() -> Void)?
     // Hover entry and exit drive delayed open-panel preparation.
     var onOpenIntent: (() -> Void)?
     var onOpenIntentEnd: (() -> Void)?
@@ -64,6 +66,8 @@ final class WelcomeView: NSView {
     private let nameLabel = NSTextField(labelWithString: "")
     private let versionLabel = NSTextField(labelWithString: "")
     private let openButton = WelcomeOpenButton()
+    private let torrentButton = WelcomeOpenButton(title: L("torrent.openFile"), shortcut: nil)
+    private let magnetButton = WelcomeOpenButton(title: L("torrent.openMagnet"), shortcut: nil)
 
     private func buildLeftContent() {
         iconView.image = NSApp.applicationIconImage
@@ -95,7 +99,14 @@ final class WelcomeView: NSView {
             self?.onOpenIntent?()
         }
         openButton.onHoverEnd = { [weak self] in self?.onOpenIntentEnd?() }
+        openButton.identifier = NSUserInterfaceItemIdentifier("welcome.openVideo")
         leftPanel.addSubview(openButton)
+        torrentButton.identifier = NSUserInterfaceItemIdentifier("welcome.openTorrent")
+        torrentButton.onClick = { [weak self] in self?.onOpenTorrent?() }
+        leftPanel.addSubview(torrentButton)
+        magnetButton.identifier = NSUserInterfaceItemIdentifier("welcome.openMagnet")
+        magnetButton.onClick = { [weak self] in self?.onOpenMagnet?() }
+        leftPanel.addSubview(magnetButton)
 
         // Keep the drag-and-drop hint only in the empty list on the right.
         // Reserve space for the default-player link so its fade-in does not
@@ -143,7 +154,9 @@ final class WelcomeView: NSView {
         leftPanel.frame = NSRect(x: 0, y: 0, width: Self.panelWidth, height: b.height)
         layoutTexture()
 
-        let stackH: CGFloat = 76 + 16 + 20 + 3 + 15 + 26 + 30
+        let buttonHeight: CGFloat = 30
+        let buttonGap: CGFloat = 8
+        let stackH: CGFloat = 76 + 16 + 20 + 3 + 15 + 26 + buttonHeight * 3 + buttonGap * 2
         var y = (b.height + stackH) / 2
         y -= 76
         iconView.frame = NSRect(x: (Self.panelWidth - 76) / 2, y: y, width: 76, height: 76)
@@ -158,9 +171,13 @@ final class WelcomeView: NSView {
         versionLabel.sizeToFit()
         versionLabel.frame.origin = NSPoint(x: (Self.panelWidth - versionLabel.frame.width) / 2, y: y)
         y -= 26 + 30
-        openButton.layoutContent()
-        openButton.frame = NSRect(x: (Self.panelWidth - openButton.frame.width) / 2, y: y,
-                                  width: openButton.frame.width, height: 30)
+        let sourceButtons = [openButton, torrentButton, magnetButton]
+        let buttonWidth = min(218, sourceButtons.map(\.preferredContentWidth).max() ?? 218)
+        for (index, button) in sourceButtons.enumerated() {
+            button.layoutContent(width: buttonWidth)
+            button.frame.origin = NSPoint(x: (Self.panelWidth - buttonWidth) / 2,
+                                          y: y - CGFloat(index) * (buttonHeight + buttonGap))
+        }
         // Center the label itself; the reserved close-button area is asymmetric.
         setDefaultLink.layoutContent()
         setDefaultLink.frame.origin = NSPoint(
@@ -233,8 +250,11 @@ final class WelcomeView: NSView {
                 let row = WelcomeRowView(entry: entry, isFirst: i == 0)
                 row.onClick = { [weak self] in self?.onPlay?(entry) }
                 row.onRemove = { [weak self] in self?.removeEntry(path: entry.path) }
-                // Prefetch headers and indexes on hover to prepare for an open.
-                row.onHover = { RecentPlaysWarmer.warmEntryIntent(path: entry.path) }
+                // Torrent identities are not local files; hover must never
+                // inspect them or start a worker/network session.
+                if entry.torrent == nil && !SPRecentWarmPolicy.isManagedTorrentPath(entry.path) {
+                    row.onHover = { RecentPlaysWarmer.warmEntryIntent(path: entry.path) }
+                }
                 addSubview(row)
                 rightRows.append(row)
             }
@@ -578,31 +598,58 @@ final class WelcomeOpenButton: NSView {
     private let label = NSTextField(labelWithString: "")
     private let kbd = NSTextField(labelWithString: "⌘O")
 
-    init() {
+    init(title: String? = nil, shortcut: String? = "⌘O") {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor(white: 1, alpha: 0.09).cgColor
         layer?.cornerRadius = 7
-        label.stringValue = L("welcome.openVideo")
+        label.stringValue = title ?? L("welcome.openVideo")
         label.font = .systemFont(ofSize: 12.5)
         label.textColor = NSColor(white: 1, alpha: 0.88)
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.setAccessibilityElement(false)
         addSubview(label)
+        kbd.stringValue = shortcut ?? ""
+        kbd.isHidden = shortcut == nil
+        kbd.setAccessibilityElement(false)
         kbd.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
         kbd.textColor = NSColor(white: 1, alpha: 0.4)
         addSubview(kbd)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(label.stringValue)
+        toolTip = label.stringValue
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) 未实现") }
 
-    func layoutContent() {
-        label.sizeToFit()
-        kbd.sizeToFit()
-        let w = 18 + label.frame.width + 10 + kbd.frame.width + 18
-        frame.size = NSSize(width: w, height: 30)
-        label.frame.origin = NSPoint(x: 18, y: (30 - label.frame.height) / 2)
-        kbd.frame.origin = NSPoint(x: 18 + label.frame.width + 10, y: (30 - kbd.frame.height) / 2)
+    var preferredContentWidth: CGFloat {
+        let textWidth = max(label.intrinsicContentSize.width, label.cell?.cellSize.width ?? 0)
+        let shortcutWidth = kbd.isHidden ? 0 : max(kbd.intrinsicContentSize.width, kbd.cell?.cellSize.width ?? 0) + 10
+        return 36 + ceil(textWidth + shortcutWidth)
     }
-
+    func layoutContent(width: CGFloat? = nil) {
+        let w = min(218, width ?? preferredContentWidth)
+        frame.size = NSSize(width: w, height: 30)
+        kbd.sizeToFit()
+        let shortcutWidth = kbd.isHidden ? 0 : kbd.frame.width + 10
+        label.frame = NSRect(x: 18, y: 7, width: max(0, w - 36 - shortcutWidth), height: 17)
+        kbd.frame.origin = NSPoint(x: max(18, w - 18 - kbd.frame.width), y: (30 - kbd.frame.height) / 2)
+    }
+    override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool { needsDisplay = true; return super.becomeFirstResponder() }
+    override func resignFirstResponder() -> Bool { needsDisplay = true; return super.resignFirstResponder() }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 76 || event.keyCode == 49 { onClick?() }
+        else { super.keyDown(with: event) }
+    }
+    override func accessibilityPerformPress() -> Bool { onClick?(); return true }
+    override func draw(_ dirtyRect: NSRect) {
+        if window?.firstResponder === self {
+            NSColor.white.withAlphaComponent(0.45).setStroke()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6).stroke()
+        }
+    }
     override func mouseDown(with event: NSEvent) { onClick?() }
 
     private var hoverArea: NSTrackingArea?
@@ -634,6 +681,7 @@ final class WelcomeRowView: NSView {
     private let nameLabel = NSTextField(labelWithString: "")
     private let metaLabel = NSTextField(labelWithString: "")
     private var triangle: NSView?
+    private var sourceCue: NSImageView?
     private var progressTrack: NSView?
     private var progressFill: NSView?
     private let fraction: Double
@@ -659,6 +707,15 @@ final class WelcomeRowView: NSView {
             fill.layer?.cornerRadius = 1
             addSubview(fill)
             progressFill = fill
+        }
+        if entry.torrent != nil {
+            let cue = NSImageView(image: NSImage(systemSymbolName: "link", accessibilityDescription: nil) ?? NSImage())
+            cue.contentTintColor = NSColor(white: 1, alpha: 0.42)
+            cue.imageScaling = .scaleProportionallyUpOrDown
+            cue.setAccessibilityElement(false)
+            addSubview(cue)
+            sourceCue = cue
+            triangle?.isHidden = true
         }
         nameLabel.stringValue = entry.title
         nameLabel.font = .systemFont(ofSize: 12.5)
@@ -706,11 +763,12 @@ final class WelcomeRowView: NSView {
         let btnY = textTop + 8 - 11
         removeButton.frame = NSRect(x: frame.width - 8 - 22, y: btnY, width: 22, height: 22)
         playButton.frame = NSRect(x: frame.width - 8 - 22 - 4 - 22, y: btnY, width: 22, height: 22)
-        let nameX: CGFloat = isFirst ? 28 : 10
+        let nameX: CGFloat = isFirst || sourceCue != nil ? 28 : 10
         let rightReserve = max(metaLabel.frame.width + 24, 22 + 4 + 22 + 18)
         nameLabel.frame = NSRect(x: nameX, y: textTop,
                                  width: frame.width - nameX - rightReserve, height: 16)
         triangle?.frame = NSRect(x: 11, y: textTop + 3, width: 9, height: 10)
+        sourceCue?.frame = NSRect(x: 10, y: textTop + 2, width: 12, height: 12)
         if let track = progressTrack, let fill = progressFill {
             let x: CGFloat = 28, w = frame.width - x - 10
             track.frame = NSRect(x: x, y: 7, width: w, height: 2)

@@ -5,14 +5,14 @@ enum MainMenuBuilder {
     static func build(trackMenuDelegate: NSMenuDelegate? = nil) -> NSMenu {
         let mainMenu = NSMenu()
 
-        let appItem = NSMenuItem()
+        let appItem = NSMenuItem(title: L("app.displayName"), action: nil, keyEquivalent: "")
         mainMenu.addItem(appItem)
-        let appMenu = NSMenu()
+        let appMenu = NSMenu(title: L("app.displayName"))
         appItem.submenu = appMenu
         appMenu.addItem(withTitle: L("menu.about"),
                         action: #selector(AppDelegate.showAboutPanelAction(_:)),
                         keyEquivalent: "")
-        // Show Check for Updates only in configured direct-distribution builds.
+        // Update controls require an explicitly enabled distributor-owned feed.
 #if !SP_APP_STORE
         if SPSoftwareUpdater.isConfigured {
             appMenu.addItem(withTitle: L("menu.checkForUpdates"),
@@ -28,6 +28,11 @@ enum MainMenuBuilder {
             appMenu.delegate = trackMenuDelegate
         }
 #endif
+        appMenu.addItem(.separator())
+
+        appMenu.addItem(withTitle: L("torrent.settings.title"),
+                        action: #selector(AppDelegate.showTorrentSettingsAction(_:)),
+                        keyEquivalent: ",")
         appMenu.addItem(.separator())
 
         let langItem = NSMenuItem(title: L("settings.language"), action: nil, keyEquivalent: "")
@@ -77,6 +82,17 @@ enum MainMenuBuilder {
         fileItem.submenu = fileMenu
         let openItem = NSMenuItem(title: L("menu.open"), action: #selector(PlayerViewController.openDocumentAction(_:)), keyEquivalent: "o")
         fileMenu.addItem(openItem)
+        fileMenu.addItem(withTitle: L("torrent.openFile"), action: #selector(PlayerViewController.openTorrentAction(_:)), keyEquivalent: "")
+        fileMenu.addItem(withTitle: L("torrent.openMagnet"), action: #selector(PlayerViewController.openMagnetAction(_:)), keyEquivalent: "")
+        fileMenu.addItem(withTitle: L("torrent.saveFile"), action: #selector(PlayerViewController.saveTorrentFileAction(_:)), keyEquivalent: "")
+        fileMenu.addItem(withTitle: L("torrent.cancelSave"), action: #selector(PlayerViewController.cancelTorrentSaveAction(_:)), keyEquivalent: "")
+        fileMenu.addItem(withTitle: L("torrent.settings.title"), action: #selector(AppDelegate.showTorrentSettingsAction(_:)), keyEquivalent: "")
+        let folderItem = NSMenuItem(title: L("menu.openFolder"), action: #selector(PlayerViewController.openPlaylistFolderAction(_:)), keyEquivalent: "O")
+        folderItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(folderItem)
+        let playlistItem = NSMenuItem(title: L("menu.playlist"), action: #selector(PlayerViewController.togglePlaylistAction(_:)), keyEquivalent: "p")
+        playlistItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(playlistItem)
 
         let recentItem = NSMenuItem(title: L("menu.recentPlays"), action: nil, keyEquivalent: "")
         let recentMenu = NSMenu(title: L("menu.recentPlays"))
@@ -86,6 +102,21 @@ enum MainMenuBuilder {
         fileMenu.addItem(recentItem)
         fileMenu.addItem(.separator())
         fileMenu.addItem(withTitle: L("menu.closeWindow"), action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+
+        // Text fields use the standard responder chain for editing shortcuts.
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: L("menu.edit"))
+        editMenu.identifier = NSUserInterfaceItemIdentifier("sp.editMenu")
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: L("menu.edit.undo"), action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = editMenu.addItem(withTitle: L("menu.edit.redo"), action: Selector(("redo:")), keyEquivalent: "Z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: L("menu.edit.cut"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: L("menu.edit.copy"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: L("menu.edit.paste"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: L("menu.edit.selectAll"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
         let playItem = NSMenuItem()
         mainMenu.addItem(playItem)
@@ -320,11 +351,11 @@ enum MainMenuBuilder {
 
         viewMenu.addItem(.separator())
         let imageAdjustItem = NSMenuItem(
-            title: L("menu.imageAdjust"),
-            action: #selector(PlayerViewController.toggleColorAdjustPanelAction(_:)),
+            title: L("settings.title"),
+            action: #selector(PlayerViewController.togglePlaybackSettingsAction(_:)),
             keyEquivalent: "c")
         imageAdjustItem.keyEquivalentModifierMask = [.command, .option]
-        imageAdjustItem.identifier = NSUserInterfaceItemIdentifier("sp.imageAdjust")
+        imageAdjustItem.identifier = NSUserInterfaceItemIdentifier("sp.playbackSettings")
         viewMenu.addItem(imageAdjustItem)
         // Sync the panel checkmark with the key window's state.
         viewMenu.identifier = NSUserInterfaceItemIdentifier("sp.viewMenu")

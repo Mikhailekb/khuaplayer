@@ -178,6 +178,24 @@ float3 oetfSRGBExt(float3 c) {
                   c <= 0.0031308);
 }
 
+// A viewing preference for bright rooms, separate from HDR display mapping.
+// A shared linear-light gain preserves RGB ratios; the soft ceiling retains
+// detail in saturated colors as they approach the available display headroom.
+float3 spHdrShadowLift(float3 encoded, bool edrOut, float peakNits) {
+    const float3 linear = float3(eotfSRGB(encoded.r), eotfSRGB(encoded.g), eotfSRGB(encoded.b));
+    const float3 weights = edrOut ? float3(0.22897, 0.69174, 0.07929)
+                                  : float3(0.2126, 0.7152, 0.0722);
+    const float y = dot(linear, weights);
+    if (y <= 0.0 || y >= 1.0) return encoded;
+    const float maximum = max(linear.r, max(linear.g, linear.b));
+    const float target = max(1.0, edrOut ? peakNits / 100.0 : 1.0);
+    if (maximum <= 0.0 || maximum >= target) return encoded;
+    const float a = 1.0 + 4.0 * (1.0 - y) * (1.0 - y) / (1.0 + 8.0 * y);
+    const float gain = a / (1.0 + (a - 1.0) * maximum / target);
+    if (gain == 1.0) return encoded;
+    return oetfSRGBExt(linear * gain);
+}
+
 constant float3x3 m2020ToP3 = float3x3(
     float3(1.343578, -0.065297,  0.002822),
     float3(-0.282180, 1.075788, -0.019598),
@@ -618,6 +636,10 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
         out = rgbEnc;
     }
 
+    if (hasHdr && u.uvals[33] > 0.5) {
+        out = spHdrShadowLift(out, edrOut, u.uvals[24]);
+    }
+
     if (u.uvals[20] != 0.0 || u.uvals[21] != 1.0 || u.uvals[22] != 1.0
         || u.uvals[23] != 1.0 || u.uvals[32] != 0.0) {
         out += float3(u.uvals[20]);
@@ -628,7 +650,7 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
         const float3 lumaAxis = normalize(float3(0.2126, 0.7152, 0.0722));
         const float luma = dot(out, float3(0.2126, 0.7152, 0.0722));
         const float3 chroma = out - float3(luma);
-        const float hueA = radians(u.uvals[32]);
+        const float hueA = u.uvals[32] * 0.017453292519943295f;
         out = float3(luma) + chroma * cos(hueA)
             + cross(lumaAxis, chroma) * sin(hueA);
         out = mix(float3(luma), out, u.uvals[22]);

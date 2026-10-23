@@ -36,3 +36,23 @@ Anyone distributing binaries must independently satisfy the LGPL requirements,
 including corresponding-source and relinking obligations where applicable.
 The repository's reproducible recipes help with compliance but are not a
 substitute for legal review, especially for Mac App Store distribution.
+
+## Torrent playback helper
+
+Torrent playback uses a separate patched TorrServer executable with these
+pinned upstream components:
+
+| Component | Version | Upstream license |
+|---|---|---|
+| [TorrServer](https://github.com/YouROK/TorrServer) | MatriX.147, source commit `a86d8fa7fd4e07605f240fe69bf299392f7cb023` | [GPL-3.0](https://github.com/YouROK/TorrServer/blob/a86d8fa7fd4e07605f240fe69bf299392f7cb023/LICENSE) |
+| [tsynik/torrent](https://github.com/tsynik/torrent) | v1.2.32, with a local patch | [MPL-2.0](https://github.com/tsynik/torrent/blob/v1.2.32/LICENSE) |
+
+The helper's exact build version, source archive hashes and downstream patches
+are recorded in
+[`worker-manifest.json`](Apps/Mac/Resources/Torrent/worker-manifest.json).
+[`NOTICE`](Apps/Mac/Resources/Torrent/NOTICE) documents the changes and pinned
+build recipe; the accompanying [`LICENSE`](Apps/Mac/Resources/Torrent/LICENSE)
+contains TorrServer's GPL text. The packaged helper includes its upstream source
+archive, the pinned torrent dependency source ZIP with its MPL license, both
+patches and the build script. Other Go dependency versions and checksums remain
+recorded in the upstream source archive's `server/go.mod` and `server/go.sum`.

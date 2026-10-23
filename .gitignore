@@ -7,6 +7,10 @@ build/
 Khua*.app/
 Khua*.dmg
 Khua*.zip
+Kinolet*.app/
+Kinolet*.dmg
+Kinolet*.zip
+Кинолёт*.app/
 *.dSYM/
 *.xcarchive/
 /dist/

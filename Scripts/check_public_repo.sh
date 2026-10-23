@@ -5,33 +5,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-managed_source_digest() {
-  python3 Scripts/lib/runtime_source.py "$1"
-}
-
-BASELINE_RELATIVE=".khua-managed-source.sha256"
-BASELINE_FILE="$ROOT/$BASELINE_RELATIVE"
-if ! git ls-files --error-unmatch -- "$BASELINE_RELATIVE" >/dev/null 2>&1; then
-  echo "error: managed-source fingerprint is not tracked: $BASELINE_RELATIVE" >&2
-  echo "maintainers must create it with the private export bootstrap workflow" >&2
-  exit 1
-fi
-if [ ! -f "$BASELINE_FILE" ] || [ -L "$BASELINE_FILE" ] ||
-   [ "$(wc -c < "$BASELINE_FILE" | awk '{print $1}')" != "65" ] ||
-   ! grep -Eq '^[0-9a-f]{64}$' "$BASELINE_FILE"; then
-  echo "error: $BASELINE_RELATIVE must contain exactly one lowercase SHA-256 digest" >&2
-  exit 1
-fi
-IFS= read -r EXPECTED_MANAGED_DIGEST < "$BASELINE_FILE"
-if ! CURRENT_MANAGED_DIGEST="$(managed_source_digest "$ROOT")"; then
-  echo "error: failed to hash managed public source" >&2
-  exit 1
-fi
-if [ "$CURRENT_MANAGED_DIGEST" != "$EXPECTED_MANAGED_DIGEST" ]; then
-  echo "error: managed public source does not match its tracked fingerprint" >&2
-  echo "do not edit the fingerprint manually; maintainers must backport and export the source change" >&2
-  exit 1
-fi
+# Kinolet maintains its runtime sources directly in this public fork. The
+# inherited .khua-managed-source.sha256 belongs to upstream's private export
+# workflow and is not a source-of-truth gate here. Git review, the source-layout
+# checks in verify_public_surface.py, and the reproducible dependency recipes
+# apply to fork changes without requiring a private upstream repository.
 
 FORBIDDEN_PATHS=(
   BenchResults
@@ -49,7 +27,7 @@ for path in "${FORBIDDEN_PATHS[@]}"; do
 done
 
 TRACKED_RELEASE_ARTIFACTS="$(git ls-files | \
-  grep -E '(^|/)(Khua[^/]*\.app/|Khua[^/]*\.(dmg|zip)$|[^/]+\.(dSYM|xcarchive)/)' || true)"
+  grep -E '(^|/)((Khua|Kinolet|Кинолёт)[^/]*\.app/|(Khua|Kinolet|Кинолёт)[^/]*\.(dmg|zip)$|[^/]+\.(dSYM|xcarchive)/)' || true)"
 if [ -n "$TRACKED_RELEASE_ARTIFACTS" ]; then
   echo "error: generated release artifacts are tracked:" >&2
   printf '%s\n' "$TRACKED_RELEASE_ARTIFACTS" >&2
@@ -131,9 +109,9 @@ for path in "${ENGLISH_FILES[@]}"; do
   fi
 done
 
-if grep -nE 'window\.title[[:space:]]*=[[:space:]]*"KhuaPlayer"' \
+if grep -nE 'window\.title[[:space:]]*=[[:space:]]*"(Khua|KhuaPlayer)"' \
      Apps/Mac/UI/PlayerWindowController.swift >/dev/null 2>&1; then
-  echo "error: bootstrap window title must use the public display name Khua" >&2
+  echo "error: bootstrap window title must use the public display name Кинолёт" >&2
   exit 1
 fi
 # Full product names are valid in About metadata and documentation. App chrome
@@ -144,12 +122,12 @@ from pathlib import Path
 
 catalog = json.loads(Path('Apps/Mac/Resources/Localizable.xcstrings').read_text())
 names = catalog['strings']['app.displayName']['localizations']
-if not names or any(record.get('stringUnit', {}).get('value') != 'Khua'
+if not names or any(record.get('stringUnit', {}).get('value') != 'Кинолёт'
                     for record in names.values()):
-    raise SystemExit('error: every app.displayName translation must be Khua')
+    raise SystemExit('error: every app.displayName translation must be Кинолёт')
 text = Path('Apps/Mac/Resources/Localizable.xcstrings').read_text()
 if 'KhuaPlayer' in text or 'Khua Player' in text:
-    raise SystemExit('error: app chrome must use the short name Khua')
+    raise SystemExit('error: app chrome must use the name Кинолёт')
 PY
 
 while IFS= read -r script; do
@@ -173,29 +151,52 @@ plutil -lint Apps/Mac/QuickLook/Info.plist >/dev/null
 plutil -lint Apps/Mac/QuickLook/KhuaPlayerQuickLook.entitlements >/dev/null
 plutil -lint Apps/Mac/Resources/PrivacyInfo.xcprivacy >/dev/null
 
-[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' Apps/Mac/Info.plist)" = "Khua" ] || {
-  echo "error: main CFBundleName must be Khua" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' Apps/Mac/Info.plist)" = "Кинолёт" ] || {
+  echo "error: main CFBundleName must be Кинолёт" >&2
   exit 1
 }
-[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/Info.plist)" = "Khua" ] || {
-  echo "error: main CFBundleDisplayName must be Khua" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/Info.plist)" = "Кинолёт" ] || {
+  echo "error: main CFBundleDisplayName must be Кинолёт" >&2
   exit 1
 }
-[ "$(/usr/libexec/PlistBuddy -c 'Print :SPProductName' Apps/Mac/Info.plist)" = "Khua Player" ] || {
-  echo "error: About product name must be Khua Player" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :SPProductName' Apps/Mac/Info.plist)" = "Кинолёт" ] || {
+  echo "error: About product name must be Кинолёт" >&2
   exit 1
 }
-grep -Eq '^[[:space:]]+SPProductName:[[:space:]]+Khua Player$' Apps/Mac/project.yml || {
-  echo "error: project About product name must be Khua Player" >&2
+grep -Eq '^[[:space:]]+SPProductName:[[:space:]]+Кинолёт$' Apps/Mac/project.yml || {
+  echo "error: project About product name must be Кинолёт" >&2
   exit 1
 }
-[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/QuickLook/Info.plist)" = "Khua Quick Look" ] || {
-  echo "error: Quick Look CFBundleDisplayName must be Khua Quick Look" >&2
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Apps/Mac/QuickLook/Info.plist)" = "Кинолёт Quick Look" ] || {
+  echo "error: Quick Look CFBundleDisplayName must be Кинолёт Quick Look" >&2
   exit 1
 }
-grep -Eq '^[[:space:]]+PRODUCT_NAME:[[:space:]]+Khua$' Apps/Mac/project.yml || {
-  echo "error: main PRODUCT_NAME must be Khua" >&2
+grep -Eq '^[[:space:]]+PRODUCT_NAME:[[:space:]]+Kinolet$' Apps/Mac/project.yml || {
+  echo "error: main PRODUCT_NAME must be Kinolet" >&2
   exit 1
 }
+
+grep -Eq '^[[:space:]]+KHUA_BUNDLE_ID:[[:space:]]+app\.kinolet\.player$' Apps/Mac/project.yml || {
+  echo "error: the default application identifier must be app.kinolet.player" >&2
+  exit 1
+}
+[ "$(/usr/libexec/PlistBuddy -c 'Print :SPEnableDistributionUpdates' Apps/Mac/Info.plist)" = "false" ] || {
+  echo "error: source distribution updates must default to false" >&2
+  exit 1
+}
+python3 - <<'PYCHANNEL'
+import json
+from pathlib import Path
+from urllib.parse import urlsplit
+channel = json.loads(Path('Distribution/sparkle.json').read_text())
+feed, key = channel.get('feedUrl'), channel.get('publicKey')
+if not isinstance(feed, str) or not isinstance(key, str) or bool(feed) != bool(key):
+    raise SystemExit('error: distribution feed and key must be supplied together')
+host = (urlsplit(feed).hostname or '').lower().rstrip('.') if feed else ''
+if host == 'khua.app' or host.endswith('.khua.app'):
+    raise SystemExit('error: the fork must not inherit the upstream update feed')
+if key == 'd8nyI3ZvaY4fTRHzcLYyygiRagGoGRdObweyoAARQ+0=':
+    raise SystemExit('error: the fork must not inherit the upstream update public key')
+PYCHANNEL
 
 echo "Public repository checks passed."

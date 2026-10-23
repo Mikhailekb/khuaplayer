@@ -3,10 +3,11 @@ import AppKit
 
 // ── Software updates (Sparkle 2, configuration-gated and lazy-loaded) ──
 //
-// Distribution policy: without SUFeedURL and SUPublicEDKey every update path
-// stays inactive. The framework is not loaded, no menu item is created, and
-// there is no network request or resident updater. Direct-distribution builds
-// enable the feature by injecting both keys. App Store builds compile it out.
+// Distribution policy: an explicit SPEnableDistributionUpdates opt-in and the
+// distributor's SUFeedURL/SUPublicEDKey are required. Inherited update metadata
+// cannot enable updates by itself. Until configured, the framework is not loaded,
+// no menu item is created, and no update request is made. App Store builds compile
+// this implementation out.
 //
 // The framework is embedded but not linked, so first-frame startup does not
 // load its dylib. It is loaded during an idle phase and invoked through the
@@ -17,11 +18,12 @@ import AppKit
 // Developer ID signature, both of which remain outside the source repository.
 @MainActor
 enum SPSoftwareUpdater {
-    /// Enable only when both the appcast URL and EdDSA public key are present.
+    /// Enable only after this distributor opts in with its own feed and key.
     /// This reads Info.plist only, so menu construction can call it safely.
     nonisolated static var isConfigured: Bool {
         let info = Bundle.main.infoDictionary
-        return (info?["SUFeedURL"] as? String)?.isEmpty == false
+        return info?["SPEnableDistributionUpdates"] as? Bool == true
+            && (info?["SUFeedURL"] as? String)?.isEmpty == false
             && (info?["SUPublicEDKey"] as? String)?.isEmpty == false
     }
 
@@ -69,7 +71,7 @@ enum SPSoftwareUpdater {
     }
 
     private static func startControllerWhenIdle() {
-        guard controller == nil else { return }
+        guard isConfigured, controller == nil else { return }
         if OpenPanelWarmer.foregroundIOActive {
             // Playing: re-check later rather than initialise the updater in the
             // tick's run loop. Manual "Check for Updates" bypasses this wait.
@@ -83,7 +85,7 @@ enum SPSoftwareUpdater {
 
     /// Synchronous start (framework already loaded, or user-initiated).
     private static func startController() {
-        guard controller == nil,
+        guard isConfigured, controller == nil,
               let cls = NSClassFromString("SPUStandardUpdaterController")
                   as? NSObject.Type else {
             NSLog("[Updater] Failed to load Sparkle.framework")
@@ -112,6 +114,7 @@ enum SPSoftwareUpdater {
 
     /// Handle Check for Updates, starting Sparkle first if idle setup has not run.
     static func checkForUpdates() {
+        guard isConfigured else { return }
         if controller == nil, isConfigured, let bundle = frameworkBundle, bundle.load() {
             startController() // user action: synchronous, regardless of playback
         }
@@ -127,6 +130,7 @@ enum SPSoftwareUpdater {
     // on. While the updater is running, write through KVC so it reschedules
     // immediately instead of reading the default at the next launch.
     nonisolated static var automaticChecksEnabled: Bool {
+        guard isConfigured else { return false }
         if let v = UserDefaults.standard.object(forKey: "SUEnableAutomaticChecks")
             as? Bool { return v }
         if let v = Bundle.main.infoDictionary?["SUEnableAutomaticChecks"]
@@ -135,6 +139,7 @@ enum SPSoftwareUpdater {
     }
 
     static func setAutomaticChecks(_ on: Bool) {
+        guard isConfigured else { return }
         startIfConfigured()
         if let controller,
            let updater = controller.value(forKey: "updater") as? NSObject {

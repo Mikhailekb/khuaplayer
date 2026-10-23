@@ -1,88 +1,63 @@
 # Repository layout
 
-Khua separates product-specific source from media and subtitle code and from
-platform implementations. These directories describe source ownership, not
-independent frameworks or Swift packages. Only the Mac product currently
-builds; the layout prepares for a future iPhone and iPad product without
-claiming iOS support.
+Кинолёт keeps product UI, media processing, and macOS implementations in
+separate directories. Existing `KhuaPlayer` module names and `SP` symbols are
+retained technical identifiers inherited from Khua; the Mac product is Кинолёт.
 
 ```text
-Apps/
-  Mac/
-    project.yml           Mac XcodeGen project definition
-    project.sparkle.yml   Optional direct-distribution updater configuration
-    Scripts/build.sh      Mac product build entry point
-    Info.plist            Main app metadata
-    UI/                   AppKit windows, controls, menus, and product behavior
-    Resources/            Mac localization, icons, and privacy manifest
-    Support/              Swift bridging header
-    QuickLook/            Finder preview extension and its configuration
-    CaptionsHost/         Mac subtitle tasks, presentation, and download adapters
-    CaptionsUI/           Lazily loaded SwiftUI language-download host
-  Mobile/                 Planned iPhone and iPad product; README only
+Apps/Mac/
+  project.yml             XcodeGen project definition
+  UI/                     AppKit windows, playback controls, and settings
+                          Folder playlists and torrent playback coordination
+  Resources/              Localizations, icons, privacy manifest
+    Torrent/              Pinned worker manifest, licenses, and source patches
+  Support/                Objective-C bridging header
+  QuickLook/              Finder preview extension
+  CaptionsHost/           Subtitle task coordination and UI adapters
+  CaptionsUI/             Lazily loaded system translation interface
 Modules/
-  MediaCore/
-    Core/                 Container, queue, and playback helpers
-    Bridge/               Media interfaces and Objective-C++ implementations
-    Shaders/              Playback shaders
-  Captions/               Subtitle models, formats, scheduling, and transcription
-  VideoEnhancement/       Motion+ planning, frame generation, and lazy Metal kernels
-Platform/
-  macOS/
-    Audio/                Mac audio-output implementation
-    Rendering/            Mac Metal-rendering implementation
-Scripts/                  Repository tools, dependency recipes, and release tools
-ThirdParty/               Dependency lock, licenses, and ignored macOS artifacts
-Design/                   Editable app-icon source and static exports
+  MediaCore/Core/         Demuxing, queues, HTTP range I/O, playback policies
+  MediaCore/Bridge/       Objective-C interfaces and media implementation
+  MediaCore/Shaders/      Metal playback shaders
+  Captions/               Subtitle formats, scheduling, transcription
+  VideoEnhancement/       Motion+ planning and frame generation
+Platform/macOS/
+  Audio/                  Mac audio output
+  Rendering/              Metal rendering and display handling
+Scripts/
+  tests/                  Focused policy and integration fixtures
+                          Dependency recipes, checks, build and release tools
+ThirdParty/               Dependency locks, licenses, ignored build artifacts
+Design/AppIcon/           Icon source and exports
+Distribution/            Distribution metadata and retained release tooling
 ```
 
-## Build and release entry points
+`Apps/Mobile` is inherited planning material. It does not provide a buildable
+mobile product or promise a mobile release.
 
-Run these commands from the repository root:
+## Build boundaries
 
-```bash
-./Apps/Mac/Scripts/build.sh Debug
-./Apps/Mac/Scripts/build.sh Release
-./Scripts/run.sh
-python3 Scripts/l10n.py check --full
-```
+`Apps/Mac/Scripts/build.sh` is the full Mac source-build entry point;
+`Scripts/build.sh` forwards its arguments and exit status. The Xcode project is
+generated from `Apps/Mac/project.yml` and is intentionally ignored by Git.
 
-The root `Scripts/build.sh` is an `exec` compatibility wrapper. It preserves
-arguments, environment settings, and the product build's exit status. Existing
-commands that use that entry point remain valid.
+The app compiles `Apps/Mac/UI`, `Apps/Mac/CaptionsHost`, and `Modules/Captions`.
+`KhuaPlayerMediaCore` combines the media core, video enhancement code, and
+macOS platform implementations. Quick Look uses the same media framework.
+`KhuaPlayerCaptionsUI` remains a separate framework that is loaded when the
+system translation interface is needed.
 
-Edit `Apps/Mac/project.yml` and its adjacent Sparkle include for Mac project
-changes. The build generates `Apps/Mac/KhuaPlayer.xcodeproj`; it is ignored and
-must not be edited as the source of truth. Running `xcodegen` without an
-explicit project definition from the repository root is no longer sufficient.
-Use the build entry point so that dependency and distribution configuration
-are prepared together.
+Motion+ has its own `FrameBudget.metallib`, loaded on demand. Ordinary playback
+uses the main renderer without starting interpolation.
 
-Build products remain under the repository-root `.build` directory. Release
-builds also deploy `Khua.app` to the repository root; Debug builds do not
-replace it. Neither location is tracked by Git. Signing, archive, App Store
-smoke checks, notarization, and DMG tools remain in `Scripts/`; their output
-locations and distribution channels are described in [RELEASING.md](RELEASING.md).
+The torrent feature runs a separate TorrServer process. Its binary, pinned
+source inputs, licenses, and notices are prepared by
+`Scripts/prepare_torrent_worker.sh` and embedded by
+`Scripts/embed_torrent_worker.sh`. The player reads its selected stream through
+HTTP range I/O on an authenticated loopback endpoint. Peer connections belong
+to the worker.
 
-## Current compilation boundaries
-
-The `KhuaPlayer` app compiles `Apps/Mac/UI`, `Apps/Mac/CaptionsHost`, and
-`Modules/Captions`. `KhuaPlayerMediaCore` still combines `Modules/MediaCore`
-with `Modules/VideoEnhancement` and the implementations under `Platform/macOS`
-in one framework. Quick Look
-uses that same media framework. `KhuaPlayerCaptionsUI` remains a separate,
-lazily loaded Mac framework; it is distinct from `CaptionsHost`.
-
-Motion+ uses a separately compiled `FrameBudget.metallib` in the media framework.
-It is loaded on demand, not by the normal renderer while Motion+ is off.
-
-Moving a source file into `Modules` does not remove its current dependencies.
-The playback host still uses AppKit, rendering still depends on Mac displays,
-audio still uses desktop device APIs, and subtitle services still depend on
-their app host. Mobile work must adapt those interfaces, file access, resource
-lookup, and task lifecycles before reusing them in a shipping product.
-
-Third-party recipes currently produce macOS libraries only. iOS device and
-simulator artifacts will need separate SDK-specific builds. No iOS target,
-bundle identifier, signing setup, or purchase integration is supplied by this
-directory layout. See [Apps/Mobile/README.md](Apps/Mobile/README.md) for scope.
+Full-build outputs and dependency caches are kept under `.build`. The build
+prints its resulting application path; see [RELEASING.md](RELEASING.md) before
+publishing a local package. `Scripts/test_*.sh` provides smaller verification
+entry points for individual features.

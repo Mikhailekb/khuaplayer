@@ -24,6 +24,21 @@ typedef NS_ENUM(NSInteger, SPPlayerState) {
     SPPlayerStateFailed,
 };
 
+// Coherent, selected-file-relative HTTP cache hints. All fields are -1 when
+// unavailable. Offsets come from real packet positions, never bitrate estimates.
+// The history boundary is the first known packet at/after playbackTime - 20s;
+// it deliberately does not keep an older GOP just to avoid a future re-download.
+// A known sub-packet audio lead can precede video in the file; its effective
+// historyStartTime is then capped at playbackTime, meaning no watched history.
+typedef struct SPSourcePlaybackWindow {
+    int64_t openGeneration;
+    int64_t seekGeneration;
+    int64_t playbackOffset;
+    int64_t historyStartOffset;
+    double playbackTime;
+    double historyStartTime;
+} SPSourcePlaybackWindow;
+
 // Budget-based Apple frame interpolation, exposed on the macOS 26+ feature tier.
 // The requested mode doubles source cadence when resources permit; uncovered
 // frame pairs retain the original source cadence.
@@ -96,6 +111,9 @@ NS_SWIFT_UI_ACTOR
 
 @property (nonatomic, readonly) BOOL sourceGrowing;
 @property (nonatomic, readonly) BOOL sourceWaiting;
+// Main-thread viewer impact: sustained rebuffer hold/source-blocked seek,
+// excluding buffered prefetch and ordinary pause. Raw sourceWaiting is unchanged.
+@property (nonatomic, readonly) BOOL sourcePlaybackWaiting;
 @property (nonatomic, readonly) BOOL sourceStalled;
 
 @property (nonatomic, readonly) BOOL sourceWaitingForIndex;
@@ -151,6 +169,18 @@ NS_SWIFT_UI_ACTOR
 // Whether the latest seek target was accepted for presentation, allowing the
 // next repeated step without invalidating every intermediate target.
 @property (nonatomic, readonly) BOOL seekSettled;
+// Main-thread snapshot of the current HTTP(S) source's exact AVIO logical
+// next-byte cursor. It can precede the end of an already downloaded AVIO buffer.
+// Returns -1 while opening, seeking, stopped, or on a non-HTTP source. A settled
+// paused session retains its cursor; reading this property never performs I/O.
+@property (nonatomic, readonly) int64_t sourceReadOffset;
+// Main-thread, no-I/O snapshot anchored to an accepted video frame or the played
+// audio clock. Seeking invalidates it until the new generation is settled.
+// Unknown history after a seek is omitted rather than guessed; packet/container
+// and downstream torrent-piece granularity determine the final cache boundary.
+@property (nonatomic, readonly) SPSourcePlaybackWindow sourcePlaybackWindow;
+@property (nonatomic, readonly) int64_t sourcePlaybackByteOffset;
+@property (nonatomic, readonly) int64_t sourceHistoryStartOffset;
 // Verified coarse-seek landing for the current generation, in zero-based
 // seconds; -1 means unavailable or unverified. Never reuse a previous generation.
 @property (nonatomic, readonly) double lastSettledCoarseSeekLandingSeconds;
@@ -245,6 +275,10 @@ NS_SWIFT_UI_ACTOR
 // Current display headroom (at least one) and potential EDR capability.
 @property (nonatomic, readonly) double displayEDRHeadroom;
 @property (nonatomic, readonly) BOOL displayEDRCapable;
+// Lift HDR shadows for a brighter viewing environment. Main-thread access.
+// Defaults to NO and persists across media opens within this core instance.
+// SDR video, encoded black, highlights and subtitle colors are unchanged.
+@property (nonatomic) BOOL hdrShadowLiftEnabled;
 // Picture controls.
 - (void)setAspectMode:(NSInteger)mode;  // 0: original, 1: 16:9, 2: 4:3, 3: stretch, 4: crop.
 - (void)setForcedAspect:(double)ratio;  // Positive values force a display aspect ratio; zero restores the default.

@@ -67,11 +67,11 @@ done
 [ -d "$RELEASE_DIR" ] || die "release directory does not exist: $RELEASE_DIR"
 RELEASE_DIR="$(cd "$RELEASE_DIR" && pwd -P)"
 
-APP="$RELEASE_DIR/Khua.app"
-SUBMISSION_ZIP="$RELEASE_DIR/Khua-notarization.zip"
-SUBMISSION_CHECKSUM="$RELEASE_DIR/Khua-notarization.zip.sha256"
-FINAL_ZIP="$RELEASE_DIR/Khua.zip"
-FINAL_CHECKSUM="$RELEASE_DIR/Khua.zip.sha256"
+APP="$RELEASE_DIR/Kinolet.app"
+SUBMISSION_ZIP="$RELEASE_DIR/Kinolet-notarization.zip"
+SUBMISSION_CHECKSUM="$RELEASE_DIR/Kinolet-notarization.zip.sha256"
+FINAL_ZIP="$RELEASE_DIR/Kinolet.zip"
+FINAL_CHECKSUM="$RELEASE_DIR/Kinolet.zip.sha256"
 RESULT="$RELEASE_DIR/NotarizationSubmission.plist"
 LOG="$RELEASE_DIR/NotarizationLog.json"
 [ -d "$APP" ] || die "prepared app is missing: $APP"
@@ -96,7 +96,7 @@ RESULT_TMP="$(mktemp "$RELEASE_DIR/.NotarizationSubmission.XXXXXX")"
 LOG_STAGE="$(mktemp -d "$RELEASE_DIR/.notary-log.XXXXXX")"
 LOG_TMP="$LOG_STAGE/NotarizationLog.json"
 FINAL_STAGE="$(mktemp -d "$RELEASE_DIR/.final-zip.XXXXXX")"
-FINAL_ZIP_TMP="$FINAL_STAGE/Khua.zip"
+FINAL_ZIP_TMP="$FINAL_STAGE/Kinolet.zip"
 SUBMISSION_CHECK="$(mktemp -d)"
 TRANSPORT_CHECK=""
 cleanup() {
@@ -123,16 +123,16 @@ plist_value() {
 ditto -x -k "$SUBMISSION_ZIP" "$SUBMISSION_CHECK"
 [ "$(find "$SUBMISSION_CHECK" -mindepth 1 -maxdepth 1 -print | \
       wc -l | tr -d ' ')" = "1" ] || \
-  die "submission ZIP must contain only Khua.app"
-[ -d "$SUBMISSION_CHECK/Khua.app" ] || \
-  die "submission ZIP does not contain Khua.app"
+  die "submission ZIP must contain only Kinolet.app"
+[ -d "$SUBMISSION_CHECK/Kinolet.app" ] || \
+  die "submission ZIP does not contain Kinolet.app"
 "$ROOT/Scripts/lib/verify_developer_id_app.sh" \
-  --app "$SUBMISSION_CHECK/Khua.app" --team-id "$TEAM_ID"
-ARCHIVED_APP="$SUBMISSION_CHECK/Khua.app"
+  --app "$SUBMISSION_CHECK/Kinolet.app" --team-id "$TEAM_ID"
+ARCHIVED_APP="$SUBMISSION_CHECK/Kinolet.app"
 APP_CDHASH="$(code_directory_hash "$APP")"
 ARCHIVED_CDHASH="$(code_directory_hash "$ARCHIVED_APP")"
 [ -n "$APP_CDHASH" ] && [ "$APP_CDHASH" = "$ARCHIVED_CDHASH" ] || \
-  die "Khua.app CodeDirectory differs from the app in the submission ZIP"
+  die "Kinolet.app CodeDirectory differs from the app in the submission ZIP"
 for plist_key in CFBundleIdentifier CFBundleShortVersionString CFBundleVersion; do
   [ "$(plist_value "$APP" "$plist_key")" = \
     "$(plist_value "$ARCHIVED_APP" "$plist_key")" ] || \
@@ -205,7 +205,7 @@ ARCHIVE_SHA256="$(shasum -a 256 "$SUBMISSION_ZIP" | awk '{print $1}')"
 [ "$NOTARY_STATUS" = "Accepted" ] || \
   die "notarization status is $NOTARY_STATUS; inspect $RESULT and $LOG"
 
-echo "==> Stapling accepted ticket to Khua.app"
+echo "==> Stapling accepted ticket to Kinolet.app"
 if ! xcrun stapler validate -q "$APP" >/dev/null 2>&1; then
   xcrun stapler staple -v "$APP"
 fi
@@ -227,15 +227,15 @@ grep -Fq 'source=Notarized Developer ID' <<<"$SPCTL_OUTPUT" || \
 ditto -c -k --keepParent "$APP" "$FINAL_ZIP_TMP"
 TRANSPORT_CHECK="$(mktemp -d)"
 ditto -x -k "$FINAL_ZIP_TMP" "$TRANSPORT_CHECK"
-xcrun stapler validate -q "$TRANSPORT_CHECK/Khua.app"
-"$ROOT/Scripts/verify_app_bundle.sh" "$TRANSPORT_CHECK/Khua.app"
+xcrun stapler validate -q "$TRANSPORT_CHECK/Kinolet.app"
+"$ROOT/Scripts/verify_app_bundle.sh" "$TRANSPORT_CHECK/Kinolet.app"
 "$ROOT/Scripts/lib/verify_developer_id_app.sh" \
-  --app "$TRANSPORT_CHECK/Khua.app" --team-id "$TEAM_ID"
+  --app "$TRANSPORT_CHECK/Kinolet.app" --team-id "$TEAM_ID"
 spctl --assess --type execute --verbose=4 \
-  "$TRANSPORT_CHECK/Khua.app" >/dev/null
+  "$TRANSPORT_CHECK/Kinolet.app" >/dev/null
 rm -rf "$TRANSPORT_CHECK"
 TRANSPORT_CHECK=""
 mv "$FINAL_ZIP_TMP" "$FINAL_ZIP"
-(cd "$RELEASE_DIR" && shasum -a 256 Khua.zip >Khua.zip.sha256)
+(cd "$RELEASE_DIR" && shasum -a 256 Kinolet.zip >Kinolet.zip.sha256)
 
 echo "==> Notarized and stapled release ready: $FINAL_ZIP"

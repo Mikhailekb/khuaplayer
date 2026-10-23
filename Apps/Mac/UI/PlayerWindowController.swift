@@ -44,7 +44,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         // The app name is identical across locales. Use a literal during bootstrap
         // to avoid loading the localization catalog before the first window appears.
         // A media filename replaces it on open; idle states use L("app.displayName").
-        window.title = "Khua"
+        window.title = "Кинолёт"
         window.minSize = NSSize(width: 480, height: 270)
         window.isReleasedWhenClosed = false
 

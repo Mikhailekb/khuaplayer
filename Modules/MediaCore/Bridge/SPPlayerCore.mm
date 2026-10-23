@@ -28,7 +28,9 @@ static BOOL spPlanarOutputEnabled(void) {
 #import "SPSubtitleRenderer.h"
 #import "SPTimelineThumbnailer.h"
 #import "Demuxer.hpp"
+#include "HTTPRangeIO.hpp"
 #include "SPSourceGrowthPolicy.hpp"
+#include "SPSourcePlaybackWaitingPolicy.hpp"
 #include "SPContentCoverage.hpp"
 #include "SPResilience.hpp"
 #include "SPTrialDecode.hpp"
@@ -37,6 +39,27 @@ static BOOL spPlanarOutputEnabled(void) {
 #include "SPVideoRecoveryLane.hpp"
 #include "SPGopReadback.hpp"
 #include <memory>
+#include <deque>
+
+struct SPSourcePacketBytePoint {
+    int64_t ptsUs;
+    int64_t position;
+    int64_t durationUs;
+    int stream;
+};
+
+static NSURL* spMediaURLFromPath(NSString* path) {
+    return sp::HTTPRangeIO::supportsURL(path.UTF8String ?: "") ?
+        [NSURL URLWithString:path] : [NSURL fileURLWithPath:path];
+}
+
+static NSString* spMediaDisplayName(NSString* path) {
+    if (sp::HTTPRangeIO::supportsURL(path.UTF8String ?: "")) {
+        // Credentials and signed query parameters belong only to transport.
+        return [NSURL URLWithString:path].path.lastPathComponent ?: @"HTTP stream";
+    }
+    return path.lastPathComponent;
+}
 
 @interface SPDamageSnapshot ()
 - (instancetype)initWithGeneration:(uint64_t)generation durationUs:(int64_t)durationUs
@@ -651,6 +674,10 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     BOOL _pubSourceGrowing;
     BOOL _pubSourceWaiting;
     BOOL _pubSourceStalled;
+    BOOL _pubSourcePlaybackWaiting;
+    spplaywait::Policy _sourcePlaybackWaitPolicy;
+    BOOL _sourcePlaybackWaitCheckQueued;
+    uint64_t _sourcePlaybackWaitCheckToken;
     uint32_t _pubSourcePathRev;
 
     std::vector<std::pair<int64_t, int64_t>> _pendingSpansUs;
@@ -998,6 +1025,22 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     int64_t _appLaunchUs;
     std::atomic<int64_t> _openGeneration;
 
+    // Only the current demux owner samples AVIO. Main-thread consumers use a
+    // generation-stamped atomic snapshot and never dereference the demuxer.
+    std::atomic<bool> _sourceReadHTTP;
+    std::atomic<uint64_t> _sourceReadPublicationSequence;
+    std::atomic<int64_t> _sourceReadOffset;
+    std::atomic<int64_t> _sourceReadOpenGeneration;
+    std::atomic<int64_t> _sourceReadSeekGeneration;
+    // At most 32768 small packet facts (~1 MiB), independent of media length.
+    // This mutex protects metadata only; it is never held across I/O or decode.
+    std::mutex _sourcePacketBytesMtx;
+    std::deque<SPSourcePacketBytePoint> _sourcePacketBytes;
+    int64_t _sourcePacketBytesOpenGeneration;
+    int64_t _sourcePacketBytesSeekGeneration;
+    std::atomic<int64_t> _sourcePlaybackTimeUs;
+    std::atomic<int64_t> _sourcePlaybackTimeSeekGeneration;
+
     std::atomic<int64_t> _rendererConfiguredOpenGeneration;
     NSString *_currentFilePath;
     std::atomic<bool> _firstFramePending;
@@ -1077,7 +1120,9 @@ static int spDisplaySizeProbeInterrupt(void *opaque) {
 + (CGSize)probeDisplaySizeForURL:(NSURL *)url
               cancellationToken:(SPProbeCancellationToken *)token {
 
-    if (token.isCancelled) return CGSizeZero;
+    // This independent Quick Look probe uses FFmpeg's file protocol, rather
+    // than the playback demuxer's authenticated custom HTTP input.
+    if (token.isCancelled || !url.isFileURL) return CGSizeZero;
     SPDisplaySizeProbeContext probeContext = {spNowUs() + 3000000, token};
     AVFormatContext *ctx = avformat_alloc_context();
     if (!ctx) return CGSizeZero;
@@ -1157,6 +1202,7 @@ static int spProbeInterrupt(void *opaque) {
     return spNowUs() > *(int64_t *)opaque;
 }
 static BOOL spProbeStreamEmitsBFrames(NSString *path) {
+    if (sp::HTTPRangeIO::supportsURL(path.UTF8String ?: "")) return NO;
     int64_t deadline = spNowUs() + 8000000;
     BOOL found = NO;
 
@@ -1228,7 +1274,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             self->_pendingForceSW = YES;
             self->_pendingRestampSeq = YES;
             self->_pendingForceSWPath = path;
-            [self openMediaAtURL:[NSURL fileURLWithPath:path] startAt:pos error:nil];
+            [self openMediaAtURL:spMediaURLFromPath(path) startAt:pos error:nil];
         });
     });
 }
@@ -1241,6 +1287,15 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     self = [super init];
     if (self) {
         _previewMode = previewMode;
+        _sourceReadHTTP.store(false);
+        _sourceReadPublicationSequence.store(0);
+        _sourceReadOffset.store(-1);
+        _sourceReadOpenGeneration.store(-1);
+        _sourceReadSeekGeneration.store(-1);
+        _sourcePacketBytesOpenGeneration = -1;
+        _sourcePacketBytesSeekGeneration = -1;
+        _sourcePlaybackTimeUs.store(-1);
+        _sourcePlaybackTimeSeekGeneration.store(-1);
         _rendererConfiguredOpenGeneration.store(-1);
         _seekSettleGen.store(0);
         _seekSettleRetryGen.store(-1);
@@ -1581,6 +1636,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     }
     NSString *pathCopy = [path copy];
     _currentFilePath = pathCopy;
+    _sourceReadHTTP.store(sp::HTTPRangeIO::supportsURL(pathCopy.UTF8String ?: ""));
 
     _position = _pendingStartSeconds;
     _duration = 0;
@@ -1672,7 +1728,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             if (_indexWaitPrepVerdict != IndexWaitVerdict::NotWritten) _indexWaitPrepState = st;
         }
         SPLOG(@"[Core] 打开失败：demux open err=%d (%s) hint=%d path=%@",
-              ret, av_err2str(ret), _openFailureHint.load(), path.lastPathComponent);
+              ret, av_err2str(ret), _openFailureHint.load(), spMediaDisplayName(path));
         [self discardFailedPrepare];
         return ret;
     }
@@ -1885,7 +1941,9 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     for (int i = 0; i < 128 && _preludeVideoPkts.empty(); i++) {
         AVPacket *pkt = av_packet_alloc();
         if (!pkt) break;
-        int r = _demuxer->readPacket(pkt);
+        // Preparing the first frame precedes _running=true. Only explicit abort
+        // may cancel these reads; the playback seek mailbox is not active yet.
+        int r = _demuxer->readPacket(pkt, false);
         if (r <= 0) { av_packet_free(&pkt); break; }
 
         const bool isolated = _demuxer->videoTrackIsolated();
@@ -1963,7 +2021,8 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         }
     }
 
-    if (par->codec_id == AV_CODEC_ID_AV1 && !_preludeVideoPkts.empty() && !_resilientDryRun.load(std::memory_order_relaxed)) {
+    if (par->codec_id == AV_CODEC_ID_AV1 && !_preludeVideoPkts.empty() && !_resilientDryRun.load(std::memory_order_relaxed) &&
+        !sp::HTTPRangeIO::supportsURL(path.UTF8String ?: "")) {
         const AVPacket *kp = _preludeVideoPkts.front();
         spresil::Av1ObuSpan seqSpan;
         if (spresil::av1FindObu(kp->data, (size_t)kp->size, 1, seqSpan) && seqSpan.len <= 4096 &&
@@ -2385,6 +2444,80 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     _demuxer->close();
 }
 
+// Called only during the serialized prepare-to-demux handoff or on the demux
+// thread. AVIO's logical position accounts for bytes still in its read buffer;
+// sampling it performs no transport read and is independent of media time.
+- (void)publishSourceReadOffsetForOpenGeneration:(int64_t)openGen
+                                seekGeneration:(int64_t)seekGen {
+    if (!_sourceReadHTTP.load() || openGen != _openGeneration.load() ||
+        seekGen != _generation.load()) return;
+    AVFormatContext *ctx = _demuxer->ctx();
+    const int64_t offset = ctx && ctx->pb ? avio_tell(ctx->pb) : -1;
+    // Sequentially consistent atomics make the two sequence observations bound
+    // one complete publication even on ARM. There is only one publishing owner.
+    _sourceReadPublicationSequence.fetch_add(1);
+    _sourceReadOffset.store(offset >= 0 ? offset : -1);
+    _sourceReadOpenGeneration.store(openGen);
+    _sourceReadSeekGeneration.store(seekGen);
+    _sourceReadPublicationSequence.fetch_add(1);
+}
+
+- (void)resetSourcePacketBytesForOpenGeneration:(int64_t)openGen
+                                seekGeneration:(int64_t)seekGen {
+    _sourcePlaybackTimeUs.store(-1);
+    _sourcePlaybackTimeSeekGeneration.store(-1);
+    std::lock_guard<std::mutex> lock(_sourcePacketBytesMtx);
+    _sourcePacketBytes.clear();
+    _sourcePacketBytesOpenGeneration = openGen;
+    _sourcePacketBytesSeekGeneration = seekGen;
+}
+
+// The demux owner records normalized presentation timestamps before packets are
+// cloned, decoded, or queued. PTS, rather than DTS, handles B-frame presentation.
+- (void)recordSourcePacketBytes:(const AVPacket *)packet
+                 openGeneration:(int64_t)openGen
+                 seekGeneration:(int64_t)seekGen {
+    if (!_sourceReadHTTP.load() || !packet || packet->pos < 0 ||
+        packet->pts == AV_NOPTS_VALUE || (packet->flags & AV_PKT_FLAG_DISCARD) ||
+        openGen != _openGeneration.load() || seekGen != _generation.load()) return;
+    AVRational timeBase;
+    if (packet->stream_index == _videoStreamIndex) timeBase = _videoTimeBase;
+    else if (packet->stream_index == _audioStreamIndex && _audioActive) {
+        // The decoder changes its active timebase asynchronously after a voice
+        // switch. Packet metadata must use this stream's immutable timebase.
+        const auto audioTimeBase = _audioTrackTimeBases.find(packet->stream_index);
+        if (audioTimeBase == _audioTrackTimeBases.end()) return;
+        timeBase = audioTimeBase->second;
+    }
+    else return;
+    if (timeBase.num <= 0 || timeBase.den <= 0) return;
+    const int64_t ptsUs = av_rescale_q(packet->pts, timeBase, AV_TIME_BASE_Q);
+    const int64_t durationUs = packet->duration > 0
+        ? av_rescale_q(packet->duration, timeBase, AV_TIME_BASE_Q) : 0;
+    std::lock_guard<std::mutex> lock(_sourcePacketBytesMtx);
+    if (_sourcePacketBytesOpenGeneration != openGen ||
+        _sourcePacketBytesSeekGeneration != seekGen ||
+        openGen != _openGeneration.load() || seekGen != _generation.load()) return;
+    // Keep two seconds of reordering slack behind the actual 20-second history
+    // boundary. B-frames can arrive out of PTS order, so queries scan exact facts.
+    const int64_t playedUs = _sourcePlaybackTimeSeekGeneration.load() == seekGen
+        ? _sourcePlaybackTimeUs.load() : -1;
+    if (playedUs > 22000000) {
+        while (!_sourcePacketBytes.empty() &&
+               _sourcePacketBytes.front().ptsUs < playedUs - 22000000) {
+            _sourcePacketBytes.pop_front();
+        }
+    }
+    if (_sourcePacketBytes.size() >= 32768) _sourcePacketBytes.pop_front();
+    _sourcePacketBytes.push_back({ptsUs, packet->pos, durationUs, packet->stream_index});
+}
+
+- (void)noteSourcePlaybackTimeUs:(int64_t)ptsUs seekGeneration:(int64_t)seekGen {
+    if (!_sourceReadHTTP.load() || ptsUs < 0 || seekGen != _generation.load()) return;
+    _sourcePlaybackTimeUs.store(ptsUs);
+    _sourcePlaybackTimeSeekGeneration.store(seekGen);
+}
+
 - (BOOL)startPipelineFromPrepareWithGeneration:(int64_t)openGen audioOnly:(BOOL)audioOnly {
     std::lock_guard<std::mutex> lock(_lifecycleMtx);
     if (openGen != _openGeneration) return NO;
@@ -2547,6 +2680,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             ? NSLocalizedString(@"memc.status.waitingCompatibleFrames", nil) : NSLocalizedString(@"memc.status.off", nil);
     }
     _generation.store(0);
+    [self resetSourcePacketBytesForOpenGeneration:openGen seekGeneration:0];
     _seekBurstBaseGen.store(0);
 
     _audioRingStartGen.store(-1);
@@ -2601,10 +2735,18 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     }
 
     for (AVPacket *p : _preludeVideoPkts) {
+        [self recordSourcePacketBytes:p openGeneration:openGen seekGeneration:0];
         TaggedPacket tp = { p, 0 };
         if (!_videoPackets->push(std::move(tp))) av_packet_free(&tp.pkt);
     }
     _preludeVideoPkts.clear();
+    _audioPackets->peekEach(_audioPackets->size(), [&](const TaggedPacket &packet) {
+        [self recordSourcePacketBytes:packet.pkt openGeneration:openGen seekGeneration:0];
+        return true;
+    });
+    for (AVPacket *packet : _preludeAudioOverflow) {
+        [self recordSourcePacketBytes:packet openGeneration:openGen seekGeneration:0];
+    }
 
     _paused = false;
     _running = true;
@@ -2617,6 +2759,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     }
 
     _demuxer->releaseRetiredContexts();
+    [self publishSourceReadOffsetForOpenGeneration:openGen seekGeneration:0];
     _demuxThread = std::thread([self, openGen] {
         [self demuxLoopForOpenGeneration:openGen];
     });
@@ -2764,9 +2907,9 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         _pendingExcludedVideo = _prepRetryExcludedVideo;
         _pendingExcludedVideoPath = [path copy];
         _pendingExcludedVideoStartSec = _prepRetryStartSec;
-        SPLOG(@"[Resilient] 备用视频轨：重开 %@（起点 %.2fs，排除 %zu 条）", path.lastPathComponent, _pendingExcludedVideoStartSec,
+        SPLOG(@"[Resilient] 备用视频轨：重开 %@（起点 %.2fs，排除 %zu 条）", spMediaDisplayName(path), _pendingExcludedVideoStartSec,
               _pendingExcludedVideo.size());
-        [self openMediaAtURL:[NSURL fileURLWithPath:path] startAt:_pendingExcludedVideoStartSec error:nil];
+        [self openMediaAtURL:spMediaURLFromPath(path) startAt:_pendingExcludedVideoStartSec error:nil];
         return;
     }
     if (prepErr != 0) {
@@ -2793,7 +2936,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
             }
         }
 
-        SPLOG(@"[Core] 打开失败 err=%d（%@）path=%@", prepErr, desc, path.lastPathComponent);
+        SPLOG(@"[Core] 打开失败 err=%d（%@）path=%@", prepErr, desc, spMediaDisplayName(path));
         if ([_delegate respondsToSelector:@selector(playerCore:didFailWithError:)]) {
             NSError *err = [self makeErrorWithDomain:@"SPDemuxerError" code:prepErr description:desc
                                                phase:@"open" diagnosis:diagnosis terminal:YES];
@@ -3303,15 +3446,16 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
 }
 
 - (BOOL)openMediaAtURL:(NSURL *)url startAt:(double)seconds error:(NSError **)error {
-    if (!url.isFileURL) {
+    const BOOL network = sp::HTTPRangeIO::supportsURL(url.absoluteString.UTF8String ?: "");
+    if (!url.isFileURL && !network) {
         if (error) *error = [self makeErrorWithDomain:@"SPURLError" code:-1
-                                          description:NSLocalizedString(@"error.localFilesOnly", nil)
+                                          description:NSLocalizedString(@"error.openFailed", nil)
                                                 phase:@"open" diagnosis:@"url" terminal:YES];
         return NO;
     }
 
     _requestedStartSeconds = MAX(0.0, seconds);
-    return [self openFileAtPath:url.path error:error];
+    return [self openFileAtPath:network ? url.absoluteString : url.path error:error];
 }
 
 #pragma mark - Controls
@@ -3366,6 +3510,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     }
     _paused = true;
     _rebufferHold = NO;
+    [self resetSourcePlaybackWaiting];
     {
         std::lock_guard<std::mutex> lock(_stateMtx);
         _playCv.notify_all();
@@ -3380,6 +3525,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     if (_audioOnlyTimer) _audioOnlyTimer.fireDate = NSDate.distantFuture;
     if (_audioOutput) [_audioOutput stop];
     [self setState:SPPlayerStatePaused];
+    [self publishSourceGrowthIfChanged];
 
     [self refreshSubtitleDisplay];
 }
@@ -3515,7 +3661,8 @@ static BOOL spThumbsEnabled(void) {
 
 - (BOOL)timelinePreviewEligible {
     return spThumbsEnabled() && !_previewMode && !_audioOnlySession.load() &&
-           _currentFilePath != nil;
+           _currentFilePath != nil &&
+           !sp::HTTPRangeIO::supportsURL(_currentFilePath.UTF8String ?: "");
 }
 
 - (void)scheduleTimelineThumbnails {
@@ -4167,6 +4314,17 @@ static BOOL spThumbsEnabled(void) {
 }
 - (double)displayEDRHeadroom { return (double)[_renderer displayEDRHeadroom]; }
 - (BOOL)displayEDRCapable { return [_renderer displayEdrCapable]; }
+- (BOOL)hdrShadowLiftEnabled { return [_renderer hdrShadowLiftEnabled]; }
+- (void)setHdrShadowLiftEnabled:(BOOL)enabled {
+    if ([_renderer hdrShadowLiftEnabled] == enabled) return;
+    [_renderer setHdrShadowLiftEnabled:enabled];
+    if (_state == SPPlayerStatePlaying || _state == SPPlayerStateOpening) {
+        _needsOutputModeRedraw.store(true);
+    } else if (_lastFrameBuffer) {
+        std::lock_guard<std::mutex> rlock(_renderMtx);
+        [_renderer renderPixelBuffer:_lastFrameBuffer];
+    }
+}
 - (void)setBrightness:(float)v { [_renderer setBrightness:v]; [self refreshSubtitleDisplay]; }
 - (void)setContrast:(float)v { [_renderer setContrast:v]; [self refreshSubtitleDisplay]; }
 - (void)setSaturation:(float)v { [_renderer setSaturation:v]; [self refreshSubtitleDisplay]; }
@@ -4649,6 +4807,10 @@ static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
 
     std::lock_guard<std::mutex> lifecycleLock(_lifecycleMtx);
     _openGeneration++;
+    _sourceReadHTTP.store(false);
+    _sourceReadOffset.store(-1);
+    [self resetSourcePacketBytesForOpenGeneration:-1 seekGeneration:-1];
+    [self resetSourcePlaybackWaiting];
     [self cancelIndexWait];
     if (_trialExecutor) _trialExecutor->cancelAll();
 
@@ -4893,7 +5055,12 @@ static NSString *spLangDisplayName(const std::string &lang) {
                     ? [NSString stringWithFormat:NSLocalizedString(@"track.audioChannelsFmt", nil), cn, si.channels] : cn];
             }
             [alist addObject:@{@"index": @(si.index),
-                               @"title": [parts componentsJoinedByString:@" · "]}];
+                               @"title": [parts componentsJoinedByString:@" · "],
+                               @"rawTitle": title ?: @"",
+                               @"language": [NSString stringWithUTF8String:si.language.c_str()] ?: @"",
+                               @"codec": [NSString stringWithUTF8String:si.codecName.c_str()] ?: @"",
+                               @"channels": @(si.channels),
+                               @"isDefault": @((s->disposition & AV_DISPOSITION_DEFAULT) != 0)}];
         } else if (si.type == AVMEDIA_TYPE_SUBTITLE && si.isTextSubtitle) {
             _subTrackMeta[si.index] = { (int)s->codecpar->codec_id, s->time_base };
             if ((s->codecpar->codec_id == AV_CODEC_ID_ASS ||
@@ -5106,7 +5273,8 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
 
 - (BOOL)repairFlacStreamInfoInPlace:(AVCodecParameters *)apar streamIndex:(int)idx {
     NSString *path = _prepPath;
-    if (!path || !apar || apar->extradata_size < 34) return NO;
+    if (!path || !apar || apar->extradata_size < 34 ||
+        sp::HTTPRangeIO::supportsURL(path.UTF8String ?: "")) return NO;
 
     const int64_t og = _openGeneration.load(std::memory_order_acquire);
     sptrial::InterruptCtx ic;
@@ -5328,7 +5496,7 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
         self->_pendingExcludedVideoPath = path;
         const double pos = MAX(0.0, self->_position);
         SP_RESLOG(@"视频轨（流#%d）不可解，改用文件里另一条视频轨（流#%d）重开 @%.1fs", cur, alt, pos);
-        [self openMediaAtURL:[NSURL fileURLWithPath:path] startAt:pos error:nil];
+        [self openMediaAtURL:spMediaURLFromPath(path) startAt:pos error:nil];
     });
     return YES;
 }
@@ -5752,6 +5920,8 @@ static void spApplyDecodeQoS() {
 
             if (waitIfSuperseded(seekGen)) continue;
             tagGen = seekGen;
+            [self publishSourceReadOffsetForOpenGeneration:sessionOpenGeneration
+                                           seekGeneration:tagGen];
             seekFirstPktPending = spDebug();
 
             landingTrimPending = sret >= 0 && _audioActive &&
@@ -5903,6 +6073,14 @@ static void spApplyDecodeQoS() {
         if (_seekMailbox.peek() || tagGen != _generation.load()) {
             if (r > 0) av_packet_unref(pkt);
             continue;
+        }
+        if (r > 0) {
+            [self publishSourceReadOffsetForOpenGeneration:sessionOpenGeneration
+                                           seekGeneration:tagGen];
+            if (!replayPkt) {
+                [self recordSourcePacketBytes:pkt openGeneration:sessionOpenGeneration
+                               seekGeneration:tagGen];
+            }
         }
         if (r > 0 && packetsSinceCoarseSeek != INT_MAX &&
             pkt->stream_index == _videoStreamIndex) {
@@ -7275,6 +7453,7 @@ static void spApplyDecodeQoS() {
     if (submitted && frame.synthetic) _generator.counters->presented.fetch_add(1);
     if (submitted) {
         _sessionEverPresented.store(true);
+        [self noteSourcePlaybackTimeUs:frame.ptsUs seekGeneration:frame.gen];
         // Only the first accepted frame of a generation needs publication.
         // Avoid a contended atomic write on every steady-state video frame.
         if (_lastSubmittedVideoGeneration.load(std::memory_order_relaxed) !=
@@ -8279,6 +8458,8 @@ static void spApplyDecodeQoS() {
         if (motionPath && _lastFrameSynthetic) _generator.counters->presented.fetch_add(1);
         if (countPresented) { _pacePresented++; [self notePresentedFrameForRate]; }
         _sessionEverPresented.store(true);
+        [self noteSourcePlaybackTimeUs:_lastPresentedPtsUs
+                       seekGeneration:_lastFrameGeneration];
         _lastSubmittedVideoGeneration.store(_lastFrameGeneration,
                                             std::memory_order_release);
         BOOL completesSeek = _presentRetryCompletesPausedSeek;
@@ -8454,6 +8635,10 @@ static void spApplyDecodeQoS() {
     int64_t nowUs = [self currentMediaNowUs];
     if (nowUs > 0) _position = nowUs / 1e6;
     const int64_t audioEndUs = _audioRingEndPtsUs.load();
+    if (nowUs >= 0 && audioEndUs > 0) {
+        [self noteSourcePlaybackTimeUs:MIN(nowUs, audioEndUs)
+                       seekGeneration:_generation.load()];
+    }
 
     if (nowUs > 0 && audioEndUs > 0 && (_duration > 0 || _demuxer->sourceGrowing())) {
         const double contentSec = MIN(nowUs, audioEndUs) / 1e6;
@@ -8572,6 +8757,31 @@ static void spApplyDecodeQoS() {
 
 - (BOOL)contentSearching { return _pubContentSearching; }
 
+- (void)resetSourcePlaybackWaiting {
+    const BOOL changed = _pubSourcePlaybackWaiting;
+    _sourcePlaybackWaitPolicy.reset();
+    _pubSourcePlaybackWaiting = NO;
+    _sourcePlaybackWaitCheckToken++;
+    _sourcePlaybackWaitCheckQueued = NO;
+    if (changed && [_delegate respondsToSelector:@selector(playerCoreDidChangeSourceGrowth:)])
+        [_delegate playerCoreDidChangeSourceGrowth:self];
+}
+
+- (void)scheduleSourcePlaybackWaitCheck {
+    if (_sourcePlaybackWaitCheckQueued) return;
+    _sourcePlaybackWaitCheckQueued = YES;
+    const uint64_t token = _sourcePlaybackWaitCheckToken;
+    const uint64_t openGeneration = _openGeneration.load(std::memory_order_acquire);
+    __weak SPPlayerCore *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        SPPlayerCore *s = weakSelf;
+        if (!s || token != s->_sourcePlaybackWaitCheckToken ||
+            openGeneration != s->_openGeneration.load(std::memory_order_acquire)) return;
+        s->_sourcePlaybackWaitCheckQueued = NO;
+        [s publishSourceGrowthIfChanged];
+    });
+}
+
 - (void)publishSourceGrowthIfChanged {
     if (!_demuxer) return;
     [self startMkvContentScanIfPending];
@@ -8591,9 +8801,35 @@ static void spApplyDecodeQoS() {
 
     if (g.waiting) _lastSourceWaitSeenUs = spNowUs();
     const BOOL seekWaiting = _seekPending.load() && spNowUs() - _lastSourceWaitSeenUs < 1500000;
-    const BOOL waiting = growing && (_rebufferHold || (g.waiting && spNowUs() - g.waitingSinceUs > 500000) || seekWaiting);
+    const BOOL waiting = (growing || _demuxer->onRemoteVolume()) &&
+        (_rebufferHold || (g.waiting && spNowUs() - g.waitingSinceUs > 500000) || seekWaiting);
 
     const BOOL stalled = waiting && g.idleUs >= spgrow::kStalledHintUs;
+
+    const bool active = _running.load() &&
+        (_state == SPPlayerStatePlaying || _state == SPPlayerStatePaused);
+    const spplaywait::Decision playbackWait = _sourcePlaybackWaitPolicy.update({
+        .nowUs = spNowUs(),
+        .openGeneration = static_cast<uint64_t>(_openGeneration.load(std::memory_order_acquire)),
+        .seekGeneration = _generation.load(),
+        .sessionActive = active,
+        .sourceEligible = bool(growing || _demuxer->onRemoteVolume()),
+        .playing = _state == SPPlayerStatePlaying && !_paused.load(),
+        .rebufferHold = bool(_rebufferHold),
+        .audioStarved = _audioOnlySession.load() && _audioActive && _audioOutput &&
+            _audioPackets && _audioOutput.bufferedFrames == 0 && _audioPackets->size() == 0 &&
+            !_demuxer->eof(),
+        .seekPending = _seekPending.load(),
+        .seekFramePending = _seekFramePending.load(),
+        .rawWaiting = g.waiting
+    });
+    // Poll only while a visible hold/seek can be pending. This also handles
+    // paused seeks, whose normal display link may be suspended.
+    if (active && (playbackWait.blocking || _seekPending.load() || _seekFramePending.load()))
+        [self scheduleSourcePlaybackWaitCheck];
+    const BOOL playbackWaitChanged = playbackWait.waiting != bool(_pubSourcePlaybackWaiting);
+    _pubSourcePlaybackWaiting = playbackWait.waiting;
+
 
     BOOL renamed = NO;
     if (g.pathRev != _pubSourcePathRev) {
@@ -8606,7 +8842,7 @@ static void spApplyDecodeQoS() {
             renamed = YES;
         }
     }
-    if (!renamed && growing == _pubSourceGrowing && waiting == _pubSourceWaiting && stalled == _pubSourceStalled) return;
+    if (!renamed && !playbackWaitChanged && growing == _pubSourceGrowing && waiting == _pubSourceWaiting && stalled == _pubSourceStalled) return;
     _pubSourceGrowing = growing;
     _pubSourceWaiting = waiting;
     _pubSourceStalled = stalled;
@@ -8618,6 +8854,7 @@ static void spApplyDecodeQoS() {
 
 - (BOOL)sourceGrowing { return _pubSourceGrowing; }
 - (BOOL)sourceWaiting { return _pubSourceWaiting || _indexWaiting; }
+- (BOOL)sourcePlaybackWaiting { return _pubSourcePlaybackWaiting; }
 - (BOOL)sourceStalled { return _pubSourceStalled || (_indexWaiting && _indexWaitStalled); }
 - (BOOL)sourceWaitingForIndex { return _indexWaiting; }
 
@@ -8742,6 +8979,7 @@ static void spApplyDecodeQoS() {
 
     if (_state == SPPlayerStatePaused) {
         [self servicePausedTickWithMotionPath:motionPath motionFrames:motionFrames];
+        [self publishSourceGrowthIfChanged];
         return;
     }
     if (_state != SPPlayerStatePlaying) return;
@@ -8766,6 +9004,7 @@ static void spApplyDecodeQoS() {
             if (spDebug()) SPLOG(@"[Core] 重缓冲结束 %.0fms（包队列=%zu 阈值=%zu）",
                                  (spNowUs() - _rebufferHoldStartUs) / 1000.0, q, exitAt);
             _rebufferHold = NO;
+            [self publishSourceGrowthIfChanged];
             _rebufferLastExitWallUs = spNowUs();
             _mediaClockPtsUs = _lastPresentedPtsUs;
             _mediaClockWallUs = spNowUs();
@@ -8788,6 +9027,7 @@ static void spApplyDecodeQoS() {
         if (enterHold) {
             _rebufferHold = YES;
             _rebufferHoldStartUs = spNowUs();
+            [self publishSourceGrowthIfChanged];
 
             _presentStarveWallUs.store(spNowUs());
 
@@ -9078,6 +9318,8 @@ static void spApplyDecodeQoS() {
          forward:(BOOL)forward
 alignToleranceUs:(int64_t)alignToleranceUs {
     _seekPending.store(true);
+    _sourceReadOffset.store(-1);
+    [self resetSourcePlaybackWaiting];
 
     _speculativeFirstFrameRevoked.store(true, std::memory_order_release);
     _lastDoSeekWallUs = spNowUs();
@@ -9101,6 +9343,8 @@ alignToleranceUs:(int64_t)alignToleranceUs {
 
     _interpolationResetRequested.store(true);
     int64_t newGen = _generation.fetch_add(1) + 1;
+    [self resetSourcePacketBytesForOpenGeneration:_openGeneration.load()
+                                   seekGeneration:newGen];
     _seekSettleRetryGen.store(-1);
 
     _settledCoarseLandingUs = -1;
@@ -9171,6 +9415,7 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     }
 
     if (_demuxer) _demuxer->wakeSourceWait();
+    [self publishSourceGrowthIfChanged];
 }
 
 #pragma mark - State and notifications
@@ -9179,6 +9424,8 @@ alignToleranceUs:(int64_t)alignToleranceUs {
     if (_state == state) return;
     const BOOL leftOpening = (_state == SPPlayerStateOpening);
     _state = state;
+    if (state != SPPlayerStatePlaying && state != SPPlayerStatePaused)
+        [self resetSourcePlaybackWaiting];
     _backgroundPlaybackState.store(state, std::memory_order_release);
     if ([_delegate respondsToSelector:@selector(playerCore:didChangeState:)]) {
         [_delegate playerCore:self didChangeState:state];
@@ -10268,6 +10515,136 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 
     return _seekSettleGen.load() == _generation.load();
 }
+
+- (int64_t)sourceReadOffset {
+    // This API is main-thread-only, like the playback state it accompanies.
+    if (!_sourceReadHTTP.load() || !_running.load() ||
+        (_state != SPPlayerStateReady && _state != SPPlayerStatePlaying &&
+         _state != SPPlayerStatePaused) ||
+        (_seekPending.load() && !_audioOnlySession.load()) ||
+        _seekMailbox.peek()) return -1;
+    const int64_t openGen = _openGeneration.load();
+    const int64_t seekGen = _generation.load();
+    // Paused audio has no presentation tick to clear its legacy seekPending
+    // flag. Its demux completion and generation-stamped cursor are sufficient;
+    // video still requires the latest target to be accepted for presentation.
+    if (_seekSettleGen.load() != seekGen ||
+        _seekDemuxDoneGen.load() != seekGen) return -1;
+    const uint64_t before = _sourceReadPublicationSequence.load();
+    if (before & 1) return -1;
+    const int64_t offset = _sourceReadOffset.load();
+    const int64_t publishedOpenGen = _sourceReadOpenGeneration.load();
+    const int64_t publishedSeekGen = _sourceReadSeekGeneration.load();
+    const uint64_t after = _sourceReadPublicationSequence.load();
+    if (before != after || publishedOpenGen != openGen ||
+        publishedSeekGen != seekGen || openGen != _openGeneration.load() ||
+        seekGen != _generation.load() ||
+        (_seekPending.load() && !_audioOnlySession.load()) ||
+        _seekMailbox.peek()) return -1;
+    return offset;
+}
+
+- (SPSourcePlaybackWindow)sourcePlaybackWindow {
+    const SPSourcePlaybackWindow unavailable = {-1, -1, -1, -1, -1, -1};
+    if (self.sourceReadOffset < 0) return unavailable;
+    const int64_t openGen = _openGeneration.load();
+    const int64_t seekGen = _generation.load();
+    int64_t playedUs = _sourcePlaybackTimeSeekGeneration.load() == seekGen
+        ? _sourcePlaybackTimeUs.load() : -1;
+    if (playedUs < 0 && _audioOnlySession.load() && _state == SPPlayerStatePaused) {
+        // A completed paused audio seek has no running audio-clock tick yet.
+        // Its selected presentation target is valid after the demux seek above;
+        // byte positions still come only from packets in that new generation.
+        playedUs = MAX((int64_t)0, (int64_t)(_position * 1e6));
+    }
+    if (playedUs < 0) return unavailable;
+    const int64_t cutoffUs = MAX((int64_t)0, playedUs - 20000000);
+    const int video = _audioOnlySession.load() ? -1 : _videoStreamIndex;
+    const int audio = _hasAudio ? _currentAudioTrackPub.load() : -1;
+    if (video < 0 && audio < 0) return unavailable;
+
+    int64_t videoTime = INT64_MIN, audioTime = INT64_MIN;
+    int64_t videoPosition = -1, audioPosition = -1;
+    int64_t nextAudioTime = INT64_MAX, nextAudioPosition = -1, nextAudioDuration = 0;
+    bool boundedFutureAudio = false;
+    int64_t historyPosition = -1, historyTime = -1;
+    {
+        std::lock_guard<std::mutex> lock(_sourcePacketBytesMtx);
+        if (_sourcePacketBytesOpenGeneration != openGen ||
+            _sourcePacketBytesSeekGeneration != seekGen) return unavailable;
+        for (const auto &packet : _sourcePacketBytes) {
+            if (packet.stream != video && packet.stream != audio) continue;
+            if (packet.ptsUs >= cutoffUs &&
+                (historyPosition < 0 || packet.position < historyPosition)) {
+                // Presentation timestamps can arrive out of order. Taking the
+                // lowest physical position among qualifying packets also keeps
+                // a future reference packet stored before a later B-frame.
+                historyPosition = packet.position;
+                historyTime = packet.ptsUs;
+            }
+            if (packet.ptsUs > playedUs) {
+                if (packet.stream == audio && packet.ptsUs < nextAudioTime) {
+                    nextAudioTime = packet.ptsUs;
+                    nextAudioPosition = packet.position;
+                    nextAudioDuration = packet.durationUs;
+                }
+                continue;
+            }
+            int64_t &time = packet.stream == video ? videoTime : audioTime;
+            int64_t &position = packet.stream == video ? videoPosition : audioPosition;
+            if (packet.ptsUs > time ||
+                (packet.ptsUs == time && (position < 0 || packet.position < position))) {
+                time = packet.ptsUs;
+                position = packet.position;
+            }
+        }
+    }
+    if (audio >= 0 && audioPosition < 0 && video >= 0 && videoPosition >= 0 &&
+        nextAudioPosition >= 0 && nextAudioDuration > 0) {
+        // A fresh MKV Cluster can begin with video at 5.000s and its first AAC
+        // packet at 5.013s; the preceding 4.992s AAC was before the seek landing.
+        // The accepted video frame is already a valid anchor while paused.
+        // Permit only this known sub-packet audio lead. Its actual packet may
+        // precede or follow video physically; neither byte position is guessed.
+        // Unknown data, wider gaps and audio-only targets retain their rules.
+        const auto timeBase = _audioTrackTimeBases.find(audio);
+        const int64_t tickUs = timeBase != _audioTrackTimeBases.end()
+            ? av_rescale_q_rnd(1, timeBase->second, AV_TIME_BASE_Q, AV_ROUND_UP) : 0;
+        if (nextAudioTime - playedUs <= nextAudioDuration + MAX((int64_t)0, tickUs)) {
+            audioTime = nextAudioTime;
+            audioPosition = nextAudioPosition;
+            boundedFutureAudio = true;
+        }
+    }
+    // Missing packet facts, timestamp recovery discontinuities, or a bounded
+    // map that no longer covers the actual playhead fail closed, never estimate.
+    if ((video >= 0 && (videoPosition < 0 ||
+            playedUs - videoTime > MAX((int64_t)250000, 3 * _frameIntervalUs))) ||
+        (audio >= 0 && (audioPosition < 0 || playedUs - audioTime > 1000000)) ||
+        historyPosition < 0) return unavailable;
+    const int64_t currentPosition = videoPosition < 0 ? audioPosition
+        : audioPosition < 0 ? videoPosition : MIN(videoPosition, audioPosition);
+    if (currentPosition < historyPosition) {
+        // Priming/interleaved audio can begin slightly before video time zero.
+        // Always retain the current packet even at that presentation boundary.
+        historyPosition = currentPosition;
+        historyTime = MAX((int64_t)0, videoPosition == currentPosition ? videoTime : audioTime);
+    }
+    if (historyTime > playedUs) {
+        if (!boundedFutureAudio || historyPosition != nextAudioPosition) return unavailable;
+        // This earlier physical packet is future audio, not already-watched
+        // media. Keep its exact bytes while reporting zero watched history at
+        // the real video playhead; do not invent an earlier playback timestamp.
+        historyTime = playedUs;
+    }
+    if (openGen != _openGeneration.load() || seekGen != _generation.load() ||
+        self.sourceReadOffset < 0) return unavailable;
+    return {openGen, seekGen, currentPosition, historyPosition,
+            playedUs / 1e6, historyTime / 1e6};
+}
+
+- (int64_t)sourcePlaybackByteOffset { return self.sourcePlaybackWindow.playbackOffset; }
+- (int64_t)sourceHistoryStartOffset { return self.sourcePlaybackWindow.historyStartOffset; }
 
 - (SPPlayerState)state { return _state; }
 

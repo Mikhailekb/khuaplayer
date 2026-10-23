@@ -5,6 +5,8 @@ final class SPPlaybackNoticeView: NSView {
     private enum G {
         static let height: CGFloat = 30
         static let padH: CGFloat = 14
+        static let padV: CGFloat = 7
+        static let marginH: CGFloat = 16
         static let topGap: CGFloat = 24
         static let fontSize: CGFloat = 13
         static let fade: CFTimeInterval = 0.15
@@ -26,7 +28,11 @@ final class SPPlaybackNoticeView: NSView {
         label.font = .systemFont(ofSize: G.fontSize, weight: .medium)
         label.textColor = .white
         label.alignment = .center
-        label.lineBreakMode = .byTruncatingMiddle
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 0
+        label.cell?.usesSingleLineMode = false
+        label.cell?.wraps = true
+        label.cell?.isScrollable = false
         addSubview(label)
         isHidden = true
         alphaValue = 0
@@ -63,14 +69,23 @@ final class SPPlaybackNoticeView: NSView {
     func place(in bounds: NSRect, topInset: CGFloat) {
         lastBounds = bounds
         lastTopInset = topInset
-        guard let text = currentText else { return }
+        guard let text = currentText, bounds.width > 0, bounds.height > 0 else { return }
         label.stringValue = text
-        let textW = ceil(label.intrinsicContentSize.width)
-        let w = min(textW + G.padH * 2, max(bounds.width - 32, 80))
-        frame = NSRect(x: bounds.midX - w / 2, y: bounds.maxY - topInset - G.topGap - G.height,
-                       width: w, height: G.height)
-        let labelH = ceil(label.intrinsicContentSize.height)
-        label.frame = NSRect(x: G.padH, y: (G.height - labelH) / 2, width: w - G.padH * 2, height: labelH)
+        guard let cell = label.cell else { return }
+        // Intrinsic width excludes part of NSTextFieldCell's text insets. Use
+        // the actual cell metrics, then reserve a point for fractional glyphs.
+        let measuringBounds = NSRect(x: 0, y: 0, width: 100_000, height: 100_000)
+        let naturalWidth = ceil(cell.cellSize(forBounds: measuringBounds).width) + 1
+        let margin = min(G.marginH, bounds.width / 4)
+        let w = min(naturalWidth + G.padH * 2, bounds.width - margin * 2)
+        let padH = min(G.padH, max(0, (w - 20) / 2))
+        let labelW = max(1, w - padH * 2)
+        let labelH = ceil(cell.cellSize(forBounds:
+            NSRect(x: 0, y: 0, width: labelW, height: measuringBounds.height)).height)
+        let h = max(G.height, labelH + G.padV * 2)
+        frame = NSRect(x: bounds.midX - w / 2, y: bounds.maxY - topInset - G.topGap - h,
+                       width: w, height: h)
+        label.frame = NSRect(x: padH, y: (h - labelH) / 2, width: labelW, height: labelH)
     }
 
     private var currentText: String? { transientText ?? stickyText }

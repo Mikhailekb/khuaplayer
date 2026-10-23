@@ -92,8 +92,14 @@ enum SPDamage {
 
 final class SPIconButton: NSButton {
     private var hoverArea: NSTrackingArea?
+    private var hovering = false
+    private var keyboardFocused = false
+    private var accessibilityFocused = false
+    var showsSelection = false { didSet { refreshTint() } }
     // When nil, the button manages its own hover highlight.
     var onHoverChanged: ((NSButton, Bool) -> Void)?
+    var onFocusChanged: ((Bool) -> Void)?
+    var preservesKeyboardFocusOnClick = false
 
     init(symbol: String, pointSize: CGFloat, size: CGFloat) {
         super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
@@ -104,7 +110,7 @@ final class SPIconButton: NSButton {
         setSymbol(symbol, pointSize: pointSize)
         contentTintColor = SPT.fgIcon
         wantsLayer = true
-        layer?.cornerRadius = 8
+        layer?.cornerRadius = size / 2
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -128,14 +134,187 @@ final class SPIconButton: NSButton {
         hoverArea = a
     }
     override func mouseEntered(with event: NSEvent) {
+        hovering = true
         if let onHoverChanged { onHoverChanged(self, true) }
         else { noAnim { layer?.backgroundColor = SPT.fillHover.cgColor } }
-        contentTintColor = SPT.fgPrimary
+        refreshTint()
     }
     override func mouseExited(with event: NSEvent) {
+        hovering = false
         if let onHoverChanged { onHoverChanged(self, false) }
         else { noAnim { layer?.backgroundColor = nil } }
-        contentTintColor = SPT.fgIcon
+        refreshTint()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else { return false }
+        keyboardFocused = true
+        onFocusChanged?(true)
+        return true
+    }
+
+    override func resignFirstResponder() -> Bool {
+        guard super.resignFirstResponder() else { return false }
+        keyboardFocused = false
+        onFocusChanged?(accessibilityFocused)
+        return true
+    }
+
+    override func setAccessibilityFocused(_ focused: Bool) {
+        super.setAccessibilityFocused(focused)
+        accessibilityFocused = focused
+        onFocusChanged?(focused || keyboardFocused)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard preservesKeyboardFocusOnClick else {
+            super.mouseDown(with: event)
+            return
+        }
+        let previousResponder = window?.firstResponder
+        let previouslyRefusedFocus = refusesFirstResponder
+        refusesFirstResponder = true
+        defer {
+            refusesFirstResponder = previouslyRefusedFocus
+            if previousResponder !== self, window?.firstResponder === self {
+                window?.makeFirstResponder(previousResponder)
+            }
+        }
+        super.mouseDown(with: event)
+    }
+
+    private func refreshTint() {
+        contentTintColor = showsSelection || hovering ? SPT.fgPrimary : SPT.fgIcon
+    }
+
+}
+
+final class SPPlaybackTimeButton: NSButton {
+    var onWidthChanged: (() -> Void)?
+    private(set) var showsRemaining = false
+    private(set) var preferredWidth: CGFloat = 90
+    private var elapsedSeconds = -1
+    private var totalSeconds = -1
+    private var keyboardFocused = false
+    private var accessibilityFocused = false
+
+    var hasInteractionFocus: Bool { keyboardFocused || accessibilityFocused }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isBordered = false
+        bezelStyle = .regularSquare
+        alignment = .left
+        imagePosition = .noImage
+        refusesFirstResponder = false
+        focusRingType = .exterior
+        cell?.wraps = false
+        cell?.usesSingleLineMode = true
+        cell?.lineBreakMode = .byTruncatingMiddle
+        target = self
+        action = #selector(toggleTimeMode)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        configure(position: 0, duration: 0)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var acceptsFirstResponder: Bool { !refusesFirstResponder }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    // Bounds keep malformed engine values away from Int conversions and the
+    // clock formatter while covering media durations up to 68 years.
+    static func normalizedSeconds(_ seconds: Double) -> Double {
+        guard seconds.isFinite else { return 0 }
+        return min(Double(Int32.max), max(0, seconds))
+    }
+
+    func configure(position: Double, duration: Double) {
+        let total = Int(Self.normalizedSeconds(duration))
+        let elapsed = total > 0 ? min(total, Int(Self.normalizedSeconds(position)))
+            : Int(Self.normalizedSeconds(position))
+        guard elapsed != elapsedSeconds || total != totalSeconds else { return }
+        elapsedSeconds = elapsed
+        totalSeconds = total
+        updateTimeTitle()
+    }
+
+    @objc private func toggleTimeMode() {
+        showsRemaining.toggle()
+        updateTimeTitle()
+    }
+
+    private func updateTimeTitle() {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        let total = SPTimeText.clock(Double(max(0, totalSeconds)))
+        let current = showsRemaining
+            ? "−" + SPTimeText.clock(Double(max(0, totalSeconds - elapsedSeconds)))
+            : SPTimeText.clock(Double(max(0, elapsedSeconds)))
+        let title = NSMutableAttributedString(string: current, attributes: [
+            .font: font, .foregroundColor: SPT.fgPrimary,
+        ])
+        title.append(NSAttributedString(string: " / " + total, attributes: [
+            .font: font, .foregroundColor: SPT.fgSecondary,
+        ]))
+        attributedTitle = title
+        let hint = showsRemaining ? L("chrome.time.showElapsed") : L("chrome.time.showRemaining")
+        toolTip = title.string + "\n" + hint
+        setAccessibilityLabel(hint)
+        setAccessibilityValue(title.string)
+        setAccessibilityHelp(hint)
+        // Reserve the duration's digit count for both modes, so ordinary ticks
+        // and the elapsed/remaining toggle do not shift adjacent controls.
+        let widestCurrent = totalSeconds > 0 ? total : SPTimeText.clock(Double(max(0, elapsedSeconds)))
+        let widestTitle = NSAttributedString(string: "−" + widestCurrent + " / " + total,
+                                              attributes: [.font: font])
+        let width = ceil(widestTitle.size().width) + 8
+        if width != preferredWidth {
+            preferredWidth = width
+            onWidthChanged?()
+        }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else { return false }
+        keyboardFocused = true
+        return true
+    }
+
+    override func resignFirstResponder() -> Bool {
+        guard super.resignFirstResponder() else { return false }
+        keyboardFocused = false
+        return true
+    }
+
+    override func setAccessibilityFocused(_ focused: Bool) {
+        super.setAccessibilityFocused(focused)
+        accessibilityFocused = focused
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let previousResponder = window?.firstResponder
+        refusesFirstResponder = true
+        defer {
+            refusesFirstResponder = false
+            if previousResponder !== self, window?.firstResponder === self {
+                window?.makeFirstResponder(previousResponder)
+            }
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if [UInt16(49), 36, 76].contains(event.keyCode),
+           event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
+            if !event.isARepeat { performClick(nil) }
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if [UInt16(49), 36, 76].contains(event.keyCode) { return }
+        super.keyUp(with: event)
     }
 }
 
@@ -1294,6 +1473,7 @@ final class SPRollingDigitLabel: CALayer {
 final class SPVolumeControl: NSControl {
     var onBoostIntent: (() -> Void)?
     var onExpansionChanged: ((_ expanded: Bool, _ animated: Bool) -> Void)?
+    var onInteractionChanged: (() -> Void)?
 
     private enum Metric {
         static let normalWidth: CGFloat = 80
@@ -1372,6 +1552,8 @@ final class SPVolumeControl: NSControl {
     private var compact = false
     private var hovering = false
     private var dragging = false
+    private var accessibilityFocused = false
+    private var keyboardFocused = false
     private var boostIntentSentForDrag = false
     private var boostDragAnchorX: CGFloat?
     private var boostDragAnchorValue: Double = 100
@@ -1385,6 +1567,10 @@ final class SPVolumeControl: NSControl {
     var preferredVisualWidth: CGFloat {
         Metric.edgeHitPadding + normalVisualWidth + Metric.boostWidth
             + Metric.edgeHitPadding
+    }
+    var visibleVisualWidth: CGFloat {
+        Metric.edgeHitPadding + normalVisualWidth + Metric.edgeHitPadding
+            + (isVisuallyExpanded || boostPrompted ? Metric.boostWidth : 0)
     }
     var regularVisualWidth: CGFloat {
         Metric.edgeHitPadding + Metric.normalWidth + Metric.boostWidth
@@ -1475,8 +1661,51 @@ final class SPVolumeControl: NSControl {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    override var acceptsFirstResponder: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
+
+    var keepsVolumeVisible: Bool {
+        hovering || dragging || hasInteractionFocus
+    }
+
+    var hasInteractionFocus: Bool { accessibilityFocused || keyboardFocused }
+
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else { return false }
+        keyboardFocused = true
+        onInteractionChanged?()
+        updateStatusVisibility(animated: true)
+        return true
+    }
+
+    override func resignFirstResponder() -> Bool {
+        guard super.resignFirstResponder() else { return false }
+        keyboardFocused = false
+        onInteractionChanged?()
+        return true
+    }
+
+    override func setAccessibilityFocused(_ focused: Bool) {
+        super.setAccessibilityFocused(focused)
+        accessibilityFocused = focused
+        onInteractionChanged?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard isEnabled,
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
+            super.keyDown(with: event)
+            return
+        }
+        switch event.keyCode {
+        case 123, 125: _ = accessibilityPerformDecrement()
+        case 124, 126: _ = accessibilityPerformIncrement()
+        case 115: setValue(0, notify: true, directManipulation: true)
+        case 119: setValue(maximumValue, notify: true, directManipulation: true)
+        case 53: window?.makeFirstResponder(nil)
+        default: super.keyDown(with: event)
+        }
+    }
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
@@ -1513,6 +1742,7 @@ final class SPVolumeControl: NSControl {
         guard next != boostPrompted else { return }
         let emphasize = next && !boostPrompted
         boostPrompted = next
+        onExpansionChanged?(isVisuallyExpanded, !reduceMotion)
         refreshHint(animated: true, emphasize: emphasize)
         updateStatusVisibility(animated: true)
         updateAccessibility()
@@ -1648,7 +1878,7 @@ final class SPVolumeControl: NSControl {
 
     /// Show while interacting, boosted, or prompted, then fade after 0.9 seconds.
     private var statusShouldShow: Bool {
-        hovering || dragging || volumePercent > 100 || boostPrompted
+        keepsVolumeVisible || volumePercent > 100 || boostPrompted
     }
 
     private func updateStatusVisibility(animated: Bool, changed: Bool = false) {
@@ -1990,12 +2220,14 @@ final class SPVolumeControl: NSControl {
 
     override func mouseEntered(with event: NSEvent) {
         hovering = true
+        onInteractionChanged?()
         needsLayout = true
         refreshHint(animated: true)
         updateStatusVisibility(animated: true)
     }
     override func mouseExited(with event: NSEvent) {
         hovering = false
+        onInteractionChanged?()
         if !dragging { needsLayout = true }
         refreshHint(animated: true)
         updateStatusVisibility(animated: true)
@@ -2003,6 +2235,7 @@ final class SPVolumeControl: NSControl {
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }
         dragging = true
+        onInteractionChanged?()
         boostIntentSentForDrag = false
         boostDragAnchorX = nil
         boostExitReleaseX = nil
@@ -2021,6 +2254,7 @@ final class SPVolumeControl: NSControl {
         guard dragging else { return }
         applyPointerValue(convert(event.locationInWindow, from: nil).x)
         dragging = false
+        onInteractionChanged?()
         boostDragAnchorX = nil
         boostExitReleaseX = nil
         needsLayout = true
@@ -2033,6 +2267,7 @@ final class SPVolumeControl: NSControl {
     func cancelInteraction() {
         guard dragging else { return }
         dragging = false
+        onInteractionChanged?()
         boostIntentSentForDrag = false
         boostDragAnchorX = nil
         boostExitReleaseX = nil
@@ -2043,6 +2278,7 @@ final class SPVolumeControl: NSControl {
     }
 
     override func accessibilityPerformIncrement() -> Bool {
+        guard isEnabled else { return false }
         if !boostUnlocked, volumePercent >= 100 {
             let wasPrompted = boostPrompted
             sendBoostIntentIfNeeded()
@@ -2062,8 +2298,111 @@ final class SPVolumeControl: NSControl {
     }
 
     override func accessibilityPerformDecrement() -> Bool {
+        guard isEnabled else { return false }
         setValue(volumePercent - 5, notify: true, directManipulation: true)
         return true
+    }
+}
+
+/// One continuous hover region covers the speaker, the gap and the slider.
+/// Clipping the rail rather than hiding it preserves its keyboard and AX path.
+final class SPVolumeHoverView: NSView {
+    var onExpansionChanged: ((_ animated: Bool) -> Void)?
+    private(set) var isExpanded = false
+    private let muteButton: SPIconButton
+    private let slider: SPVolumeControl
+    private var hovering = false
+    private var speakerFocused = false
+    private var trackingAreaRef: NSTrackingArea?
+    private var collapseWorkItem: DispatchWorkItem?
+    private let sliderGap: CGFloat = 4
+
+    init(muteButton: SPIconButton, slider: SPVolumeControl) {
+        self.muteButton = muteButton
+        self.slider = slider
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        addSubview(muteButton)
+        addSubview(slider)
+        setAccessibilityElement(false)
+        muteButton.refusesFirstResponder = false
+        muteButton.preservesKeyboardFocusOnClick = true
+        muteButton.nextKeyView = slider
+        muteButton.onFocusChanged = { [weak self] focused in
+            self?.speakerFocused = focused
+            self?.refreshExpansion()
+        }
+        slider.onInteractionChanged = { [weak self] in self?.refreshExpansion() }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    var keepsControlsVisible: Bool {
+        hovering || speakerFocused || slider.keepsVolumeVisible
+    }
+
+    var hasFocusedControl: Bool { speakerFocused || slider.hasInteractionFocus }
+
+    var preferredVisualWidth: CGFloat {
+        SPM.btnAux + (isExpanded ? sliderGap + slider.visibleVisualWidth : 0)
+    }
+
+    override func layout() {
+        super.layout()
+        muteButton.frame = NSRect(x: 0, y: (bounds.height - SPM.btnAux) / 2,
+                                  width: SPM.btnAux, height: SPM.btnAux)
+        slider.frame = NSRect(x: SPM.btnAux + sliderGap,
+                              y: bounds.midY - slider.trackCenterOffset,
+                              width: slider.preferredVisualWidth,
+                              height: slider.preferredVisualHeight)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = trackingAreaRef { removeTrackingArea(area) }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.activeInActiveApp, .inVisibleRect,
+                                            .mouseEnteredAndExited], owner: self)
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+        refreshExpansion()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        refreshExpansion()
+    }
+
+    private func refreshExpansion() {
+        collapseWorkItem?.cancel()
+        collapseWorkItem = nil
+        if keepsControlsVisible {
+            setExpanded(true, animated: true)
+            return
+        }
+        // The grace period also bridges a pointer crossing during relayout.
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.keepsControlsVisible else { return }
+            self.setExpanded(false, animated: true)
+        }
+        collapseWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24, execute: work)
+    }
+
+    private func setExpanded(_ expanded: Bool, animated: Bool) {
+        guard expanded != isExpanded else { return }
+        isExpanded = expanded
+        onExpansionChanged?(animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(convert(point, from: superview)) else { return nil }
+        return super.hitTest(point)
     }
 }
 
@@ -2747,7 +3086,6 @@ final class SPChromeView: NSView, PlayerChromePresenting {
 #endif
 
     var onPlayPause: (() -> Void)?
-    var onSeekRelative: ((Double) -> Void)?
     var onScrubBegan: ((Double) -> Void)?
     var onScrubCoarse: ((Double) -> Void)?
     var onScrubEnded: ((Double, Bool) -> Void)?
@@ -2766,7 +3104,11 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     var onVolumeBoostIntent: (() -> Void)?  // Intent to cross the locked boundary.
     var onMute: (() -> Void)?
     var onFullscreen: (() -> Void)?
+    var onSettingsToggle: (() -> Void)?
     var onRateSelected: ((Double) -> Void)?
+    var onSpeedSettings: (() -> Void)?
+    var onSubtitlesToggle: (() -> Void)?
+    var onTogglePlaylist: (() -> Void)?
     var onMotionSmoothingToggle: (() -> Void)?
     var onXDRToggle: (() -> Void)?
     var durationProvider: (() -> Double) = { 0 }
@@ -2775,28 +3117,67 @@ final class SPChromeView: NSView, PlayerChromePresenting {
 
     private let scrim = CAGradientLayer()
     private let playBtn = SPPlayPauseButton(size: SPM.btnMain)
-    private let backBtn = SPSpinIconButton(
-        symbol: "gobackward.5", accessibilityLabel: L("menu.play.backward5"),
-        pointSize: SPM.symAux, size: SPM.btnAux)
-    private let fwdBtn = SPSpinIconButton(
-        symbol: "goforward.5", accessibilityLabel: L("menu.play.forward5"),
-        pointSize: SPM.symAux, size: SPM.btnAux)
     private let muteBtn = SPIconButton(symbol: "speaker.wave.2.fill", pointSize: SPM.symAux, size: SPM.btnAux)
     private let fsBtn = SPIconButton(symbol: "arrow.up.left.and.arrow.down.right", pointSize: SPM.symAux, size: SPM.btnAux)
+    private let settingsBtn = SPIconButton(symbol: "gearshape", pointSize: SPM.symAux, size: SPM.btnAux)
+    private let playlistBtn = SPIconButton(symbol: "list.bullet", pointSize: SPM.symAux, size: SPM.btnAux)
     private let volSlider = SPVolumeControl(frame: .zero)
+    private lazy var volumeGroup = SPVolumeHoverView(muteButton: muteBtn, slider: volSlider)
     private let rateChip = SPChipButton(width: 48)
 
-    private let hdrLabel: NSTextField = {
-        let l = NSTextField(labelWithString: "")
-        l.isSelectable = false
-        l.refusesFirstResponder = true
-        l.lineBreakMode = .byClipping
-        l.setAccessibilityRole(.staticText)
-        return l
+    private let motionBtn = SPMotionButton()
+    private let subtitlesBtn = SPIconButton(symbol: "rectangle", pointSize: SPM.symAux, size: SPM.btnAux)
+    private static let subtitlesOutline = makeSubtitlesImage(filled: false)
+    private static let subtitlesFilled = makeSubtitlesImage(filled: true)
+    private static let playlistImage: NSImage = {
+        let image = NSImage(size: NSSize(width: 22, height: 18), flipped: false) { _ in
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            for rect in [CGRect(x: 1, y: 14, width: 17, height: 2),
+                         CGRect(x: 1, y: 9, width: 17, height: 2),
+                         CGRect(x: 1, y: 4, width: 10, height: 2)] {
+                context.fill(rect)
+            }
+            context.move(to: CGPoint(x: 14.5, y: 0.5))
+            context.addLine(to: CGPoint(x: 21.5, y: 4.5))
+            context.addLine(to: CGPoint(x: 14.5, y: 8.5))
+            context.closePath()
+            context.fillPath()
+            return true
+        }
+        image.isTemplate = true
+        return image
     }()
-    private let motionChip = SPChipButton(width: 116)
 
-    private let xdrChip = SPChipButton(width: 48)
+    private static func makeSubtitlesImage(filled: Bool) -> NSImage {
+        let image = NSImage(size: NSSize(width: 22, height: 17), flipped: false) { _ in
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            let outline = CGPath(roundedRect: CGRect(x: 1, y: 1, width: 20, height: 15),
+                                 cornerWidth: 1, cornerHeight: 1, transform: nil)
+            if filled {
+                context.setFillColor(CGColor(gray: 1, alpha: 1))
+                context.addPath(outline)
+                context.fillPath()
+            } else {
+                context.setStrokeColor(CGColor(gray: 1, alpha: 1))
+                context.setLineWidth(1.8)
+                context.addPath(outline)
+                context.strokePath()
+            }
+            context.setFillColor(CGColor(gray: filled ? 0.3 : 1, alpha: 1))
+            for rect in [CGRect(x: 4, y: 6, width: 4.5, height: 1.6),
+                         CGRect(x: 11, y: 6, width: 7, height: 1.6),
+                         CGRect(x: 4, y: 3, width: 8, height: 1.6),
+                         CGRect(x: 14, y: 3, width: 4, height: 1.6)] {
+                context.addPath(CGPath(roundedRect: rect, cornerWidth: 0.8,
+                                       cornerHeight: 0.8, transform: nil))
+                context.fillPath()
+            }
+            return true
+        }
+        image.isTemplate = !filled
+        return image
+    }
     private var xdrPresentation: XDRPresentation = .idle
 
     private var latestPosition: Double = 0
@@ -2808,20 +3189,23 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     private var latestVolumeBoost: VolumeBoostPresentation = .normal
     private var latestHDRDescription: String?
     private var latestHDRDetail: String?
-    private var hdrTitles: [Bool: NSAttributedString] = [:]
-    private var hdrLabelSize: NSSize = .zero
-    private var renderedHDRKind: Bool?
-    private var renderedHDRDetail: String?
     private var regularRateWidth: CGFloat = 48
-    private var regularXDRWidth: CGFloat = 48
     private var motionPresentation: MotionPresentation = .idle
 
     private var turboFrozenMotion: MotionPresentation?
     private var lastRenderedModel: ChromePresentation?
-    private var motionCompact = false
     private let track = SPProgressView()
-    private let curLabel = NSTextField(labelWithString: "0:00")
-    private let remLabel = NSTextField(labelWithString: "−0:00")
+    private let timeLabel = SPPlaybackTimeButton(frame: .zero)
+    private struct VolumeWidthTransition {
+        var start: CGFloat
+        var target: CGFloat
+        var began: TimeInterval
+        let duration: TimeInterval = 0.20
+    }
+    private var volumeWidthTransition: VolumeWidthTransition?
+    private var visibleVolumeWidth: CGFloat = SPM.btnAux
+    private var targetVolumeWidth: CGFloat = SPM.btnAux
+    private var volumeAnimationTimer: Timer?
     private let bubble = SPHoverBubble()
     private let previewCard = SPHoverPreviewCard()
     private var lastHoverX: CGFloat?
@@ -2840,8 +3224,6 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     private var lastGlowButton: NSButton?
     private var lastGlowExit: TimeInterval = 0
 
-    private var lastCurText = "", lastRemText = ""
-    private var lastCurSec = -1, lastRemSec = -1
     private var lastRenderedRate = Double.nan
 
     private var latestTurbo = false
@@ -2893,10 +3275,12 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         layer?.insertSublayer(turboRing, above: scrim)
 
         playBtn.target = self; playBtn.action = #selector(playTapped)
-        backBtn.target = self; backBtn.action = #selector(backTapped)
-        fwdBtn.target = self; fwdBtn.action = #selector(fwdTapped)
         muteBtn.target = self; muteBtn.action = #selector(muteTapped)
         fsBtn.target = self; fsBtn.action = #selector(fsTapped)
+        settingsBtn.target = self; settingsBtn.action = #selector(settingsTapped)
+        setSettingsSelected(false)
+        playlistBtn.target = self; playlistBtn.action = #selector(playlistTapped)
+        setPlaylistSelected(false)
 
         volSlider.target = self
         volSlider.action = #selector(volChanged)
@@ -2904,32 +3288,28 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         volSlider.onExpansionChanged = { [weak self] _, animated in
             self?.layoutRightControls(animateVolume: animated)
         }
+        volumeGroup.onExpansionChanged = { [weak self] animated in
+            self?.layoutRightControls(animateVolume: animated)
+        }
+        muteBtn.setAccessibilityLabel(L("settings.mute"))
 
         rateChip.setText("1×")
         rateChip.toolTip = L("chrome.rate.tooltip")
         rateChip.target = self
         rateChip.action = #selector(rateTapped)
-        hdrLabel.isHidden = true
+        noAnim { rateChip.layer?.backgroundColor = NSColor.clear.cgColor }
         if SPFeatures.enhancements {
-            motionChip.target = self
-            motionChip.action = #selector(motionSmoothingTapped)
-            motionChip.setAccessibilityLabel(L("chrome.memc.a11y.label"))
-            motionChip.installLamp(.orbit)
+            motionBtn.target = self
+            motionBtn.action = #selector(motionSmoothingTapped)
+            motionBtn.setAccessibilityLabel(L("chrome.memc.a11y.label"))
             applyMotionSmoothingAppearance()
         }
-        xdrChip.target = self
-        xdrChip.action = #selector(xdrTapped)
-        xdrChip.setAccessibilityLabel(L("chrome.xdr.a11y.label"))
-        xdrChip.installLamp(.moon)
-        applyXDRAppearance()
+        subtitlesBtn.target = self
+        subtitlesBtn.action = #selector(subtitlesTapped)
+        setSubtitlesSelected(false, available: false)
         prepareStableControlMetrics()
 
-        curLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
-        curLabel.textColor = SPT.fgPrimary
-        curLabel.alignment = .left
-        remLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
-        remLabel.textColor = SPT.fgSecondary
-        remLabel.alignment = .right
+        timeLabel.onWidthChanged = { [weak self] in self?.layoutRightControls() }
 
         track.onBegan = { [weak self] r in
             guard let self else { return }
@@ -2965,10 +3345,10 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         }
 
         // Omitted feature chips never enter the view or layout hierarchy.
-        var installedViews: [NSView] = [track, playBtn, backBtn, fwdBtn]
-        if SPFeatures.enhancements { installedViews += [motionChip] }
-        installedViews += [xdrChip, hdrLabel, rateChip, muteBtn, volSlider, fsBtn,
-                           curLabel, remLabel, bubble, previewCard]
+        var installedViews: [NSView] = [track, playBtn, volumeGroup]
+        if SPFeatures.enhancements { installedViews += [motionBtn] }
+        installedViews += [rateChip, playlistBtn, subtitlesBtn, settingsBtn, fsBtn,
+                           timeLabel, bubble, previewCard]
         for v in installedViews { addSubview(v) }
 
         styleObserver = NotificationCenter.default.addObserver(
@@ -3001,14 +3381,15 @@ final class SPChromeView: NSView, PlayerChromePresenting {
             if inside { self.glowMove(to: b) } else { self.glowExit(from: b) }
         }
         playBtn.onHoverChanged = handler
-        backBtn.onHoverChanged = handler
-        fwdBtn.onHoverChanged = handler
         muteBtn.onHoverChanged = handler
+        settingsBtn.onHoverChanged = handler
+        playlistBtn.onHoverChanged = handler
+        subtitlesBtn.onHoverChanged = handler
         fsBtn.onHoverChanged = handler
     }
 
     private func glowSet(_ g: CALayer, frame: CGRect) {
-        noAnim { g.frame = frame }
+        noAnim { g.frame = frame; g.cornerRadius = min(frame.width, frame.height) / 2 }
     }
 
     private func glowFade(_ g: CALayer, to op: Float, duration: CFTimeInterval) {
@@ -3046,12 +3427,12 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     private func glowMove(to b: NSButton) {
-        let target = b.frame // Buttons use chrome coordinates directly.
+        let target = convert(b.bounds, from: b)
         let now = ProcessInfo.processInfo.systemUptime
         // Treat an enter within 0.25 seconds of exit as a handoff.
         let prev = glowButton ?? ((now - lastGlowExit < 0.25) ? lastGlowButton : nil)
         glowButton = b
-        let trio: [NSButton] = [playBtn, backBtn, fwdBtn]
+        let trio: [NSButton] = [playBtn, muteBtn]
         if let prev, prev !== b, let g = activeGlow,
            trio.contains(where: { $0 === prev }), trio.contains(where: { $0 === b }) {
             glowSlide(g, to: target, duration: 0.17)
@@ -3228,32 +3609,27 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     func layoutChrome(in parentBounds: NSRect) {
-        frame = NSRect(x: 0, y: 0, width: parentBounds.width, height: SPM.scrimH)
+        let chromeFrame = NSRect(x: 0, y: 0, width: parentBounds.width, height: SPM.scrimH)
+        let geometryChanged = frame != chromeFrame
+        frame = chromeFrame
         noAnim { scrim.frame = bounds }
 
-        endHover(animated: false)
-        glowReset()
+        if geometryChanged {
+            endHover(animated: false)
+            glowReset()
+        }
 
         let colW = min(SPM.maxW, bounds.width - SPM.side * 2)
         let colX = (bounds.width - colW) / 2
 
         let byC = SPM.bot + SPM.btnRow / 2
-        var x = colX
-        playBtn.frame = NSRect(x: x, y: byC - SPM.btnMain / 2, width: SPM.btnMain, height: SPM.btnMain)
+        playBtn.frame = NSRect(x: colX, y: byC - SPM.btnMain / 2, width: SPM.btnMain, height: SPM.btnMain)
         turboRing.position = CGPoint(x: playBtn.frame.midX, y: playBtn.frame.midY)
-        x = playBtn.frame.maxX + SPM.gapIn
-        backBtn.frame = NSRect(x: x, y: byC - SPM.btnAux / 2, width: SPM.btnAux, height: SPM.btnAux)
-        x = backBtn.frame.maxX + SPM.gapIn
-        fwdBtn.frame = NSRect(x: x, y: byC - SPM.btnAux / 2, width: SPM.btnAux, height: SPM.btnAux)
 
         layoutRightControls()
 
         let ty = SPM.bot + SPM.btnRow + SPM.gapRT
-        curLabel.frame = NSRect(x: colX, y: ty + 2, width: SPM.timeW, height: 18)
-        remLabel.frame = NSRect(x: colX + colW - SPM.timeW, y: ty + 2, width: SPM.timeW, height: 18)
-        track.frame = NSRect(x: curLabel.frame.maxX + SPM.gapTT, y: ty,
-                             width: remLabel.frame.minX - SPM.gapTT - curLabel.frame.maxX - SPM.gapTT,
-                             height: SPM.trackRow)
+        track.frame = NSRect(x: colX, y: ty, width: colW, height: SPM.trackRow)
     }
 
     func layout(in parentBounds: NSRect) {
@@ -3263,20 +3639,6 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     // Chrome is installed after the first frame. Measure its constant titles
     // once here; subsequent layout and FPS updates do no text measurement.
     private func prepareStableControlMetrics() {
-        for isHDR in [false, true] {
-            let title = NSAttributedString(string: isHDR ? "HDR" : "SDR", attributes: [
-                .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
-                .kern: 1.0,
-                .foregroundColor: NSColor(white: 1, alpha: isHDR ? 0.6 : 0.4),
-            ])
-            hdrTitles[isHDR] = title
-            hdrLabel.attributedStringValue = title
-            let size = hdrLabel.fittingSize
-            hdrLabelSize.width = max(hdrLabelSize.width, ceil(size.width))
-            hdrLabelSize.height = max(hdrLabelSize.height, ceil(size.height))
-        }
-        renderedHDRKind = true
-        regularXDRWidth = xdrChip.layoutWidth(min: 48)
         // Digits are monospaced and fmtRate emits at most two decimals. This
         // reserves every supported rate, including custom values between menu
         // entries, without a rate change moving the compact boundary.
@@ -3286,81 +3648,123 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         regularRateWidth = max(48, ceil(widestRate.size().width) + 16)
     }
 
-    // Reserve the complete fixed row even when no HDR/SDR badge is present.
-    // Only window width and the build's feature set determine compactness;
-    // switching media, toggling an enhancement or updating FPS cannot hide it.
-    private func regularControlsWidth() -> CGFloat {
-        let playbackWidth = SPM.btnMain + 2 * SPM.btnAux + 2 * SPM.gapIn
-        let transportWidth = 2 * SPM.btnAux + 2 * SPM.gapBtw
-            + volSlider.regularVisualWidth + SPM.gapIn + regularRateWidth
-        var featureWidth = SPM.gapIn + regularXDRWidth + SPM.gapBtw + hdrLabelSize.width
-        if SPFeatures.enhancements {
-            featureWidth += SPM.flexibleChipMinW + SPM.gapIn
-        }
-        return playbackWidth + SPM.gapBtw + transportWidth + featureWidth
-    }
-
+    // Keep the quick actions reachable even while the volume rail is
+    // open. Changed speed is the first optional item to yield in tight windows.
     private func layoutRightControls(animateVolume: Bool = false) {
         let colW = min(SPM.maxW, bounds.width - SPM.side * 2)
         let colX = (bounds.width - colW) / 2
         let byC = SPM.bot + SPM.btnRow / 2
-        let compactControls = colW < regularControlsWidth()
-        motionCompact = compactControls
-        // Reserve both tracks even in compact layouts to keep geometry stable.
-        volSlider.setCompact(compactControls)
-        volSlider.isHidden = false
-        if SPFeatures.enhancements {
-            motionChip.isHidden = compactControls
-        }
-        xdrChip.isHidden = compactControls
-        hdrLabel.isHidden = compactControls || latestHDRDescription == nil
+        let compact = colW < 620
+        let actionGap: CGFloat = compact ? 4 : SPM.gapIn
+        volSlider.setCompact(compact)
+        volumeGroup.needsLayout = true
+        updateVolumeWidthTarget(volumeGroup.preferredVisualWidth, animated: animateVolume)
+        visibleVolumeWidth = sampleVolumeWidth(at: ProcessInfo.processInfo.systemUptime)
+        let volumeFrame = NSRect(x: playBtn.frame.maxX + SPM.gapIn,
+                                 y: byC - SPM.btnRow / 2,
+                                 width: visibleVolumeWidth,
+                                 height: SPM.btnRow)
+        volumeGroup.frame = volumeFrame
+        volumeGroup.layoutSubtreeIfNeeded()
         var rx = colX + colW
-        fsBtn.frame = NSRect(x: rx - SPM.btnAux, y: byC - SPM.btnAux / 2, width: SPM.btnAux, height: SPM.btnAux)
-        rx = fsBtn.frame.minX - SPM.gapBtw
-        let volumeX = rx - volSlider.preferredVisualWidth
-        let volumeFrame = NSRect(x: volumeX,
-                                 y: byC - volSlider.trackCenterOffset,
-                                 width: volSlider.preferredVisualWidth,
-                                 height: volSlider.preferredVisualHeight)
-        applyVolumeFrame(volumeFrame, animated: animateVolume)
-        rx = volumeX - SPM.gapIn
-        muteBtn.frame = NSRect(x: rx - SPM.btnAux, y: byC - SPM.btnAux / 2, width: SPM.btnAux, height: SPM.btnAux)
-        rx = muteBtn.frame.minX - SPM.gapBtw
-        rateChip.frame = NSRect(x: rx - regularRateWidth, y: byC - 10, width: regularRateWidth, height: 20)
-        rx = rateChip.frame.minX - SPM.gapIn
-        if !compactControls {
-            if SPFeatures.enhancements {
-                let motionBudget = min(SPM.flexibleChipMaxW,
-                                       SPM.flexibleChipMinW + colW - regularControlsWidth())
-                // Remaining space is a cap, not a request to stretch the chip.
-                let motionWidth = motionChip.layoutWidth(min: SPM.flexibleChipMinW, max: motionBudget)
-                motionChip.frame = NSRect(x: rx - motionWidth, y: byC - 10,
-                                          width: motionWidth, height: 20)
-                motionChip.fitAttributedTitleToWidth()
-                rx = motionChip.frame.minX - SPM.gapIn
-            }
-            // Brightness+ sits beside the flexible chip; the badge has a
-            // larger group gap and keeps the same frame for HDR and SDR.
-            xdrChip.frame = NSRect(x: rx - regularXDRWidth, y: byC - 10, width: regularXDRWidth, height: 20)
-            rx = xdrChip.frame.minX - SPM.gapBtw
-            hdrLabel.frame = NSRect(x: rx - hdrLabelSize.width, y: byC - hdrLabelSize.height / 2,
-                                    width: hdrLabelSize.width, height: hdrLabelSize.height).integral
+        var rightActions: [NSButton] = [fsBtn, settingsBtn, subtitlesBtn]
+        if SPFeatures.enhancements { rightActions.append(motionBtn) }
+        rightActions.append(playlistBtn)
+        motionBtn.setCompact(compact)
+        for button in rightActions {
+            let width = button === motionBtn ? motionBtn.preferredWidth : SPM.btnAux
+            button.frame = NSRect(x: rx - width, y: byC - SPM.btnAux / 2,
+                                   width: width, height: SPM.btnAux)
+            rx = button.frame.minX - actionGap
         }
+        let timeX = volumeFrame.maxX + 8
+        let timeBudget = max(0, rx - 8 - timeX)
+        let showRate = abs(currentRate - 1) > 0.0001
+            && timeBudget >= timeLabel.preferredWidth + regularRateWidth + actionGap
+        rateChip.isHidden = !showRate
+        rateChip.frame = NSRect(x: rx - regularRateWidth, y: byC - SPM.btnAux / 2,
+                                width: regularRateWidth, height: SPM.btnAux)
+        if showRate { rx = rateChip.frame.minX - actionGap }
+        timeLabel.frame = NSRect(x: timeX, y: byC - SPM.btnAux / 2,
+                                 width: min(timeLabel.preferredWidth, max(0, rx - 8 - timeX)),
+                                 height: SPM.btnAux)
     }
 
-    private func applyVolumeFrame(_ target: NSRect, animated: Bool) {
-        guard !NSEqualRects(volSlider.frame, target) else { return }
-        let shouldAnimate = animated && volSlider.superview != nil && volSlider.frame.width > 0 &&
-            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        guard shouldAnimate else {
-            volSlider.frame = target
+    // One clock drives the actual clip width and adjacent time position.
+    // Timeline ticks can relayout without changing the transition's endpoint.
+    private func updateVolumeWidthTarget(_ width: CGFloat, animated: Bool) {
+        guard abs(width - targetVolumeWidth) > 0.001 else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        visibleVolumeWidth = sampleVolumeWidth(at: now)
+        targetVolumeWidth = width
+        guard animated, !isHidden, volumeGroup.superview != nil,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            volumeWidthTransition = nil
+            volumeAnimationTimer?.invalidate()
+            volumeAnimationTimer = nil
+            visibleVolumeWidth = width
             return
         }
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.20
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1)
-            volSlider.animator().frame = target
+        volumeWidthTransition = VolumeWidthTransition(start: visibleVolumeWidth,
+                                                       target: width, began: now)
+        guard volumeAnimationTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+            let ownerExists = MainActor.assumeIsolated {
+                guard let self else { return false }
+                self.advanceVolumeAnimation()
+                return true
+            }
+            if !ownerExists { timer.invalidate() }
         }
+        timer.tolerance = 0.002
+        RunLoop.main.add(timer, forMode: .common)
+        volumeAnimationTimer = timer
+    }
+
+    private func sampleVolumeWidth(at now: TimeInterval) -> CGFloat {
+        guard let transition = volumeWidthTransition else { return visibleVolumeWidth }
+        let fraction = min(1, max(0, (now - transition.began) / transition.duration))
+        let eased = fraction * fraction * (3 - 2 * fraction)
+        return transition.start + (transition.target - transition.start) * CGFloat(eased)
+    }
+
+    private func advanceVolumeAnimation() {
+        guard let transition = volumeWidthTransition else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        visibleVolumeWidth = sampleVolumeWidth(at: now)
+        if now - transition.began >= transition.duration {
+            visibleVolumeWidth = transition.target
+            volumeWidthTransition = nil
+            volumeAnimationTimer?.invalidate()
+            volumeAnimationTimer = nil
+        }
+        layoutRightControls()
+    }
+
+    var ownsKeyboardFocus: Bool {
+        volumeGroup.hasFocusedControl || timeLabel.hasInteractionFocus || motionBtn.hasInteractionFocus
+    }
+
+    func settingsButtonRect(in parent: NSView) -> NSRect {
+        settingsBtn.convert(settingsBtn.bounds, to: parent)
+    }
+
+    func settingsMenuAnchorRect(in parent: NSView) -> NSRect {
+        let button = settingsButtonRect(in: parent)
+        let timeline = track.convert(track.bounds, to: parent)
+        return NSRect(x: button.minX, y: button.minY, width: button.width,
+                      height: max(button.maxY, timeline.maxY) - button.minY)
+    }
+
+    func playlistButtonRect(in parent: NSView) -> NSRect {
+        playlistBtn.convert(playlistBtn.bounds, to: parent)
+    }
+
+    func playlistMenuAnchorRect(in parent: NSView) -> NSRect {
+        let button = playlistButtonRect(in: parent)
+        let timeline = track.convert(track.bounds, to: parent)
+        return NSRect(x: button.minX, y: button.minY, width: button.width,
+                      height: max(button.maxY, timeline.maxY) - button.minY)
     }
 
     func render(_ presentation: ChromePresentation) {
@@ -3400,6 +3804,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         isHidden = false
         glowReset() // Rebuild hover state on the next enter.
         renderLatestPresentation()
+        motionBtn.setEffectsVisible(true)
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.14
             animator().alphaValue = 1
@@ -3407,6 +3812,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     func hide() {
+        motionBtn.setEffectsVisible(false)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.22
             animator().alphaValue = 0
@@ -3424,8 +3830,10 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     func setTime(position: Double, duration: Double, rate: Double) {
-        latestPosition = position
-        latestDuration = duration
+        latestDuration = SPPlaybackTimeButton.normalizedSeconds(duration)
+        latestPosition = latestDuration > 0
+            ? min(latestDuration, SPPlaybackTimeButton.normalizedSeconds(position))
+            : SPPlaybackTimeButton.normalizedSeconds(position)
         currentRate = rate
         guard !isHidden else { return }
         renderLatestTime()
@@ -3442,27 +3850,6 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         latestHDRDescription = desc
         latestHDRDetail = detail
         guard !isHidden else { return }
-        renderLatestHDR()
-    }
-
-    private func renderLatestHDR() {
-        guard let desc = latestHDRDescription else {
-            hdrLabel.isHidden = true
-            return
-        }
-        let isHDR = desc != "SDR"
-        if renderedHDRKind != isHDR, let title = hdrTitles[isHDR] {
-            hdrLabel.attributedStringValue = title
-            renderedHDRKind = isHDR
-        }
-        let detail = latestHDRDetail ?? desc
-        if renderedHDRDetail != detail {
-            hdrLabel.toolTip = detail
-            hdrLabel.setAccessibilityValue(detail)
-            hdrLabel.setAccessibilityHelp(detail)
-            renderedHDRDetail = detail
-        }
-        hdrLabel.isHidden = motionCompact
     }
 
     func setMotionSmoothing(_ presentation: MotionPresentation) {
@@ -3475,215 +3862,35 @@ final class SPChromeView: NSView, PlayerChromePresenting {
 
     private func applyMotionSmoothingAppearance() {
         guard SPFeatures.enhancements else { return }
-        let motionPresentation = turboFrozenMotion ?? self.motionPresentation
-        let isOn = motionPresentation.visualState == .on
-        let title: String
-        if motionPresentation.contentBypassed {
-            // Permanent content bypass says "Unavailable" and is disabled.
-            // This is the only always-visible state that may map localized
-            // non-Latin glyphs.
-            title = "Motion+ · " + L("chrome.blocked.title")
-        } else {
-
-            title = "Motion+"
-        }
-
-        let textColor: NSColor
-        let fillColor: NSColor
-        let borderColor: NSColor?
-        let borderWidth: CGFloat
-
-        if !motionPresentation.isControlEnabled || !isOn {
-            textColor = SPT.fgSecondary
-            fillColor = SPT.chipFill
-            borderColor = nil
-            borderWidth = 0
-        } else {
-            textColor = .white
-            fillColor = NSColor.controlAccentColor.withAlphaComponent(0.90)
-            borderColor = NSColor.white.withAlphaComponent(0.24)
-            borderWidth = 0.5
-        }
-
-        var richTitle: NSAttributedString? = nil
-        var compactRichTitle: NSAttributedString? = nil
-        var richKey = ""
-        var lampColor: NSColor?
-        var readoutDigits: String?
-        var readoutDigitsColor = textColor
-        var readoutRange = NSRange(location: NSNotFound, length: 0)
-        if motionPresentation.hasMedia {
-            let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
-            let dotColor: NSColor
-            switch motionPresentation.light {
-            case .green: dotColor = .systemGreen
-            case .orange: dotColor = .systemOrange
-            case .red: dotColor = .systemRed
-            case .none: dotColor = SPT.w(1, 0.32)
-            }
-
-            lampColor = dotColor
-            let rich = NSMutableAttributedString(attributedString: SPChipButton.lampSlot())
-            rich.append(NSAttributedString(string: "  " + title, attributes: [.font: font, .foregroundColor: textColor]))
-            if let readout = motionPresentation.fpsReadout {
-                // Save the complete lamp/title before appending the atomic
-                // FPS suffix; a narrow chip hides that suffix as one unit.
-                compactRichTitle = NSAttributedString(attributedString: rich)
-
-                let readoutColor = textColor.withAlphaComponent(0.85)
-                rich.append(NSAttributedString(string: " · ",
-                                               attributes: [.font: font, .foregroundColor: readoutColor]))
-                readoutRange = NSRange(location: rich.length, length: (readout as NSString).length)
-                rich.append(NSAttributedString(string: readout,
-                                               attributes: [.font: font, .foregroundColor: NSColor.clear]))
-                rich.append(NSAttributedString(string: "fps", attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold),
-                    .foregroundColor: textColor.withAlphaComponent(0.7),
-                ]))
-                let pad = motionPresentation.fpsReadoutDigits - readout.count
-                if pad > 0 {
-                    rich.append(NSAttributedString(string: String(repeating: "0", count: pad),
-                                                   attributes: [.font: font, .foregroundColor: NSColor.clear]))
-                }
-                readoutDigits = readout
-                readoutDigitsColor = readoutColor
-            }
-            richTitle = rich
-            richKey = "\(rich.string)|\(textColor.description)"
-        }
-        applyChipAppearance(ChipAppearance(
-            title: title, titleAttributed: richTitle, titleAttributedKey: richKey,
-            compactTitleAttributed: compactRichTitle, textColor: textColor, fill: fillColor,
-            border: borderColor, borderWidth: borderWidth, tip: motionPresentation.toolTip,
-            a11yValue: motionPresentation.accessibilityValue,
-            enabled: motionPresentation.isControlEnabled, on: isOn,
-            lamp: ChipLamp(on: isOn, color: lampColor, visible: motionPresentation.hasMedia)
-        ), to: motionChip)
-        motionChip.setReadout(readoutDigits, range: readoutRange, color: readoutDigitsColor,
-                              animated: lampTransitionsAnimate)
+        let presentation = turboFrozenMotion ?? motionPresentation
+        let enabled = presentation.isControlEnabled && !turboLocked
+        motionBtn.configure(presentation, interactionEnabled: enabled)
+        var tip = "Motion+ · " + presentation.toolTip
+        if let fps = presentation.fpsReadout { tip += " · " + fps + " fps" }
+        motionBtn.toolTip = tip
+        motionBtn.setAccessibilityValue(presentation.accessibilityValue)
+        motionBtn.setAccessibilityHelp(tip)
     }
 
     func setXDR(_ presentation: XDRPresentation) {
-        guard presentation != xdrPresentation else { return }
         xdrPresentation = presentation
-        guard !isHidden else { return }
-        applyXDRAppearance()
     }
 
-    private func applyXDRAppearance() {
-        let p = xdrPresentation
-        let isOn = p.isOn
-        let textColor: NSColor
-        let fillColor: NSColor
-        let borderColor: NSColor?
-        let borderWidth: CGFloat
-        let tip: String
-        let a11y: String
-        if !p.hasMedia {
-            textColor = SPT.fgSecondary; fillColor = SPT.chipFill; borderColor = nil; borderWidth = 0
-            tip = L("chrome.xdr.tooltip.noMedia")
-            a11y = L("chrome.a11y.unavailable")
-        } else if !p.contentSDR {
-            textColor = SPT.fgSecondary; fillColor = SPT.chipFill; borderColor = nil; borderWidth = 0
-            tip = L("chrome.xdr.tooltip.contentHDR")
-            a11y = L("chrome.a11y.unavailable")
-        } else if !p.displayCapable {
-            textColor = SPT.fgSecondary; fillColor = SPT.chipFill; borderColor = nil; borderWidth = 0
-            tip = L("chrome.xdr.tooltip.noHeadroom")
-            a11y = L("chrome.a11y.unavailable")
-        } else if !isOn {
-            textColor = SPT.fgSecondary; fillColor = SPT.chipFill; borderColor = nil; borderWidth = 0
-            tip = L("chrome.xdr.tooltip.off")
-            a11y = L("chrome.a11y.off")
-        } else {
-            textColor = .white
-            fillColor = NSColor.controlAccentColor.withAlphaComponent(0.90)
-            borderColor = NSColor.white.withAlphaComponent(0.24)
-            borderWidth = 0.5
-            tip = L("chrome.xdr.tooltip.on")
-            a11y = L("chrome.a11y.on")
-        }
-
-        let title = NSMutableAttributedString(attributedString: SPChipButton.lampSlot())
-        title.append(NSAttributedString(string: "  Brightness+", attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: textColor,
-        ]))
-        applyChipAppearance(ChipAppearance(
-            title: "Brightness+", titleAttributed: title,
-            titleAttributedKey: "Brightness+|\(textColor.description)",
-            textColor: textColor, fill: fillColor,
-            border: borderColor, borderWidth: borderWidth, tip: tip,
-            a11yValue: a11y, enabled: p.isControlEnabled, on: isOn, lockable: false,
-            lamp: ChipLamp(on: isOn, color: nil, visible: true)
-        ), to: xdrChip)
-    }
-
-    private struct ChipAppearance {
-        var title: String
-        var titleAttributed: NSAttributedString? = nil
-        var titleAttributedKey: String = ""
-        var compactTitleAttributed: NSAttributedString? = nil
-        var textColor: NSColor
-        var fill: NSColor
-        var border: NSColor? = nil
-        var borderWidth: CGFloat = 0
-        var tip: String
-        var a11yValue: String
-        var enabled: Bool
-        var on: Bool
-        var lockable: Bool = true
-        var lamp: ChipLamp? = nil
-    }
-    private struct ChipLamp {
-        var on: Bool
-        var color: NSColor?
-        var visible: Bool
-    }
-
-    private var lampTransitionsSuppressed = false
-    private var lampTransitionsAnimate: Bool {
-        !lampTransitionsSuppressed && !isHidden && window != nil
-    }
-
-    private func applyChipAppearance(_ a: ChipAppearance, to chip: SPChipButton) {
-        let locked = a.lockable && turboLocked
-        let enabled = a.enabled && !locked
-        chip.isEnabled = enabled
-        chip.alphaValue = enabled ? 1 : (locked ? 0.4 : 0.52)
-        chip.state = a.on ? .on : .off
-        if let rich = a.titleAttributed {
-            chip.setAttributedText(rich, key: a.titleAttributedKey,
-                                   compactTitle: a.compactTitleAttributed)
-        } else {
-            chip.setText(a.title, color: a.textColor)
-        }
-        let fromFill = chip.layer?.presentation()?.backgroundColor ?? chip.layer?.backgroundColor
-        noAnim {
-            chip.layer?.backgroundColor = a.fill.cgColor
-            chip.layer?.borderColor = a.border?.cgColor
-            chip.layer?.borderWidth = a.borderWidth
-        }
-        if let lamp = a.lamp {
-            let animated = lampTransitionsAnimate
-            chip.updateLamp(on: lamp.on, enabled: enabled, color: lamp.color,
-                            visible: lamp.visible, animated: animated)
-
-            if animated, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
-               let fromFill, let layer = chip.layer, fromFill != layer.backgroundColor {
-                let fade = CABasicAnimation(keyPath: "backgroundColor")
-                fade.fromValue = fromFill
-                fade.duration = 0.3
-                fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                layer.add(fade, forKey: "fill")
-            }
-        }
-        chip.toolTip = a.tip
-        chip.setAccessibilityValue(a.a11yValue)
-        chip.setAccessibilityHelp(a.tip)
+    func setSubtitlesSelected(_ shown: Bool, available: Bool) {
+        subtitlesBtn.showsSelection = shown
+        subtitlesBtn.state = shown ? .on : .off
+        subtitlesBtn.image = shown ? Self.subtitlesFilled : Self.subtitlesOutline
+        subtitlesBtn.isEnabled = available
+        subtitlesBtn.alphaValue = available ? 1 : 0.4
+        let label = L("settings.subtitles")
+        subtitlesBtn.toolTip = label
+        subtitlesBtn.setAccessibilityLabel(label)
+        subtitlesBtn.setAccessibilityValue(available
+            ? (shown ? L("chrome.a11y.on") : L("chrome.a11y.off")) : L("chrome.a11y.unavailable"))
     }
 
     @objc private func rateTapped() {
+        if let onSpeedSettings { onSpeedSettings(); return }
         let menu = NSMenu()
         for r in Self.rateOptions {
             let item = NSMenuItem(title: Self.fmtRate(r), action: #selector(rateMenuPicked(_:)),
@@ -3703,23 +3910,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     private func setTimeLabels(position: Double, duration: Double) {
-
-        let curSec = max(0, Int(position))
-        let remSec = max(0, Int(max(0, duration - position)))
-        if curSec == lastCurSec && remSec == lastRemSec { return }
-        lastCurSec = curSec
-        lastRemSec = remSec
-
-        let cur = Self.fmt(position)
-        if cur != lastCurText {
-            lastCurText = cur
-            curLabel.stringValue = cur
-        }
-        let rem = "−" + Self.fmt(max(0, duration - position))
-        if rem != lastRemText {
-            lastRemText = rem
-            remLabel.stringValue = rem
-        }
+        timeLabel.configure(position: position, duration: duration)
     }
 
     func setPlaying(_ playing: Bool) {
@@ -3754,15 +3945,11 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     private func renderLatestPresentation() {
-        lampTransitionsSuppressed = true
-        defer { lampTransitionsSuppressed = false }
         renderLatestTime()
         renderLatestPlaying(animated: false)
         renderLatestVolumeBoost()
         renderLatestVolume(animated: false)
-        renderLatestHDR()
         applyMotionSmoothingAppearance()
-        applyXDRAppearance()
         layoutRightControls()
     }
 
@@ -3778,6 +3965,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
             lastRenderedTurbo = latestTurbo
             rateChip.setText(Self.fmtRate(currentRate),
                              color: latestTurbo ? Self.turboAccent : .white)
+            layoutRightControls()
         }
     }
 
@@ -3786,7 +3974,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     private func setTurboLocked(_ locked: Bool) {
         guard locked != turboLocked else { return }
         turboLocked = locked
-        for b in [backBtn, fwdBtn, rateChip] as [NSButton] {
+        for b in [rateChip] as [NSButton] {
             b.isEnabled = !locked
             b.alphaValue = locked ? 0.4 : 1
         }
@@ -3837,19 +4025,31 @@ final class SPChromeView: NSView, PlayerChromePresenting {
 
     private static func fmt(_ t: Double) -> String { SPTimeText.clock(t) }
 
+    func setSettingsSelected(_ shown: Bool) {
+        settingsBtn.showsSelection = shown
+        settingsBtn.state = shown ? .on : .off
+        settingsBtn.setSymbol(shown ? "gearshape.fill" : "gearshape", pointSize: SPM.symAux)
+        let label = shown ? L("settings.close") : L("settings.title")
+        settingsBtn.toolTip = label
+        settingsBtn.setAccessibilityLabel(label)
+    }
+
+    func setPlaylistSelected(_ shown: Bool) {
+        playlistBtn.showsSelection = shown
+        playlistBtn.state = shown ? .on : .off
+        playlistBtn.image = Self.playlistImage
+        let label = L("control.playlist")
+        playlistBtn.toolTip = label
+        playlistBtn.setAccessibilityLabel(label)
+        playlistBtn.setAccessibilityValue(shown ? L("chrome.a11y.on") : L("chrome.a11y.off"))
+    }
+
     @objc private func playTapped() { onPlayPause?() }
-    // Spin in the direction indicated by the symbol.
-    @objc private func backTapped() {
-        backBtn.spin(clockwise: false)
-        onSeekRelative?(-5)
-    }
-    @objc private func fwdTapped() {
-        fwdBtn.spin(clockwise: true)
-        onSeekRelative?(+5)
-    }
     @objc private func muteTapped() { onMute?() }
     @objc private func fsTapped() { onFullscreen?() }
+    @objc private func settingsTapped() { onSettingsToggle?() }
+    @objc private func playlistTapped() { onTogglePlaylist?() }
     @objc private func motionSmoothingTapped() { onMotionSmoothingToggle?() }
-    @objc private func xdrTapped() { onXDRToggle?() }
+    @objc private func subtitlesTapped() { onSubtitlesToggle?() }
     @objc private func volChanged() { onVolume?(volSlider.volumePercent) }
 }

@@ -11,6 +11,7 @@ final class PlayerView: NSView {
     var onMouseUp: ((NSEvent) -> Void)?
     var onKeyDown: ((NSEvent) -> Void)?
     var onKeyUp: ((NSEvent) -> Void)?
+    var onResignFirstResponder: (() -> Void)?
     var onScrollWheel: ((NSEvent) -> Bool)?
     var onMagnify: ((NSEvent) -> Bool)?
 
@@ -67,6 +68,12 @@ final class PlayerView: NSView {
 
     override func keyUp(with event: NSEvent) {
         onKeyUp?(event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { onResignFirstResponder?() }
+        return resigned
     }
 
     override func scrollWheel(with event: NSEvent) {

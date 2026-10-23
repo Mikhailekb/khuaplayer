@@ -7,6 +7,7 @@
 #import <ImageIO/ImageIO.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
+#include "ShaderSource.h"
 
 #include <algorithm>
 #include <array>
@@ -270,6 +271,9 @@ static bool spThumbDoviGpuSetup(SPThumbDoviGpu &g, unsigned logId) {
     id<MTLLibrary> lib = [g.device newDefaultLibraryWithBundle:
                               [NSBundle bundleForClass:SPTimelineThumbnailer.class]
                                                        error:&error];
+    if (!lib) {
+        lib = [g.device newLibraryWithSource:@(kSPShaderSource) options:nil error:&error];
+    }
     id<MTLFunction> fn = [lib newFunctionWithName:@"doviThumbConvert"];
     if (!fn) {
         NSLog(@"[c%u][Thumb] DoVi 转换核加载失败: %@", logId, error);

@@ -1,4 +1,5 @@
 #include "Demuxer.hpp"
+#include "HTTPRangeIO.hpp"
 #include "SPContainerRecovery.hpp"
 #include "Recovery/RecoveryTsPsi.hpp"
 #include "Recovery/RecoveryMkvContentMap.hpp"
@@ -1436,12 +1437,62 @@ bool Demuxer::attachLocalIO(const std::string& path, const std::shared_ptr<Local
     return true;
 }
 
+int Demuxer::attachHTTPIO(const std::string& url) {
+    // A previous growing local file must not rename or mark the HTTP session as
+    // incomplete through the shared published growth state.
+    remoteVolume_ = true;
+    growthPub_->mode.store(0, std::memory_order_relaxed);
+    growthPub_->waitingSinceUs.store(0, std::memory_order_relaxed);
+    growthPub_->lastGrowthUs.store(spNowUs(), std::memory_order_relaxed);
+    growthPub_->downloadHint.store(false, std::memory_order_relaxed);
+    growthPub_->pendingZeroPos.store(-1, std::memory_order_relaxed);
+    growthPub_->inPlaceFill.store(false, std::memory_order_relaxed);
+    growthPub_->liveSize.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(growthPub_->pathMtx);
+        growthPub_->path.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(pendingJobMtx_);
+        pendingJob_->cancelled.store(true);
+        pendingJob_ = std::make_shared<PendingScanJob>();
+    }
+    byteTimeMapCaptured_ = false;
+    try {
+        httpIO_ = std::make_unique<HTTPRangeIO>(url, [this] {
+            return abortIO_.load() || (httpYieldAllowed_ && growthYield_ && *growthYield_ && (*growthYield_)());
+        }, 120.0, [published = growthPub_](bool waiting) {
+            published->waitingSinceUs.store(waiting ? spNowUs() : 0, std::memory_order_relaxed);
+            published->lastGrowthUs.store(spNowUs(), std::memory_order_relaxed);
+        });
+    } catch (const std::bad_alloc&) { return AVERROR(ENOMEM); }
+    const int result = httpIO_->open();
+    if (result < 0) { httpIO_.reset(); return result; }
+    growthPub_->liveSize.store(httpIO_->size(), std::memory_order_relaxed);
+    constexpr int bufferSize = 256 * 1024;
+    uint8_t* buffer = static_cast<uint8_t*>(av_malloc(bufferSize));
+    if (!buffer) { httpIO_.reset(); return AVERROR(ENOMEM); }
+    avio_ = avio_alloc_context(buffer, bufferSize, 0, httpIO_.get(),
+        [](void* input, uint8_t* destination, int requested) {
+            return static_cast<HTTPRangeIO*>(input)->read(destination, requested);
+        }, nullptr,
+        [](void* input, int64_t offset, int whence) {
+            return static_cast<HTTPRangeIO*>(input)->seek(offset, whence);
+        });
+    if (!avio_) { av_free(buffer); httpIO_.reset(); return AVERROR(ENOMEM); }
+    avio_->seekable = AVIO_SEEKABLE_NORMAL;
+    fmtCtx_->pb = avio_;
+    fmtCtx_->flags |= AVFMT_FLAG_CUSTOM_IO;
+    return 0;
+}
+
 void Demuxer::detachLocalIO() {
     if (avio_) {
 
         av_freep(&avio_->buffer);
         avio_context_free(&avio_);
     }
+    httpIO_.reset();
     std::shared_ptr<LocalFileIO> io;
     {
         std::lock_guard<std::mutex> lk(ioMtx_);
@@ -3093,7 +3144,12 @@ int Demuxer::openInputOnce(const std::string& path, int64_t skipInitialBytes, in
     if (!fmtCtx_) { av_dict_free(&opts); return AVERROR(ENOMEM); }
     fmtCtx_->interrupt_callback = { spInterruptCb, &abortIO_ };
     const auto retainedSource = source ? source : openingSource_;
-    const bool attached = attachLocalIO(path, retainedSource);
+    const bool network = HTTPRangeIO::supportsURL(path);
+    if (network) {
+        const int result = attachHTTPIO(path);
+        if (result < 0) { av_dict_free(&opts); closeInputOnly(); return result; }
+    }
+    const bool attached = !network && attachLocalIO(path, retainedSource);
     if (attached && !openingSource_ && openThread_.load(std::memory_order_acquire)) {
         openingSource_ = localIO_;
         openingSource_->openingViewActive.store(true, std::memory_order_release);
@@ -3132,7 +3188,10 @@ int Demuxer::openInputOnce(const std::string& path, int64_t skipInitialBytes, in
                         std::min<int64_t>(localIO_->size, 64ll * 1024 * 1024), 0);
     }
 
-    const std::string& probeUrl = (neutralProbeName_ && localIO_) ? neutralProbeUrl_ : path;
+    // The real URL may contain Basic credentials or signed query parameters.
+    // Custom AVIO owns transport; FFmpeg only needs a neutral probing name.
+    const std::string probeUrl = network ? "http-stream" :
+        (neutralProbeName_ && localIO_) ? neutralProbeUrl_ : path;
     int ret = avformat_open_input(&fmtCtx_, probeUrl.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (spDebug()) {
@@ -4421,8 +4480,13 @@ bool Demuxer::reopenCandidateOrFallBack(const spresil::RecoveryPlan& plan, bool 
     return false;
 }
 
-int Demuxer::readPacket(AVPacket* pkt) {
+int Demuxer::readPacket(AVPacket* pkt, bool allowHTTPYield) {
     if (!fmtCtx_) return AVERROR(EINVAL);
+    struct HTTPReadScope {
+        bool& allowed;
+        explicit HTTPReadScope(bool& flag, bool enabled) : allowed(flag) { allowed = enabled; }
+        ~HTTPReadScope() { allowed = false; }
+    } httpReadScope(httpYieldAllowed_, allowHTTPYield);
     lastPacketReplay_ = false;
     lastPacketAllZero_ = false;
     lastPacketGarbage_ = false;

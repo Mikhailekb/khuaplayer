@@ -3,6 +3,46 @@ import Darwin
 
 enum WelcomeHeartbeatState { case active, paused, gone }
 
+/// Torrent recent-play paths are stable identities, not files to inspect. This
+/// lexical check also covers old identities left without a typed resume source.
+enum SPRecentWarmPolicy {
+    private static let torrentIdentityRoot = (NSHomeDirectory() as NSString)
+        .appendingPathComponent("Library/Application Support/Khua/Torrent Playlists")
+
+    private static func normalizedPath(_ path: String) -> String {
+        var parts: [Substring] = []
+        for part in path.split(separator: "/") {
+            if part == "." { continue }
+            if part == ".." {
+                if !parts.isEmpty { parts.removeLast() }
+            } else {
+                parts.append(part)
+            }
+        }
+        return "/" + parts.joined(separator: "/")
+    }
+
+    static func isManagedTorrentPath(_ path: String) -> Bool {
+        guard path.hasPrefix("/") else { return false }
+        let normalized = normalizedPath(path)
+        return normalized == torrentIdentityRoot || normalized.hasPrefix(torrentIdentityRoot + "/")
+    }
+
+    static func permitsLocalIO(path: String, recents: [RecentPlay]) -> Bool {
+        guard path.hasPrefix("/"), !isManagedTorrentPath(path) else { return false }
+        let normalized = normalizedPath(path)
+        return !recents.contains {
+            $0.torrent != nil && normalizedPath($0.path) == normalized
+        }
+    }
+
+    static func permitsLocalIO(path: String) -> Bool {
+        // Reject managed identities before even loading the recent-play ledger.
+        guard path.hasPrefix("/"), !isManagedTorrentPath(path) else { return false }
+        return permitsLocalIO(path: path, recents: RecentPlays.load())
+    }
+}
+
 #if SP_APP_STORE
 // Recent paths alone do not grant sandbox access. Match OpenPanelWarmer's no-op
 // implementation rather than attempting reads without security-scoped access.
@@ -104,11 +144,13 @@ enum RecentPlaysWarmer {
     /// Resolve each visible path's volume on an independent worker, then claim
     /// at most one 4 KB wake read per volume within the cooldown.
     static func warmForWelcome(entries: [(path: String, resumeFraction: Double)]) {
+        let recents = RecentPlays.load()
         for entry in entries {
             let path = entry.path
             let fraction = entry.resumeFraction
 
-            guard SPFileAccess.mayWarm(path: path) else { continue }
+            guard SPRecentWarmPolicy.permitsLocalIO(path: path, recents: recents),
+                  SPFileAccess.mayWarm(path: path) else { continue }
             lock.lock()
             let claimed = ledger.claimPath(path)
             lock.unlock()
@@ -119,6 +161,7 @@ enum RecentPlaysWarmer {
                     ledger.finishPath(path)
                     lock.unlock()
                 }
+                guard SPRecentWarmPolicy.permitsLocalIO(path: path) else { return }
                 let ioPolicy = SPBackgroundDiskIOPolicyLease()
                 defer { ioPolicy.restore() }
                 let matPolicy = SPDatalessMaterializationOffLease()
@@ -212,6 +255,7 @@ enum RecentPlaysWarmer {
     /// issuing a regular intent here would carry a newer sequence and evict
     /// that in-flight read, with no re-enter event to ever restore it.
     static func warmEntryAutoIntent(path: String) {
+        guard SPRecentWarmPolicy.permitsLocalIO(path: path) else { return }
         lock.lock()
         let hovered = realHoverSeen
         lock.unlock()
@@ -220,8 +264,8 @@ enum RecentPlaysWarmer {
     }
 
     static func warmEntryIntent(path: String, isAutoIntent: Bool = false) {
-
-        guard SPFileAccess.mayWarm(path: path) else { return }
+        guard SPRecentWarmPolicy.permitsLocalIO(path: path),
+              SPFileAccess.mayWarm(path: path) else { return }
         lock.lock()
         if !isAutoIntent { realHoverSeen = true }
         // Workers query this latest sequence when claiming or registering, so
@@ -269,6 +313,10 @@ enum RecentPlaysWarmer {
                 entryLanes[path] = lane
                 lock.unlock()
                 if let key = resolvedVolumeKey { attemptRelaunch(key: key) }
+            }
+            guard SPRecentWarmPolicy.permitsLocalIO(path: path) else {
+                performedWork = false
+                return
             }
             let ioPolicy = SPBackgroundDiskIOPolicyLease()
             defer { ioPolicy.restore() }
@@ -394,6 +442,7 @@ enum RecentPlaysWarmer {
     nonisolated(unsafe) private static var foregroundOpenPath: String?
 
     static func noteForegroundOpen(path: String) {
+        guard SPRecentWarmPolicy.permitsLocalIO(path: path) else { return }
         lock.lock()
         foregroundOpenPath = path
         lock.unlock()
@@ -426,6 +475,7 @@ enum RecentPlaysWarmer {
     }
 
     private static func beginSpeculativeOpen(path: String) -> Double? {
+        guard SPRecentWarmPolicy.permitsLocalIO(path: path) else { return nil }
         let defaults = UserDefaults.standard
         lock.lock()
         defer { lock.unlock() }
@@ -499,7 +549,11 @@ enum RecentPlaysWarmer {
     @MainActor static func wakeRecentVolumesAtLaunch() {
         let count = WelcomeView.visibleEntryCount
         DispatchQueue.global(qos: .utility).async {
-            beatRecentVolumes(RecentPlays.load().prefix(count).map(\.path))
+            let entries = RecentPlays.load()
+            let paths = entries.prefix(count).filter {
+                SPRecentWarmPolicy.permitsLocalIO(path: $0.path, recents: entries)
+            }.map(\.path)
+            beatRecentVolumes(paths)
         }
     }
 
@@ -535,15 +589,20 @@ enum RecentPlaysWarmer {
             return
         }
         guard active, !userAway, !OpenPanelWarmer.foregroundIOActive else { return }
-        let paths = RecentPlays.load().prefix(WelcomeView.visibleEntryCount).map(\.path)
+        let entries = RecentPlays.load()
+        let paths = entries.prefix(WelcomeView.visibleEntryCount).filter {
+            SPRecentWarmPolicy.permitsLocalIO(path: $0.path, recents: entries)
+        }.map(\.path)
         DispatchQueue.global(qos: .utility).async { beatRecentVolumes(paths) }
     }
 
     private static func beatRecentVolumes(_ paths: [String]) {
+        let recents = RecentPlays.load()
+        let localPaths = paths.filter { SPRecentWarmPolicy.permitsLocalIO(path: $0, recents: recents) }
         var chosenDevs = Set<Int64>()
         var targets: [String] = []
         lock.lock()
-        for path in paths where !heartbeatNonRemote.contains(path) {
+        for path in localPaths where !heartbeatNonRemote.contains(path) {
 
             if let key = ledger.volumeKey(forPath: path), ledger.isVolumeReadInFlight(key: key) { continue }
             if let dev = heartbeatDevByPath[path] {
@@ -561,6 +620,12 @@ enum RecentPlaysWarmer {
             lock.unlock()
             guard claimed else { continue }
             DispatchQueue.global(qos: .utility).async {
+                guard SPRecentWarmPolicy.permitsLocalIO(path: path) else {
+                    lock.lock()
+                    heartbeatInFlight.remove(path)
+                    lock.unlock()
+                    return
+                }
                 var dev: Int64 = 0
                 let r = path.withCString { SPVolumeHeartbeatBeat($0, Int32(heartbeatInterval * 1000), &dev) }
                 lock.lock()
