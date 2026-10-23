@@ -355,22 +355,29 @@ struct TorrentPauseBufferChecks {
         check(extended.count == 2 && extended[1]["range"] as? String == "bytes=\(upper)-\(upper + 262_144 - 1)",
               "a larger approved target reads only the new suffix after a completed fill")
 
-        let growingSource = url("slow", "growing-target")
+        let growingSource = url("gated-growth", "growing-target")
+        let growthGate = eventFile.deletingLastPathComponent().appendingPathComponent("hold-growing-target")
+        try Data().write(to: growthGate)
+        defer { try? FileManager.default.removeItem(at: growthGate) }
         let growingStart: Int64 = 2000
         let originalGrowingEnd = growingStart + 8 * 1_024 * 1_024
         manager.start(identity: identity, streamURL: growingSource, offset: 2000,
                       fileLength: fileLength, forwardEndOffset: originalGrowingEnd)
-        try await wait { manager.snapshot.receivedBytes > 0 }
+        try await wait { manager.snapshot.receivedBytes > 0 && events("growing-target", kind: "gated").count == 1 }
         let grownEnd = originalGrowingEnd + 4 * 1_024 * 1_024
         for step in 1...4 {
-            let advanced = growingStart + manager.snapshot.receivedBytes / 2
+            // receivedBytes is relative to the current rangeStart. Retaining
+            // the original start here would accidentally seek backward when
+            // a later update observes no new body progress.
+            let advanced = (manager.snapshot.rangeStart ?? growingStart) + manager.snapshot.receivedBytes / 2
             manager.start(identity: identity, streamURL: growingSource, offset: advanced,
                           fileLength: fileLength, forwardEndOffset: originalGrowingEnd + Int64(step) * 1_024 * 1_024)
             try await Task.sleep(for: .milliseconds(30))
         }
         FileHandle.standardError.write(Data("GROWTH active updates=4 requests=\(requests("growing-target").count) completed=\(events("growing-target", kind: "finished").count)\n".utf8))
-        check(requests("growing-target").count == 1,
+        check(requests("growing-target").count == 1 && events("growing-target", kind: "finished").isEmpty,
               "growing worker bounds and advancing frontiers preserve the original in-flight HTTP reader")
+        try FileManager.default.removeItem(at: growthGate)
         try await awaitState(manager, .filled)
         try await wait { events("growing-target", kind: "finished").count == 2 }
         let growthRequests = requests("growing-target")

@@ -45,6 +45,10 @@ class FixtureServer(ThreadingHTTPServer):
         with self.events_lock:
             self.write_event_locked(kind="finished", **fields)
 
+    def record_gate(self, **fields):
+        with self.events_lock:
+            self.write_event_locked(kind="gated", **fields)
+
     def capacity_state(self, tag, upper=None):
         with self.events_lock:
             state = self.capacity.setdefault(tag, {"upper": 1024 * 1024, "revision": 1})
@@ -138,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(401, headers={"WWW-Authenticate": 'Basic realm="fixture"'})
             return
         if endpoint not in {
-            "/valid", "/slow", "/short", "/slow-short", "/quota-shrink", "/capacity-cycle", "/wrong-start", "/wrong-end",
+            "/valid", "/slow", "/gated-growth", "/short", "/slow-short", "/quota-shrink", "/capacity-cycle", "/wrong-start", "/wrong-end",
             "/wrong-total", "/no-range", "/encoded", "/missing-range",
             "/oversize", "/auth", "/redirect-target", "/delay-headers",
         }:
@@ -196,6 +200,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.bytes_sent += size
             remaining -= size
+            if endpoint == "/gated-growth" and self.bytes_sent == size:
+                gate = self.server.events.with_name("hold-growing-target")
+                if gate.exists():
+                    self.server.record_gate(requestTarget=self.path, byteCount=self.bytes_sent)
+                    # The test releases this owned gate only after all window
+                    # updates, so scheduler delays cannot finish the first body.
+                    while gate.exists():
+                        time.sleep(0.005)
             if endpoint in {"/slow", "/slow-short", "/quota-shrink", "/capacity-cycle"}:
                 time.sleep(0.005)
 
