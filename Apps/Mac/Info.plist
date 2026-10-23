@@ -8,12 +8,18 @@
 	<string>Кинолёт</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
-        <dict>
-            <key>CFBundleTypeName</key><string>BitTorrent</string>
-            <key>CFBundleTypeExtensions</key><array><string>torrent</string></array>
-            <key>CFBundleTypeRole</key><string>Viewer</string>
-            <key>LSHandlerRank</key><string>Alternate</string>
-        </dict>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>torrent</string>
+			</array>
+			<key>CFBundleTypeName</key>
+			<string>BitTorrent</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
 			<string>Video</string>
@@ -115,6 +121,19 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>BitTorrent Magnet Link</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>magnet</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
@@ -123,6 +142,11 @@
 	<string>public.app-category.video</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSDesktopFolderUsageDescription</key>
 	<string>Used to find subtitles and the next episode in the folder of the video you open.</string>
 	<key>NSDocumentsFolderUsageDescription</key>
@@ -139,10 +163,10 @@
 	<string>Used to find subtitles and the next episode in the folder of the video you open.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Кинолёт generates subtitles from the audio of the media you open. Processing takes place on this Mac.</string>
-	<key>SPProductName</key>
-	<string>Кинолёт</string>
 	<key>SPEnableDistributionUpdates</key>
 	<false/>
+	<key>SPProductName</key>
+	<string>Кинолёт</string>
 	<key>UTImportedTypeDeclarations</key>
 	<array>
 		<dict>
@@ -343,13 +367,5 @@
 			</dict>
 		</dict>
 	</array>
-    <key>CFBundleURLTypes</key>
-    <array><dict>
-        <key>CFBundleURLName</key><string>BitTorrent Magnet Link</string>
-        <key>CFBundleTypeRole</key><string>Viewer</string>
-        <key>CFBundleURLSchemes</key><array><string>magnet</string></array>
-    </dict></array>
-    <key>NSAppTransportSecurity</key>
-    <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict>
 </plist>

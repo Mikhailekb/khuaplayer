@@ -27,6 +27,9 @@ info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 assert info['CFBundleIdentifier'] == 'app.kinolet.player'
 assert info['CFBundleExecutable'] == 'Kinolet'
 assert info['LSMinimumSystemVersion'] == '14.0'
+assert any('magnet' in entry.get('CFBundleURLSchemes', []) for entry in info.get('CFBundleURLTypes', [])), 'Missing magnet URL registration'
+assert any('torrent' in entry.get('CFBundleTypeExtensions', []) for entry in info.get('CFBundleDocumentTypes', [])), 'Missing torrent document registration'
+assert info.get('NSAppTransportSecurity', {}).get('NSAllowsLocalNetworking') is True, 'Missing local-network ATS declaration'
 version, build = info['CFBundleShortVersionString'], info['CFBundleVersion']
 assert re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,2}', version)
 assert re.fullmatch(r'[0-9]+', build)
@@ -49,7 +52,9 @@ assert 'Signature=adhoc' in signing and 'TeamIdentifier=not set' in signing
 commit = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
 assert re.fullmatch(r'[0-9a-f]{40}', commit)
 assert not os.environ.get('GITHUB_SHA') or os.environ['GITHUB_SHA'] == commit
-assert not subprocess.check_output(['git', '-C', str(root), 'status', '--porcelain'], text=True).strip()
+dirty = subprocess.check_output(['git', '-C', str(root), 'status', '--porcelain'], text=True).strip()
+if dirty:
+    raise SystemExit('Release source tree changed during the build:\n' + dirty)
 resources = app / 'Contents/Resources'
 for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md'):
     assert (resources / name).read_bytes() == (root / name).read_bytes(), name

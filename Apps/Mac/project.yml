@@ -180,9 +180,19 @@ targets:
         NSDownloadsFolderUsageDescription: "Used to find subtitles and the next episode in the folder of the video you open."
         NSNetworkVolumesUsageDescription: "Used to find subtitles and the next episode in the folder of the video you open."
         NSRemovableVolumesUsageDescription: "Used to find subtitles and the next episode in the folder of the video you open."
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         # Only system-provided encryption (HTTPS for update checks) is used.
         ITSAppUsesNonExemptEncryption: false
+        CFBundleURLTypes:
+          - CFBundleURLName: "BitTorrent Magnet Link"
+            CFBundleTypeRole: Viewer
+            CFBundleURLSchemes: [magnet]
         CFBundleDocumentTypes:
+          - CFBundleTypeName: "BitTorrent"
+            CFBundleTypeExtensions: [torrent]
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
           - CFBundleTypeName: "Video"
             CFBundleTypeRole: Viewer
             LSHandlerRank: Alternate
