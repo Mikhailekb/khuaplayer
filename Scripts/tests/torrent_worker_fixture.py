@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import signal
+import sys
 import threading
 import time
 import urllib.parse
@@ -30,14 +31,19 @@ records_lock = threading.Lock()
 audit_lock = threading.Lock()
 payload = bytes(range(256)) * 4096
 settings = json.loads((args.path / 'settings.json').read_text())['BitTorr']
+diagnostics = os.environ.get('KINOLET_TORRENT_FIXTURE_DIAGNOSTICS')
 
 def audit(kind, **values):
-    event = json.dumps(dict(kind=kind, pid=os.getpid(), **values)) + '\n'
+    event = json.dumps(dict(kind=kind, pid=os.getpid(), monotonic=time.monotonic(), **values)) + '\n'
     with audit_lock:
         with (args.path.parent / 'fixture-events.jsonl').open('a') as output:
             output.write(event)
+        if diagnostics:
+            with Path(diagnostics).open('a') as output:
+                output.write(event)
 
-audit('start', cacheSize=settings['CacheSize'], directory=args.path.name)
+audit('start', cacheSize=settings['CacheSize'], directory=args.path.name,
+      port=args.port, python=sys.version.split()[0])
 if (args.path.parent / 'refuse-start').exists():
     raise SystemExit(12)
 
@@ -46,6 +52,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *unused):
         pass
     def answer(self, status, data=b'', content_type='application/json', extra=None):
+        audit('response', path=urllib.parse.urlsplit(self.path).path,
+              method=self.command, status=status,
+              hasAuthorization=self.headers.get('Authorization') is not None)
         self.send_response(status)
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Content-Type', content_type)
@@ -217,6 +226,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 server = ThreadingHTTPServer((args.ip, args.port), Handler)
+audit('listening', port=args.port)
 server.daemon_threads = True
 def stop():
     delay = args.path.parent / 'termination-delay-ms'

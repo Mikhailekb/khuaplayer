@@ -11,6 +11,7 @@ struct TorrentServerChecks {
     static var ownedServer: SPTorrentServer?
     static var cacheChanges = 0
     static func main() async {
+        setbuf(stdout, nil)
         do { try await run() }
         catch {
             ownedServer?.shutdown()
