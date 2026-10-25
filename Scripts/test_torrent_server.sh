@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+python3 "$ROOT/Scripts/check_torrent_worker_version.py"
 CHECK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/khua-torrent-server.XXXXXX")"
 cleanup() {
   local status=$?

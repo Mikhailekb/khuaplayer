@@ -95,6 +95,9 @@ jobs:
       - name: Build and verify Release app
         run: ./Apps/Mac/Scripts/build.sh Release
 
+      - name: Check bundled torrent worker startup
+        run: ./Scripts/test_torrent_worker_startup.sh .build/Build/Products/Release/Kinolet.app
+
       - name: Compile and inspect unsigned App Store archive
         run: ./Scripts/smoke_app_store_unsigned.sh
 

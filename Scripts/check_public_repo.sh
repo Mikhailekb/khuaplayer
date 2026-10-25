@@ -140,6 +140,7 @@ python3 -m json.tool Design/AppIcon/export-manifest.json >/dev/null
 python3 -m json.tool Apps/Mac/Resources/Localizable.xcstrings >/dev/null
 python3 -m json.tool Apps/Mac/Resources/Assets.xcassets/Contents.json >/dev/null
 python3 -m json.tool Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset/Contents.json >/dev/null
+python3 Scripts/check_torrent_worker_version.py
 python3 Design/AppIcon/check_appicon.py \
   --shipping Apps/Mac/Resources/Assets.xcassets/AppIcon.appiconset
 python3 Scripts/l10n.py check --full

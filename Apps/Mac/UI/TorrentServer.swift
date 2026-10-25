@@ -70,7 +70,7 @@ struct SPTorrentPlaybackWindow: Equatable, Sendable {
 @MainActor
 final class SPTorrentServer {
     static let shared = SPTorrentServer()
-    nonisolated static let workerVersion = "MatriX.147-khua.4"
+    nonisolated static let workerVersion = "MatriX.147-khua.5"
     /// Default for callers without an active worker; runtime status uses the
     /// configuration captured by the worker, never the desired preference.
     nonisolated static let cacheSizeBytes = SPTorrentConfiguration().cacheSizeBytes

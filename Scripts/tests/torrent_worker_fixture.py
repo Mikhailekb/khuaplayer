@@ -16,6 +16,8 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 from pathlib import Path
 
+WORKER_VERSION = 'MatriX.147-khua.5'
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--ip', default='127.0.0.1')
 parser.add_argument('--port', type=int, required=True)
@@ -187,7 +189,7 @@ class Handler(BaseHTTPRequestHandler):
                 (args.path.parent / 'echo-started').touch()
                 while barrier.exists():
                     time.sleep(0.01)
-            self.answer(200, b'MatriX.147-khua.4', 'text/plain')
+            self.answer(200, WORKER_VERSION.encode(), 'text/plain')
             return
         if not url.path.startswith('/stream/'):
             self.answer(404)
