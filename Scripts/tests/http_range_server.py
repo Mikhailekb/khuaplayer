@@ -20,8 +20,22 @@ _AUTHORIZATION = "Basic " + base64.b64encode(b"user name:p:ass word").decode("as
 _PATHS = {
     "/ok", "/head405", "/bad-origin", "/bad-total", "/truncated",
     "/bad-length", "/ignore-range", "/stall", "/timeout", "/empty",
-    "/short-valid", "/auth",
+    "/short-valid", "/auth", "/cache-interleaved", "/cache-lru",
+    "/retry-once", "/retry-twice", "/retry-persistent", "/retry-deadline",
+    "/retry-cancel", "/retry-slow", "/retry-reset", "/retry-reset-changed",
+    "/retry-total-changed", "/changed-etag", "/invalid-body", "/not-found", "/forbidden",
 }
+
+
+def resource_size(path):
+    return 8 * 1024 * 1024 + 17 if path.startswith("/cache-") else RESOURCE_SIZE
+
+
+def cache_resource_bytes(offset, count):
+    # Include high position bits so distant windows cannot pass byte checks by
+    # accidentally returning the same repeated 256-byte pattern.
+    return bytes(((p * 37 + 11) ^ (p >> 8) ^ ((p >> 16) * 13)) & 255
+                 for p in range(offset, offset + count))
 
 
 def resource_bytes(offset, count):
@@ -38,15 +52,18 @@ class FixtureServer(ThreadingHTTPServer):
         self.stats_lock = threading.Lock()
         self.stats = {}
 
-    def record(self, path, method, requested_count):
+    def record(self, path, method, requested_count, start=None, if_range=None):
         with self.stats_lock:
             entry = self.stats.setdefault(path, {
-                "head": 0, "get": 0, "max_range": 0, "requested_counts": [],
+                "head": 0, "get": 0, "max_range": 0, "requested_counts": [], "requests": [],
             })
             entry[method.lower()] += 1
             if requested_count is not None:
                 entry["max_range"] = max(entry["max_range"], requested_count)
                 entry["requested_counts"].append(requested_count)
+            if method == "GET":
+                entry["requests"].append({"first": start, "count": requested_count, "if_range": if_range})
+            return sum(item["first"] == start for item in entry["requests"])
 
 
 class RangeHandler(BaseHTTPRequestHandler):
@@ -87,7 +104,7 @@ class RangeHandler(BaseHTTPRequestHandler):
         if path == "/head405":
             self._headers(405, 0)
             return
-        self._headers(200, 0 if path == "/empty" else RESOURCE_SIZE)
+        self._headers(200, 0 if path == "/empty" else resource_size(path))
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -106,28 +123,49 @@ class RangeHandler(BaseHTTPRequestHandler):
             return
 
         raw_range = self.headers.get("Range")
+        size = resource_size(path)
         match = _RANGE.fullmatch(raw_range or "")
         if match is None:
             self.server.record(path, "GET", None)
-            self._headers(416, 0, f"bytes */{RESOURCE_SIZE}")
+            self._headers(416, 0, f"bytes */{size}")
             return
 
         start = int(match.group(1))
-        requested_end = int(match.group(2)) if match.group(2) else RESOURCE_SIZE - 1
+        requested_end = int(match.group(2)) if match.group(2) else size - 1
         requested_count = requested_end - start + 1
-        self.server.record(path, "GET", max(0, requested_count))
+        attempt = self.server.record(path, "GET", max(0, requested_count), start, self.headers.get("If-Range"))
+        if path in {"/not-found", "/forbidden"}:
+            self._headers(404 if path == "/not-found" else 403, 0)
+            return
+        if start != 0 and path.startswith("/retry-"):
+            status = 0
+            if path in {"/retry-once", "/retry-cancel"} and attempt == 1:
+                status = 503
+            elif path == "/retry-twice" and attempt <= 2:
+                status = 502 if attempt == 1 else 504
+            elif path in {"/retry-persistent", "/retry-deadline"}:
+                status = 503
+            elif path == "/retry-slow" and attempt <= 2:
+                status = 503
+            if path == "/retry-deadline":
+                time.sleep(0.08)
+            if path == "/retry-slow":
+                time.sleep(0.15 if status else 0.3)
+            if status:
+                self._headers(status, 0)
+                return
         if path == "/empty":
             self._headers(416, 0, "bytes */0")
             return
-        if start >= RESOURCE_SIZE or requested_end < start:
-            self._headers(416, 0, f"bytes */{RESOURCE_SIZE}")
+        if start >= size or requested_end < start:
+            self._headers(416, 0, f"bytes */{size}")
             return
         if requested_count > MAX_RANGE_SIZE:
             # Large client reads must be split into bounded HTTP requests.
             self._headers(400, 0)
             return
 
-        end = min(requested_end, RESOURCE_SIZE - 1)
+        end = min(requested_end, size - 1)
         if path == "/short-valid":
             end = min(end, start + 10)
         count = end - start + 1
@@ -139,15 +177,40 @@ class RangeHandler(BaseHTTPRequestHandler):
 
         origin = start + 1 if path == "/bad-origin" else start
         range_end = end + 1 if path == "/bad-origin" else end
-        total = 0 if path == "/bad-total" else RESOURCE_SIZE
+        total = 0 if path == "/bad-total" else size
         content_range = f"bytes {origin}-{range_end}/{total}"
         content_length = count + 1 if path == "/bad-length" else count
-        self._headers(206, content_length, content_range)
+        if path == "/invalid-body" and start != 0:
+            self.send_response(206)
+            self.send_header("Content-Range", content_range)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self._write(b"4\r\noops\r\n0\r\n\r\n")
+            return
+        if path.startswith("/retry-") or path == "/changed-etag":
+            if path == "/retry-total-changed" and start != 0 and attempt > 1:
+                content_range = f"bytes {origin}-{range_end}/{size + 1}"
+            self.send_response(206)
+            self.send_header("Content-Length", str(content_length))
+            self.send_header("Content-Range", content_range)
+            changed = (path == "/changed-etag" and start != 0) or (path == "/retry-reset-changed" and start != 0 and attempt > 1)
+            self.send_header("ETag", '"fixture-v2"' if changed else '"fixture-v1"')
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            if path in {"/retry-reset", "/retry-reset-changed", "/retry-total-changed"} and start != 0 and attempt == 1:
+                self._write(resource_bytes(start, 128))
+                return
+        else:
+            self._headers(206, content_length, content_range)
         if path in {"/stall", "/timeout"} and (start != 0 or end != 0):
             time.sleep(STALL_SECONDS)
         if path == "/truncated":
             count //= 2
-        self._write(resource_bytes(start, count))
+        self._write(cache_resource_bytes(start, count) if path.startswith("/cache-")
+                    else resource_bytes(start, count))
 
 
 def main():

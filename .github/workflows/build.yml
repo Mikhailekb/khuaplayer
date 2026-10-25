@@ -93,6 +93,9 @@ jobs:
           ./Scripts/test_turbo_speed.sh
           ./Scripts/test_video_click.sh
           ./Scripts/test_playback_feedback.sh
+          ./Scripts/test_playback_control_intent.sh
+          ./Scripts/test_playback_diagnostics.sh
+          ./Scripts/test_playback_diagnostic_projection.sh
           ./Scripts/test_video_context_menu.sh
           ./Scripts/test_video_context_policy.sh
           ./Scripts/test_floating_video.sh
@@ -116,6 +119,11 @@ jobs:
 
       - name: Build and verify Release app
         run: ./Apps/Mac/Scripts/build.sh Release
+
+      - name: Check native HTTP range recovery
+        env:
+          FFMPEG_INCLUDE_DIR: ${{ github.workspace }}/ThirdParty/ffmpeg-min/include
+        run: python3 Scripts/tests/http_range_io.py
 
       - name: Check bundled torrent worker startup
         run: ./Scripts/test_torrent_worker_startup.sh .build/Build/Products/Release/Kinolet.app

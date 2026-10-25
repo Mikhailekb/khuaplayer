@@ -105,6 +105,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private let playerView = PlayerView()
     private var core: SPPlayerCore?
+    private let playbackDiagnostics = SPPlaybackDiagnostics()
+    private var playbackDiagnosticTimer: Timer?
+    private var lastPlaybackDiagnosticSnapshotAt: TimeInterval = 0
+    private var lastPlaybackDiagnosticWait: [Int64]?
     private let playbackSleep = SPPlaybackSleepController()
     private var repeatVideoIdentity: String?
     private var videoSharePicker: NSSharingServicePicker?
@@ -284,6 +288,119 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         torrentContext?.identityURL ?? openMediaPath.map { URL(fileURLWithPath: $0, isDirectory: false) }
     }
     private var resumeIdentityPath: String? { playbackIdentityURL?.path }
+
+    private func updatePlaybackDiagnosticTimer(for state: SPPlayerState) {
+        if state == .idle || state == .failed {
+            playbackDiagnosticTimer?.invalidate()
+            playbackDiagnosticTimer = nil
+            return
+        }
+        guard playbackDiagnosticTimer == nil else { return }
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            MainActor.assumeIsolated { self.recordPlaybackDiagnosticSnapshotIfNeeded() }
+        }
+        playbackDiagnosticTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func recordPlaybackDiagnosticSnapshotIfNeeded() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastPlaybackDiagnosticSnapshotAt >= 2 else { return }
+        lastPlaybackDiagnosticSnapshotAt = now
+        recordPlaybackDiagnostic(.snapshot)
+    }
+
+    /// Fixed numeric fields only; no media locations, names or torrent identities.
+    /// This reads existing coherent snapshots and never fetches data for logging.
+    private func recordPlaybackDiagnostic(_ event: SPPlaybackDiagnostics.Event,
+                                          control: SPPlaybackDiagnostics.Control? = nil,
+                                          seekTarget: Double? = nil,
+                                          commandValue: Double? = nil) {
+        guard let core else { return }
+        let source = core.sourcePlaybackWindow
+        let applied = torrentAppliedPlaybackWindow
+        let cached = torrentLastCacheSnapshot
+        let prefetch = torrentContext == nil ? nil : torrentPauseBuffer.snapshot
+        func scaled(_ value: Double, by scale: Double) -> Int64 {
+            let result = value * scale
+            // Double(Int64.max) rounds up to 2^63; use a strict upper bound.
+            guard result.isFinite, result >= Double(Int64.min), result < Double(Int64.max) else { return -1 }
+            return Int64(result)
+        }
+        var interactions: Int64 = 0
+        if scrollSeekTarget != nil { interactions |= 1 << 0 }
+        if scrollSeekWasPlaying { interactions |= 1 << 1 }
+        if burstWasPlaying { interactions |= 1 << 2 }
+        if burstStepCount > 1 { interactions |= 1 << 3 }
+        if isScrubbing { interactions |= 1 << 4 }
+        if turbo.blocksPlaybackControls { interactions |= 1 << 5 }
+        if torrentCacheRestartToken != nil { interactions |= 1 << 6 }
+        if torrentPauseBufferManuallyStopped { interactions |= 1 << 7 }
+        let prefetchState: Int64
+        switch prefetch?.state {
+        case .idle: prefetchState = 0
+        case .filling: prefetchState = 1
+        case .filled: prefetchState = 2
+        case .waitingForCapacity: prefetchState = 3
+        case .stopped: prefetchState = 4
+        case .failed: prefetchState = 5
+        case nil: prefetchState = -1
+        }
+        var values: [SPPlaybackDiagnostics.Field: Int64] = [
+            .state: Int64(core.state.rawValue),
+            .positionUs: scaled(core.position, by: 1_000_000),
+            .durationUs: scaled(core.duration, by: 1_000_000),
+            .openGeneration: source.openGeneration, .seekGeneration: source.seekGeneration,
+            .readByte: core.sourceReadOffset, .playbackByte: source.playbackOffset,
+            .playbackHistoryByte: source.historyStartOffset,
+            .historyLowerByte: applied?.historyLowerBound ?? -1,
+            .requestedHistoryLowerByte: applied?.requestedHistoryLowerBound ?? -1,
+            .appliedPlaybackByte: applied?.playbackOffset ?? -1,
+            .appliedOpenGeneration: applied?.openGeneration ?? -1,
+            .appliedSeekGeneration: applied?.seekGeneration ?? -1,
+            .appliedFileID: applied.map { Int64($0.fileID) } ?? -1,
+            .forwardUpperByte: applied?.forwardUpperBound ?? -1,
+            .waitFlags: playbackDiagnosticWaitFlags(core),
+            .waitReason: Int64(core.sourcePlaybackWaitReason.rawValue),
+            .prefetchState: prefetchState,
+            .prefetchReceivedBytes: prefetch?.receivedBytes ?? -1,
+            .prefetchBudgetBytes: prefetch?.budgetBytes ?? -1,
+            .prefetchLowerByte: prefetch?.rangeStart ?? -1,
+            .prefetchUpperByte: prefetch?.rangeEnd ?? -1,
+            .prefetchFileID: prefetch?.identity.map { Int64($0.fileID) } ?? -1,
+            .prefetchMatchesContext: prefetch?.identity.map { identity in
+                identity.fileID == torrentContext?.file.id &&
+                    identity.sessionGeneration == torrentContext?.descriptor.leaseID ? 1 : 0
+            } ?? 0,
+            .residentBytes: cached?.residentBytes ?? -1,
+            .capacityBytes: torrentLastStatus?.bufferCapacityBytes ?? -1,
+            .interactionFlags: interactions,
+            .selectedFileID: torrentContext.map { Int64($0.file.id) } ?? -1,
+            .fileOffsetByte: cached?.fileOffset ?? -1,
+            .rangesKnown: cached == nil ? 0 : 1
+        ]
+        if let control { values[.control] = control.rawValue }
+        if let seekTarget { values[.seekTargetUs] = scaled(seekTarget, by: 1_000_000) }
+        if let commandValue { values[.commandValueMilli] = scaled(commandValue, by: 1000) }
+        let ranges = cached?.ranges.prefix(64).map {
+            SPPlaybackDiagnostics.ByteRange(lower: $0.lowerBound, upper: $0.upperBound)
+        } ?? []
+        playbackDiagnostics.record(event, values: values, completeRanges: ranges,
+                                   completeRangeCount: cached?.ranges.count ?? 0)
+    }
+
+    private func playbackDiagnosticWaitFlags(_ core: SPPlayerCore) -> Int64 {
+        var flags: Int64 = 0
+        if core.sourceWaiting { flags |= 1 << 0 }
+        if core.sourceStalled { flags |= 1 << 1 }
+        if core.sourcePlaybackWaiting { flags |= 1 << 2 }
+        if core.sourceGrowing { flags |= 1 << 3 }
+        if core.seekSettled { flags |= 1 << 4 }
+        if core.sourceWaitingForIndex { flags |= 1 << 5 }
+        if core.contentSearching { flags |= 1 << 6 }
+        return flags
+    }
 
     private lazy var playlistController: SPPlaylistController = {
         let controller = SPPlaylistController(mediaExtensions: Self.mediaExtensions)
@@ -1357,6 +1474,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                   self.videoActionIdentity == identity, self.isRepeatingVideo,
                   core.state == .ended else { return }
             self.yieldDirectoryScanToForegroundIO()
+            self.recordPlaybackDiagnostic(.control, control: .play)
             core.play()
         }
         return true
@@ -2167,6 +2285,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             }
 
             if shouldResumePreviousPlayback {
+                recordPlaybackDiagnostic(.control, control: .play)
                 core.play()
             }
             view.window?.title = previousTitle
@@ -2276,6 +2395,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             break
         case .ended:
             yieldDirectoryScanToForegroundIO()
+            recordPlaybackDiagnostic(.control, control: .play)
             core.play()
         default:
 
@@ -2543,6 +2663,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func issueForegroundSeek(to target: Double,
                                      precise: Bool = true,
                                      forward: Bool = false) {
+        recordPlaybackDiagnostic(.seek, control: .seek, seekTarget: target,
+                                 commandValue: precise ? 1 : (forward ? 2 : 0))
         yieldDirectoryScanToForegroundIO()
         cancelTorrentPauseBuffer()
         cancelTorrentPlaybackWindowPolicy()
@@ -2718,6 +2840,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var closingWindowInProgress = false
 
     func handleWindowClose(destroyingWindow: Bool = false) {
+        recordPlaybackDiagnostic(.close)
+        playbackDiagnosticTimer?.invalidate()
+        playbackDiagnosticTimer = nil
         floatingVideo.restore()
         repeatVideoIdentity = nil
         videoSharePicker = nil
@@ -2990,6 +3115,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                         // frame (and intentionally skips near-end history
                         // positions). A live worker handoff requires the exact
                         // saved frame, including sub-second and near-end points.
+                        recordPlaybackDiagnostic(.control, control: .cacheRestorePause,
+                                                 seekTarget: snapshot.position)
                         core.pause()
                         core.seek(to: snapshot.position, precise: true)
                     }
@@ -2999,8 +3126,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                         (core.audioOnlySession || core.hasEverPresentedThisSession))) {
                         // pause publishes its delegate synchronously; doing it
                         // here avoids reentering an outer Playing state handler.
-                        if snapshot.wasPlaying, core.state != .ended { core.play() }
-                        else { core.pause() }
+                        if snapshot.wasPlaying, core.state != .ended {
+                            recordPlaybackDiagnostic(.control, control: .cacheRestoreResume)
+                            core.play()
+                        } else {
+                            recordPlaybackDiagnostic(.control, control: .cacheRestoreKeepPaused)
+                            core.pause()
+                        }
                         core.setMuted(snapshot.muted)
                         core.setVolume(snapshot.volume)
                         volumeBoostUnlocked = snapshot.volumeBoostUnlocked
@@ -3474,6 +3606,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         torrentTimelinePresentation = nil
         chrome?.setBufferedRanges([], visible: visible)
         floatingVideo.setBufferedRanges([], visible: visible)
+        recordPlaybackDiagnosticSnapshotIfNeeded()
     }
 
     private func applyTorrentCacheSnapshot(_ snapshot: SPTorrentCacheSnapshot,
@@ -3493,6 +3626,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let ranges = mapped?.normalizedRanges ?? []
         chrome?.setBufferedRanges(ranges, visible: true)
         floatingVideo.setBufferedRanges(ranges, visible: true)
+        recordPlaybackDiagnosticSnapshotIfNeeded()
     }
 
     private func showTorrentLoading(_ text: String, detail: String?) {
@@ -3931,6 +4065,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 #endif
 
     func playerCore(_ core: SPPlayerCore, didChange state: SPPlayerState) {
+        recordPlaybackDiagnostic(.state)
+        updatePlaybackDiagnosticTimer(for: state)
         if state == .playing || state == .paused { startTorrentPlaybackWindowPolicyIfNeeded() }
         else if state != .ready {
             cancelTorrentPlaybackWindowPolicy(releaseRetainedWindow:
@@ -4122,6 +4258,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     func playerCore(_ core: SPPlayerCore, didUpdatePosition position: Double, duration: Double) {
+        recordPlaybackDiagnosticSnapshotIfNeeded()
         updateFloatingVideoPresentation()
         captionsAttachIfNeeded()
         captionsAutomationHookIfNeeded()
@@ -4385,6 +4522,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     func playerCoreDidChangeSourceGrowth(_ core: SPPlayerCore) {
         guard core === self.core else { return }
+        let source = core.sourcePlaybackWindow
+        let signature = [playbackDiagnosticWaitFlags(core), Int64(core.sourcePlaybackWaitReason.rawValue),
+                         source.openGeneration, source.seekGeneration]
+        if signature != lastPlaybackDiagnosticWait {
+            lastPlaybackDiagnosticWait = signature
+            recordPlaybackDiagnostic(.sourceWait)
+        }
         startTorrentPlaybackWindowPolicyIfNeeded()
         updateTorrentPauseBuffer()
         if torrentContext != nil { refreshPlaylistView() }
@@ -4483,7 +4627,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         cancelVideoClick()
         if turbo.blocksPlaybackControls, SPTurboSpeed.blocksCommand(requestedCommand) { return }
         // A new explicit command supersedes an unfinished trackpad seek.
-        if scrollSeekTarget != nil { cancelPlaybackScroll() }
+        if scrollSeekTarget != nil, requestedCommand != .togglePlayback { cancelPlaybackScroll() }
 
         var context = commandContext
         if case .seekRelative(let delta) = requestedCommand {
@@ -4511,11 +4655,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             lastRelSeekAt = ProcessInfo.processInfo.systemUptime
             issueForegroundSeek(to: target, precise: false, forward: forward)
         case .setPlaybackRate(let rate):
+            recordPlaybackDiagnostic(.control, control: .setRate, commandValue: rate)
             core?.setPlaybackRate(rate)
             if let core {
                 transitionPresentation(.playbackRateChanged(core.playbackRate))
             }
         case .setVolumePercent(let percent):
+            recordPlaybackDiagnostic(.control, control: .setVolume, commandValue: percent)
             // Normalize Float round-off at the 100% interaction boundary.
             let normalizedPercent = abs(percent - 100) < 0.01 ? 100 : percent
             if normalizedPercent > 100 {
@@ -4530,6 +4676,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             if normalizedPercent > 0 { core?.setMuted(false) }
             publishVolumePresentation()
         case .toggleMute:
+            recordPlaybackDiagnostic(.control, control: .toggleMute)
             if let core {
                 core.setMuted(!core.isMuted)
             }
@@ -4545,6 +4692,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         case .clearLoop:
             core?.clearLoop()
         case .stepFrame(let delta):
+            recordPlaybackDiagnostic(.control, control: .stepFrame, commandValue: Double(delta))
             cancelTorrentPauseBuffer()
             cancelTorrentPlaybackWindowPolicy()
             yieldDirectoryScanToForegroundIO()
@@ -4559,6 +4707,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         case .showMediaInfo:
             presentMediaInfo()
         case .selectSubtitleTrack(let index):
+            recordPlaybackDiagnostic(.control, control: .setSubtitleTrack, commandValue: Double(index))
             cancelTorrentPauseBuffer()
             cancelTorrentPlaybackWindowPolicy()
             // Positive track changes re-read cues through an internal precise
@@ -4569,6 +4718,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             core?.selectSubtitleTrack(at: index)
             startTorrentPlaybackWindowPolicyIfNeeded()
         case .selectAudioTrack(let index):
+            recordPlaybackDiagnostic(.control, control: .setAudioTrack, commandValue: Double(index))
             cancelTorrentPauseBuffer()
             cancelTorrentPlaybackWindowPolicy()
             if let track = core?.audioTrackList.first(where: { ($0["index"] as? NSNumber)?.intValue == index }) as? [String: Any] {
@@ -5286,6 +5436,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 if self.burstStepCount == 2, core.isPlaying {
 
                     self.burstWasPlaying = true
+                    self.recordPlaybackDiagnostic(.control, control: .autoPauseBurst)
                     core.pause()
                 }
 
@@ -5496,24 +5647,30 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func togglePlaybackNow() {
         cancelVideoClick()
-        cancelPlaybackScroll()
         guard let core else { return }
         let previousState = core.state
         guard previousState == .playing || previousState == .paused || previousState == .ended else { return }
+        recordPlaybackDiagnostic(.control, control: .toggle,
+                                 commandValue: previousState == .playing ? 0 : 1)
+        // Temporary gesture pauses already publish Paused (and show Play).
+        // Preserve that explicit intent before revoking delayed auto-resumes.
+        cancelPlaybackScroll(resumePlayback: false)
+        stopRepeat(resumePlayback: false)
         // Core.play() turns Ended into an implicit precise seek-to-zero.
         if previousState == .ended { yieldDirectoryScanToForegroundIO() }
-        core.togglePlayPause()
+        if previousState == .playing { core.pause() }
+        else { core.play() }
         if hasVideoSession { showPlaybackFeedback(isPlaying: previousState != .playing) }
     }
 
     private func turboSpaceDown() {
         cancelVideoClick()
-        // Restore the pre-gesture state before deciding whether this press can
-        // accelerate. A short press toggles playback only when released.
-        cancelPlaybackScroll()
+        // A short press toggles the visible state on release. Gesture cleanup
+        // must not resume a temporarily paused item before that decision.
+        cancelPlaybackScroll(resumePlayback: false)
         guard let core else { return }
 
-        if repeatOwnerKeyCode != nil { stopRepeat() }
+        if repeatOwnerKeyCode != nil { stopRepeat(resumePlayback: false) }
         let effects = turbo.keyDown(enabled: SPTurboSettings.isEnabled,
                                     playing: core.state == .playing,
                                     currentRate: core.playbackRate,
@@ -6065,7 +6222,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         hud.place(in: view.bounds, topInset: topInset)
     }
 
-    private func stopRepeat() {
+    private func stopRepeat(resumePlayback: Bool = true) {
         repeatTimer?.invalidate()
         repeatTimer = nil
         repeatAction = nil
@@ -6078,7 +6235,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if burstStepCount > 1, let core {
             lastRelSeekTarget = burstTarget
             lastRelSeekAt = ProcessInfo.processInfo.systemUptime
-            if burstWasPlaying {
+            if burstWasPlaying && resumePlayback {
+                recordPlaybackDiagnostic(.control, control: .autoResumeBurst)
                 core.play()
             }
         }
@@ -6317,7 +6475,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 scrubMuteAllowed = false
                 lastCoarseTarget = -1
                 lastRelSeekTarget = -1
-                if scrollSeekWasPlaying { core.pause() }
+                if scrollSeekWasPlaying {
+                    recordPlaybackDiagnostic(.control, control: .autoPauseScroll)
+                    core.pause()
+                }
             case .seek(let delta):
                 if scrollSeekTarget != nil {
                     gestureSeek.submit(delta)
@@ -6352,7 +6513,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             SPPlaybackGestureSettings.verticalVolumeEnabled
     }
 
-    private func endPlaybackScrollSeek() {
+    private func endPlaybackScrollSeek(resumePlayback: Bool = true) {
         guard scrollSeekTarget != nil else { return }
         gestureSeekTimer?.invalidate()
         gestureSeekTimer = nil
@@ -6362,9 +6523,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         gestureSeek.reset()
         scrollSeekTarget = nil
         isScrubbing = false
-        let resume = scrollSeekWasPlaying
+        let resume = scrollSeekWasPlaying && resumePlayback
         scrollSeekWasPlaying = false
-        if resume { core?.play() }
+        if resume {
+            recordPlaybackDiagnostic(.control, control: .autoResumeScroll)
+            core?.play()
+        }
         if let core {
             transitionPresentation(.timelineChanged(
                 position: core.position, duration: core.duration, rate: core.playbackRate))
@@ -6399,11 +6563,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         issueForegroundSeek(to: target, precise: false, forward: delta > 0)
     }
 
-    private func cancelPlaybackScroll() {
+    private func cancelPlaybackScroll(resumePlayback: Bool = true) {
         scrollGestureTimeout?.invalidate()
         scrollGestureTimeout = nil
         _ = scrollGesture.reset()
-        endPlaybackScrollSeek()
+        endPlaybackScrollSeek(resumePlayback: resumePlayback)
     }
 
     private func handlePlaybackMagnify(_ event: NSEvent) -> Bool {

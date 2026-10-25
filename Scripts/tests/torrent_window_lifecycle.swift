@@ -81,6 +81,9 @@ private struct SPTorrentPlaybackWindow {
     }
 }
 @MainActor private final class Controller {
+    enum Diagnostic { case seek }
+    func recordPlaybackDiagnostic(_ event: Diagnostic, control: Diagnostic,
+                                  seekTarget: Double, commandValue: Double) {}
     struct AppliedTorrentPlaybackWindow {
         let leaseID: UUID
         let fileID: Int

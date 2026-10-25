@@ -60,6 +60,7 @@ private func fixturePayload() -> [String: Any] {
     let notice = Notice()
     var playbackNotice: Notice? { notice }
     func playbackNoticeView() -> Notice { notice }
+    func recordPlaybackDiagnosticSnapshotIfNeeded() {}
     func apply(_ snapshot: SPTorrentCacheSnapshot, context: SPTorrentPlaybackContext) {
         applyTorrentCacheSnapshot(snapshot, context: context)
     }

@@ -7,6 +7,7 @@ extern "C" {
 #include <libavutil/error.h>
 }
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -207,6 +208,130 @@ void authenticationChecks(const std::string& base) {
     expect(read > 0 && read <= static_cast<int>(sizeof(bytes)), "subsequent ranged requests retain authorization");
     expectBytes(bytes, read, 16, "authorized ranged bytes preserve the resource contents");
 }
+
+void transientRetryChecks(const std::string& base) {
+    for (const std::string path : {"/retry-once", "/retry-twice", "/retry-reset"}) {
+        sp::HTTPRangeIO io(base + path, [] { return false; }, 2.0);
+        expect(io.open() >= 0, "open transient retry fixture " + path);
+        expect(io.seek(16, SEEK_SET) == 16, "leave transient retry probe cache");
+        uint8_t bytes[64]{};
+        const int read = io.read(bytes, sizeof(bytes));
+        expect(read == sizeof(bytes), "recover a complete range before returning it to AVIO " + path);
+        expectBytes(bytes, read, 16, "retries never duplicate or skip returned bytes " + path);
+        expect(io.seek(0, SEEK_CUR) == 16 + sizeof(bytes), "advance only once after recovered range");
+    }
+    for (const std::string path : {"/retry-persistent", "/retry-reset-changed", "/retry-total-changed",
+                                   "/changed-etag", "/invalid-body"}) {
+        sp::HTTPRangeIO io(base + path, [] { return false; }, 2.0);
+        expect(io.open() >= 0, "open terminal retry fixture " + path);
+        expect(io.seek(16, SEEK_SET) == 16, "select terminal range");
+        uint8_t bytes[64];
+        std::fill(std::begin(bytes), std::end(bytes), 0xCC);
+        const int result = io.read(bytes, sizeof(bytes));
+        expect(result == (path == "/retry-persistent" ? AVERROR(EIO) : AVERROR_INVALIDDATA),
+               "return the terminal transport or validation error " + path);
+        expect(io.seek(0, SEEK_CUR) == 16, "failed retries do not advance position " + path);
+        expect(std::all_of(std::begin(bytes), std::end(bytes), [](uint8_t b) { return b == 0xCC; }),
+               "partial or invalid response bytes never reach caller " + path);
+    }
+    for (const std::string path : {"/not-found", "/forbidden"}) {
+        sp::HTTPRangeIO io(base + path, [] { return false; });
+        expect(io.open() == AVERROR(path == "/not-found" ? ENOENT : EACCES),
+               "permanent HTTP status is not retried " + path);
+    }
+    std::atomic<bool> cancelled{false};
+    std::atomic<bool> retryBackoffEntered{false};
+    auto* retryEntered = &retryBackoffEntered;
+    id cancellationObserver = [NSNotificationCenter.defaultCenter addObserverForName:@"KinoletHTTPRangeDiagnostic"
+        object:nil queue:nil usingBlock:^(NSNotification* notification) {
+            if ([notification.userInfo[@"phase"] intValue] == 3) retryEntered->store(true);
+        }];
+    sp::HTTPRangeIO cancellation(base + "/retry-cancel", [&] { return cancelled.load(); }, 2.0);
+    expect(cancellation.open() >= 0, "open backoff cancellation fixture");
+    expect(cancellation.seek(16, SEEK_SET) == 16, "leave cancellation probe cache");
+    uint8_t bytes[64]{};
+    const auto cancelStart = std::chrono::steady_clock::now();
+    std::thread cancel([&] {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!retryBackoffEntered.load() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        cancelled.store(true);
+    });
+    const int cancelledResult = cancellation.read(bytes, sizeof(bytes));
+    const auto cancelElapsed = std::chrono::steady_clock::now() - cancelStart;
+    cancel.join();
+    [NSNotificationCenter.defaultCenter removeObserver:cancellationObserver];
+    expect(retryBackoffEntered.load(), "cancellation fixture actually enters retry backoff");
+    expect(cancelledResult == AVERROR_EXIT, "cancellation interrupts transient retry backoff");
+    expect(cancelElapsed < std::chrono::milliseconds(200), "retry cancellation is promptly polled");
+
+    std::vector<bool> deadlineWaiting;
+    sp::HTTPRangeIO deadline(base + "/retry-deadline", [] { return false; }, 0.18,
+                            [&](bool value) { deadlineWaiting.push_back(value); });
+    expect(deadline.open() >= 0, "open logical deadline fixture");
+    expect(deadline.seek(16, SEEK_SET) == 16, "leave deadline probe cache");
+    const auto deadlineStart = std::chrono::steady_clock::now();
+    expect(deadline.read(bytes, sizeof(bytes)) == AVERROR(ETIMEDOUT), "retries share one original deadline");
+    expect(std::chrono::steady_clock::now() - deadlineStart < std::chrono::milliseconds(350),
+           "retry attempts do not multiply the request timeout");
+    expect(balancedWaiting(deadlineWaiting), "logical deadline leaves balanced waiting state");
+
+    std::vector<bool> slowWaiting;
+    NSMutableArray<NSDictionary*>* events = [NSMutableArray array];
+    id observer = [NSNotificationCenter.defaultCenter addObserverForName:@"KinoletHTTPRangeDiagnostic"
+        object:nil queue:nil usingBlock:^(NSNotification* notification) { [events addObject:notification.userInfo]; }];
+    sp::HTTPRangeIO slow(base + "/retry-slow", [] { return false; }, 3.0,
+                        [&](bool value) { slowWaiting.push_back(value); });
+    expect(slow.open() >= 0, "open waiting-across-retries fixture");
+    expect(slow.seek(16, SEEK_SET) == 16, "leave slow probe cache");
+    expect(slow.read(bytes, sizeof(bytes)) == sizeof(bytes), "a slower retried body completes");
+    [NSNotificationCenter.defaultCenter removeObserver:observer];
+    expect(slowWaiting == std::vector<bool>({true, false}), "one balanced waiting interval spans all attempts");
+    int phases[4]{};
+    bool numericOnly = true;
+    const int64_t reader = [events.firstObject[@"reader"] longLongValue];
+    for (NSDictionary* event in events) {
+        numericOnly &= event.count == 7 && [event[@"reader"] longLongValue] == reader && reader > 0;
+        for (NSString* key in event) {
+            id value = event[key];
+            numericOnly &= [value isKindOfClass:NSNumber.class] && strcmp([value objCType], @encode(double)) != 0;
+        }
+        const int phase = [event[@"phase"] intValue];
+        if (phase >= 1 && phase <= 3) phases[phase]++;
+    }
+    expect(numericOnly, "persistent range diagnostics contain only seven numeric fields and stable reader ID");
+    expect(phases[1] == 1 && phases[2] == 1 && phases[3] == 2,
+           "slow logical fetch emits one waiting, one completion, and two bounded retry diagnostics");
+}
+
+void cacheWindowChecks(const std::string& base) {
+    auto readAt = [](sp::HTTPRangeIO& io, int64_t offset) {
+        expect(io.seek(offset, SEEK_SET) == offset, "select an interleaved cache region");
+        uint8_t bytes[1024]{};
+        const int received = io.read(bytes, sizeof(bytes));
+        expect(received == sizeof(bytes), "interleaved cache reads preserve the requested count");
+        bool valid = true;
+        for (int i = 0; valid && i < received; ++i) {
+            const int64_t p = offset + i;
+            valid = bytes[i] == uint8_t(((p * 37 + 11) ^ (p >> 8) ^ ((p >> 16) * 13)) & 255);
+        }
+        expect(valid, "cached bytes match their physical region including high offset bits");
+    };
+    sp::HTTPRangeIO interleaved(base + "/cache-interleaved", [] { return false; });
+    expect(interleaved.open() >= 0, "open interleaved stream fixture");
+    for (int i = 0; i < 24; ++i) {
+        readAt(interleaved, 128 * 1024 + 17 + i * 32);
+        readAt(interleaved, 1024 * 1024 + 93 + i * 32);
+    }
+    sp::HTTPRangeIO eviction(base + "/cache-lru", [] { return false; });
+    expect(eviction.open() >= 0, "open bounded LRU fixture");
+    for (int i = 0; i < 8; ++i) readAt(eviction, int64_t(i) * 512 * 1024 + 64);
+    readAt(eviction, 64); // Most recently used window must survive the next insertion.
+    readAt(eviction, 8 * 512 * 1024 + 64);
+    readAt(eviction, 64);
+    readAt(eviction, 512 * 1024 + 64); // The oldest of the other eight was evicted.
+}
 }
 
 int main(int argc, char** argv) {
@@ -222,6 +347,8 @@ int main(int argc, char** argv) {
         responseValidationChecks(base);
         interruptionChecks(base);
         authenticationChecks(base);
+        cacheWindowChecks(base);
+        transientRetryChecks(base);
         std::cout << "HTTP range IO checks passed (" << checks << " assertions)." << std::endl;
     }
 }

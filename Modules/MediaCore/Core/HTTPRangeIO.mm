@@ -7,16 +7,20 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
 constexpr int64_t kRangeBytes = 256 * 1024;
+constexpr size_t kCacheWindows = 8;
+std::atomic<int64_t> nextReader{1};
 
 struct ContentRange {
     int64_t first = -1, last = -1, total = -1;
@@ -64,7 +68,7 @@ NSURLComponents* urlComponents(const std::string& text) {
 @public
     int64_t first, last, knownTotal, total, expectedLength;
     int result;
-    BOOL headersValidated, acceptedEmpty;
+    BOOL headersValidated, acceptedEmpty, retryable;
     NSString* expectedValidator;
     NSString* validator;
     NSMutableData* body;
@@ -118,6 +122,8 @@ NSURLComponents* urlComponents(const std::string& text) {
         return;
     }
     if (http.statusCode != 206) {
+        state->retryable = http.statusCode == 500 || http.statusCode == 502 ||
+                           http.statusCode == 503 || http.statusCode == 504;
         state->result = AVERROR(http.statusCode == 401 || http.statusCode == 403 ? EACCES :
                                 http.statusCode == 404 ? ENOENT : EIO);
         completionHandler(NSURLSessionResponseCancel); // Never collect a server's full-file 200 body.
@@ -166,8 +172,12 @@ NSURLComponents* urlComponents(const std::string& text) {
     if (!state) return;
     if (state->acceptedEmpty) state->result = 0;
     else if (state->result >= 0) {
-        if (error) state->result = AVERROR(error.code == NSURLErrorTimedOut ? ETIMEDOUT : EIO);
-        else if (!state->headersValidated || state->body.length != (NSUInteger)state->expectedLength)
+        if (error) {
+            state->result = AVERROR(error.code == NSURLErrorTimedOut ? ETIMEDOUT : EIO);
+            state->retryable = [error.domain isEqualToString:NSURLErrorDomain] &&
+                (error.code == NSURLErrorNetworkConnectionLost || error.code == NSURLErrorTimedOut ||
+                 error.code == NSURLErrorCannotConnectToHost || error.code == NSURLErrorNotConnectedToInternet);
+        } else if (!state->headersValidated || state->body.length != (NSUInteger)state->expectedLength)
             state->result = AVERROR_INVALIDDATA;
     }
     dispatch_semaphore_signal(state->completed);
@@ -184,8 +194,54 @@ struct HTTPRangeIO::Impl {
     NSString* validator = nil;
     SPHTTPRangeTransport* transport = nil;
     NSURLSession* session = nil;
-    int64_t length = -1, position = 0, cachePosition = -1;
-    std::vector<uint8_t> cache;
+    int64_t length = -1, position = 0;
+    struct CacheWindow {
+        int64_t first;
+        uint64_t access;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<CacheWindow> cache;
+    uint64_t cacheAccess = 0;
+    const int64_t reader = nextReader.fetch_add(1, std::memory_order_relaxed);
+
+    void diagnose(int64_t start, int64_t count, int64_t waitMs, int phase, int result, int attempt) {
+        NSLog(@"[KinoletRange] reader=%lld start=%lld count=%lld wait_ms=%lld phase=%d result=%d attempt=%d",
+              (long long)reader, (long long)start, (long long)count, (long long)waitMs, phase, result, attempt);
+        // A private bounded consumer can retain diagnostics even when launchd
+        // redirects stderr. This contains no URL, path, headers or credentials.
+        [NSNotificationCenter.defaultCenter postNotificationName:@"KinoletHTTPRangeDiagnostic" object:nil
+            userInfo:@{@"reader": @(reader), @"start": @(start), @"count": @(count),
+                       @"waitMs": @(waitMs), @"phase": @(phase), @"result": @(result), @"attempt": @(attempt)}];
+    }
+
+    CacheWindow* cachedAt(int64_t offset) {
+        for (auto& window : cache) {
+            if (offset >= window.first && offset - window.first < (int64_t)window.bytes.size()) {
+                window.access = ++cacheAccess;
+                return &window;
+            }
+        }
+        return nullptr;
+    }
+    void cacheBytes(int64_t first, std::vector<uint8_t> bytes) {
+        if (bytes.empty()) return;
+        // A demuxer alternates between nearby audio/video/index regions. Retain
+        // a few validated windows rather than downloading each again on a seek.
+        // Windows retain their exact response origins, including short206s.
+        for (auto& window : cache) {
+            if (window.first == first) {
+                window = {first, ++cacheAccess, std::move(bytes)};
+                return;
+            }
+        }
+        if (cache.size() < kCacheWindows) {
+            cache.push_back({first, ++cacheAccess, std::move(bytes)});
+        } else {
+            auto oldest = std::min_element(cache.begin(), cache.end(),
+                [](const auto& a, const auto& b) { return a.access < b.access; });
+            *oldest = {first, ++cacheAccess, std::move(bytes)};
+        }
+    }
 
     Impl(const std::string& text, std::function<bool()> stop, double seconds,
          std::function<void(bool)> waiting)
@@ -221,9 +277,24 @@ struct HTTPRangeIO::Impl {
     bool cancelled() const { return interrupted && interrupted(); }
     int fetch(int64_t start, int64_t count, std::vector<uint8_t>& output, int64_t& receivedTotal) {
         @autoreleasepool {
-            if (cancelled()) return AVERROR_EXIT;
+            const auto started = std::chrono::steady_clock::now();
+            int currentAttempt = 0;
+            bool retryAnnounced = false;
+            auto elapsedMs = [&] {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+            };
+            auto finish = [&](int result) {
+                const int64_t milliseconds = elapsedMs();
+                // Persistent diagnostics contain numeric positions/results only.
+                // A demux yield is expected cancellation, not a transport failure.
+                if (retryAnnounced || milliseconds >= 500 || (result < 0 && result != AVERROR_EXIT))
+                    diagnose(start, count, milliseconds, 2, result, currentAttempt);
+                return result;
+            };
+            if (cancelled()) return finish(AVERROR_EXIT);
             if (!url || !session || start < 0 || count <= 0 || count > kRangeBytes || start > INT64_MAX - count)
-                return AVERROR(EINVAL);
+                return finish(AVERROR(EINVAL));
             struct WaitingScope {
                 std::function<void(bool)>& changed;
                 bool announced = false;
@@ -233,34 +304,80 @@ struct HTTPRangeIO::Impl {
                 }
                 ~WaitingScope() { if (announced) changed(false); }
             } waiting(waitingChanged);
-            NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url
-                cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:timeout];
-            [request setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", (long long)start,
-                (long long)(start + count - 1)] forHTTPHeaderField:@"Range"];
-            [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
-            if (authorization) [request setValue:authorization forHTTPHeaderField:@"Authorization"];
-            if (validator) [request setValue:validator forHTTPHeaderField:@"If-Range"];
-            SPHTTPRangeRequest* state = [SPHTTPRangeRequest new];
-            state->first = start; state->last = start + count - 1;
-            state->knownTotal = length; state->expectedValidator = validator;
-            NSURLSessionDataTask* task = [session dataTaskWithRequest:request];
-            [transport addRequest:state task:task];
-            [task resume];
-            const auto started = std::chrono::steady_clock::now();
             const auto deadline = started + std::chrono::duration<double>(timeout);
-            while (dispatch_semaphore_wait(state->completed, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC))) {
-                if (cancelled()) { [task cancel]; return AVERROR_EXIT; }
-                if (std::chrono::steady_clock::now() >= deadline) { [task cancel]; return AVERROR(ETIMEDOUT); }
-                if (std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(250))
-                    waiting.announce();
+            bool slowAnnounced = false;
+            auto announceWaiting = [&] {
+                const auto elapsed = std::chrono::steady_clock::now() - started;
+                if (!slowAnnounced && elapsed >= std::chrono::milliseconds(500)) {
+                    slowAnnounced = true;
+                    diagnose(start, count, elapsedMs(), 1, 0, currentAttempt);
+                }
+                if (elapsed >= std::chrono::milliseconds(250)) waiting.announce();
+            };
+            int64_t expectedTotal = length;
+            NSString* expectedValidator = validator;
+            // A transient transport error must not reach AVIO: some demuxers
+            // retain it as terminal EOF, while others discard an incomplete packet.
+            // Retry the exact bounded request, never exposing a partial body.
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                currentAttempt = attempt + 1;
+                if (cancelled()) return finish(AVERROR_EXIT);
+                const double remaining = std::chrono::duration<double>(
+                    deadline - std::chrono::steady_clock::now()).count();
+                if (remaining <= 0) return finish(AVERROR(ETIMEDOUT));
+                NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url
+                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:remaining];
+                [request setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", (long long)start,
+                    (long long)(start + count - 1)] forHTTPHeaderField:@"Range"];
+                [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
+                if (authorization) [request setValue:authorization forHTTPHeaderField:@"Authorization"];
+                if (expectedValidator) [request setValue:expectedValidator forHTTPHeaderField:@"If-Range"];
+                SPHTTPRangeRequest* state = [SPHTTPRangeRequest new];
+                state->first = start; state->last = start + count - 1;
+                state->knownTotal = expectedTotal; state->expectedValidator = expectedValidator;
+                NSURLSessionDataTask* task = [session dataTaskWithRequest:request];
+                [transport addRequest:state task:task];
+                [task resume];
+                while (dispatch_semaphore_wait(state->completed,
+                       dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC))) {
+                    if (cancelled()) { [task cancel]; return finish(AVERROR_EXIT); }
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        [task cancel]; return finish(AVERROR(ETIMEDOUT));
+                    }
+                    announceWaiting();
+                }
+                if (cancelled()) return finish(AVERROR_EXIT);
+                if (std::chrono::steady_clock::now() >= deadline) return finish(AVERROR(ETIMEDOUT));
+                if (state->result >= 0) {
+                    receivedTotal = state->total;
+                    if (state->validator.length) validator = state->validator;
+                    output.resize(state->body.length);
+                    if (!output.empty()) memcpy(output.data(), state->body.bytes, output.size());
+                    return finish(0);
+                }
+                if (!state->retryable || attempt == 2) return finish(state->result);
+                retryAnnounced = true;
+                diagnose(start, count, elapsedMs(), 3, state->result, currentAttempt);
+                // Even an incomplete body can have established the entity and
+                // length. A retry must not silently switch to another resource.
+                if (state->headersValidated) {
+                    expectedTotal = state->total;
+                    if (state->validator.length) expectedValidator = state->validator;
+                }
+                // The deadline and waiting interval span all attempts. Poll the
+                // interrupt during backoff too, so seek/stop never waits on retry.
+                const auto retryAt = std::min(deadline, std::chrono::steady_clock::now() +
+                    std::chrono::duration<double>(attempt == 0 ? 0.05 : 0.15));
+                while (std::chrono::steady_clock::now() < retryAt) {
+                    if (cancelled()) return finish(AVERROR_EXIT);
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) return finish(AVERROR(ETIMEDOUT));
+                    announceWaiting();
+                    std::this_thread::sleep_for(std::min(std::chrono::duration<double>(retryAt - now),
+                                                        std::chrono::duration<double>(0.025)));
+                }
             }
-            if (cancelled()) return AVERROR_EXIT;
-            if (state->result < 0) return state->result;
-            receivedTotal = state->total;
-            if (state->validator.length) validator = state->validator;
-            output.resize(state->body.length);
-            if (!output.empty()) memcpy(output.data(), state->body.bytes, output.size());
-            return 0;
+            return finish(AVERROR(EIO));
         }
     }
 };
@@ -275,9 +392,11 @@ bool HTTPRangeIO::supportsURL(const std::string& url) {
 int HTTPRangeIO::open() {
     if (impl_->length >= 0) return 0;
     int64_t total = -1;
-    const int result = impl_->fetch(0, 1, impl_->cache, total);
+    std::vector<uint8_t> probe;
+    const int result = impl_->fetch(0, 1, probe, total);
     if (result < 0) return result;
-    impl_->length = total; impl_->position = 0; impl_->cachePosition = 0;
+    impl_->length = total; impl_->position = 0;
+    impl_->cacheBytes(0, std::move(probe));
     return 0;
 }
 int64_t HTTPRangeIO::size() const { return impl_->length; }
@@ -286,18 +405,21 @@ int HTTPRangeIO::read(uint8_t* destination, int requested) {
     if (requested < 0 || (!destination && requested) || impl_->length < 0) return AVERROR(EINVAL);
     if (!requested) return 0;
     if (impl_->position >= impl_->length) return AVERROR_EOF;
-    const int64_t cached = impl_->cachePosition < 0 ? -1 : impl_->position - impl_->cachePosition;
-    if (impl_->cachePosition < 0 || cached < 0 || cached >= (int64_t)impl_->cache.size()) {
+    auto* cached = impl_->cachedAt(impl_->position);
+    if (!cached) {
         const int64_t count = std::min(kRangeBytes, impl_->length - impl_->position);
         int64_t total = -1;
-        const int result = impl_->fetch(impl_->position, count, impl_->cache, total);
+        std::vector<uint8_t> bytes;
+        const int result = impl_->fetch(impl_->position, count, bytes, total);
         if (result < 0) return result;
-        impl_->cachePosition = impl_->position;
+        impl_->cacheBytes(impl_->position, std::move(bytes));
+        cached = impl_->cachedAt(impl_->position);
     }
-    const size_t offset = (size_t)(impl_->position - impl_->cachePosition);
-    const size_t count = std::min<size_t>(requested, impl_->cache.size() - offset);
+    if (!cached) return AVERROR(EIO);
+    const size_t offset = (size_t)(impl_->position - cached->first);
+    const size_t count = std::min<size_t>(requested, cached->bytes.size() - offset);
     if (!count) return AVERROR(EIO);
-    memcpy(destination, impl_->cache.data() + offset, count);
+    memcpy(destination, cached->bytes.data() + offset, count);
     impl_->position += (int64_t)count;
     return (int)count;
 }

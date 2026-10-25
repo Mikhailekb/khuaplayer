@@ -97,6 +97,7 @@ private enum FixtureError: Error { case unavailable }
     func startTorrentPlaybackWindowPolicyIfNeeded() { policyStarts += 1 }
     func refreshPlaylistView() { refreshes += 1 }
     func updateTorrentLoadingForCoreState(_ state: Core.State) {}
+    func recordPlaybackDiagnosticSnapshotIfNeeded() {}
     func start(_ context: SPTorrentPlaybackContext) { torrentContext = context; startTorrentStatusUpdates() }
     func changeContextOnly(_ context: SPTorrentPlaybackContext) { torrentContext = context }
     func prime(_ context: SPTorrentPlaybackContext) {
