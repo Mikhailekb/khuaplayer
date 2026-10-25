@@ -77,6 +77,8 @@ jobs:
         run: |
           ./Scripts/test_brand_migration.sh
           ./Scripts/test_turbo_speed.sh
+          ./Scripts/test_video_click.sh
+          ./Scripts/test_playback_feedback.sh
           ./Scripts/test_playlist_filesystem.sh
           ./Scripts/test_playlist_keyboard.sh
           ./Scripts/test_torrent_models.sh

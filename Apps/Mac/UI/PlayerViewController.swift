@@ -203,6 +203,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var turboTimer: Timer?
     private var turboHUD: SPTurboHUDView?
     private var playbackNotice: SPPlaybackNoticeView?
+    private var playbackFeedback: SPPlaybackFeedbackView?
     private var seekFeedback: SPSeekFeedbackView?
     private var volumeFeedback: SPVolumeFeedbackView?
     private var settingsPanel: SPPlaybackSettingsView?
@@ -431,7 +432,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         playerView.autoresizingMask = []
         playerView.onDoubleClick = { [weak self] in
             guard let self else { return }
-
+            cancelVideoClick()
             showControlsTemporarily()
             perform(.toggleFullscreen)
         }
@@ -444,6 +445,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         playerView.onKeyUp = { [weak self] event in self?.handleKeyUp(event) }
         playerView.onResignFirstResponder = { [weak self] in
             self?.endTurbo(reason: "resignFirstResponder")
+            self?.cancelVideoClick()
         }
         playerView.onScrollWheel = { [weak self] event in
             self?.handlePlaybackScroll(event) ?? false
@@ -715,6 +717,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             self?.stopRepeat()
             self?.endTurbo(reason: "resignKey")
             MainActor.assumeIsolated {
+                self?.cancelVideoClick()
+                self?.playbackFeedback?.dismiss()
                 self?.seekFeedback?.dismiss()
                 self?.volumeFeedback?.dismiss()
                 self?.setSettingsPanelShown(false)
@@ -776,6 +780,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if let overlay = compareOverlay, !overlay.isHidden { layoutCompareOverlay() }
         if let hud = turboHUD, !hud.isHidden { layoutTurboHUD() }
         seekFeedback?.place(in: playerView.frame)
+        playbackFeedback?.place(in: playerView.frame)
         volumeFeedback?.place(in: volumeFeedbackBounds)
         if let notice = playbackNotice, !notice.isHidden { layoutPlaybackNotice() }
 
@@ -1226,27 +1231,34 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         playbackCursor?.setChromeHidden(true)
     }
 
-    private var clickCandidate: (origin: NSPoint, pointer: NSPoint)?
-
+    private var videoClick = SPVideoClickGesture()
+    private var videoClickWork: DispatchWorkItem?
     nonisolated(unsafe) private var clickUpMonitor: Any?
-    private static let clickSlop: CGFloat = 4
 
     private func noteVideoMouseDown(_ event: NSEvent) {
-        clickCandidate = nil
-
-        guard event.type == .leftMouseDown, event.clickCount == 1,
-              !event.modifierFlags.contains(.control),
-              hasMediaSession, let win = view.window else { return }
-        clickCandidate = (win.frame.origin, NSEvent.mouseLocation)
+        cancelVideoClick()
+        guard let win = view.window else { return }
+        videoClick.mouseDown(clickCount: event.clickCount,
+                             eligible: event.type == .leftMouseDown &&
+                                !event.modifierFlags.contains(.control) && hasMediaSession,
+                             windowOrigin: win.frame.origin, pointer: NSEvent.mouseLocation)
         if clickUpMonitor == nil {
-
-            clickUpMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .leftMouseDragged]) { [weak self] ev in
+            clickUpMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown,
+                           .leftMouseUp, .leftMouseDragged]) { [weak self] ev in
                 MainActor.assumeIsolated {
                     guard let self else { return }
-                    if ev.type == .leftMouseDragged {
+                    switch ev.type {
+                    case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+                        // A new press on controls or a context menu also
+                        // supersedes a video click waiting for confirmation.
+                        self.cancelVideoClick()
+                    case .leftMouseDragged:
                         self.cancelClickCandidateIfDragged()
-                    } else {
+                    case .leftMouseUp:
                         self.resolveClickCandidate(ev)
+                    default:
+                        break
                     }
                 }
                 return ev
@@ -1254,30 +1266,36 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
     }
 
+    private func cancelVideoClick() {
+        videoClick.cancel()
+        videoClickWork?.cancel()
+        videoClickWork = nil
+    }
+
     private func cancelClickCandidateIfDragged() {
-        guard let cand = clickCandidate, let win = view.window else { return }
-        let p = NSEvent.mouseLocation
-        if win.frame.origin != cand.origin || hypot(p.x - cand.pointer.x, p.y - cand.pointer.y) > Self.clickSlop {
-            clickCandidate = nil
-        }
+        guard let win = view.window else { cancelVideoClick(); return }
+        videoClick.mouseDragged(windowOrigin: win.frame.origin, pointer: NSEvent.mouseLocation)
     }
 
     private func resolveClickCandidate(_ event: NSEvent) {
-        guard let cand = clickCandidate else { return }
-        clickCandidate = nil
-        guard let win = view.window, event.window === win else { return }
-        let p = NSEvent.mouseLocation
-        let dist = hypot(p.x - cand.pointer.x, p.y - cand.pointer.y)
-        if win.frame.origin != cand.origin || dist > Self.clickSlop {
-            if Self.dbg { NSLog("[Chrome] 松开=拖动 位移=%.1fpt 窗口动=%d", dist, win.frame.origin != cand.origin ? 1 : 0) }
-            return
+        guard let win = view.window,
+              let token = videoClick.mouseUp(sameWindow: event.window === win,
+                                             windowOrigin: win.frame.origin,
+                                             pointer: NSEvent.mouseLocation) else { return }
+        // Waiting for the system interval lets a double click enter full screen
+        // without briefly pausing/resuming the movie on its first release.
+        let work = DispatchWorkItem { [weak self, weak win] in
+            guard let self, self.videoClick.consume(token) else { return }
+            self.videoClickWork = nil
+            guard let win, self.view.window === win, win.isKeyWindow,
+                  win.attachedSheet == nil, self.hasMediaSession,
+                  !self.isSettingsPanelShown, !self.isPlaylistShown,
+                  let state = self.core?.state,
+                  state == .playing || state == .paused || state == .ended else { return }
+            self.perform(.togglePlayback)
         }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if Self.dbg { NSLog("[Chrome] 单击 → %@", self.isControlBarVisible ? "隐藏" : "唤出") }
-            if self.isControlBarVisible { self.dismissControlsNow() } else { self.showControlsTemporarily() }
-        }
+        videoClickWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + NSEvent.doubleClickInterval, execute: work)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -3572,7 +3590,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             view.window?.makeFirstResponder(playerView)
             if !isSettingsPanelShown, settingsDismissMouseButton == nil { removeSettingsEventMonitor() }
         }
-        clickCandidate = nil
+        cancelVideoClick()
         showControlsTemporarily()
         core?.notePausedLayoutChange()
     }
@@ -4218,7 +4236,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func perform(_ requestedCommand: PlayerCommand) {
-
+        cancelVideoClick()
         if turbo.blocksPlaybackControls, SPTurboSpeed.blocksCommand(requestedCommand) { return }
         // A new explicit command supersedes an unfinished trackpad seek.
         if scrollSeekTarget != nil { cancelPlaybackScroll() }
@@ -5221,13 +5239,19 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func togglePlaybackNow() {
+        cancelVideoClick()
         cancelPlaybackScroll()
+        guard let core else { return }
+        let previousState = core.state
+        guard previousState == .playing || previousState == .paused || previousState == .ended else { return }
         // Core.play() turns Ended into an implicit precise seek-to-zero.
-        if core?.state == .ended { yieldDirectoryScanToForegroundIO() }
-        core?.togglePlayPause()
+        if previousState == .ended { yieldDirectoryScanToForegroundIO() }
+        core.togglePlayPause()
+        if hasVideoSession { showPlaybackFeedback(isPlaying: previousState != .playing) }
     }
 
     private func turboSpaceDown() {
+        cancelVideoClick()
         // Restore the pre-gesture state before deciding whether this press can
         // accelerate. A short press toggles playback only when released.
         cancelPlaybackScroll()
@@ -5333,6 +5357,19 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         return hud
     }
 
+    private func showPlaybackFeedback(isPlaying: Bool) {
+        let feedback: SPPlaybackFeedbackView
+        if let existing = playbackFeedback {
+            feedback = existing
+        } else {
+            feedback = SPPlaybackFeedbackView(frame: .zero)
+            view.addSubview(feedback, positioned: .above, relativeTo: playerView)
+            playbackFeedback = feedback
+        }
+        feedback.place(in: playerView.frame)
+        feedback.show(isPlaying: isPlaying)
+    }
+
     private func showSeekFeedback(delta: Double) {
         let feedback: SPSeekFeedbackView
         if let existing = seekFeedback {
@@ -5417,7 +5454,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         stopRepeat()
         isSettingsPanelShown = shown
         chrome?.setSettingsSelected(shown)
-        clickCandidate = nil
+        cancelVideoClick()
         if shown {
             setPlaylistShown(false)
             applyColorAdjust(nil)
@@ -5770,6 +5807,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     @discardableResult
     private func cancelTransientInteractions() -> Bool {
+        cancelVideoClick()
         setSettingsPanelShown(false)
         setPlaylistShown(false)
         settingsDismissMouseButton = nil
@@ -5777,6 +5815,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         // Waiting and skipped-content notices belong to the outgoing session.
         // Closing to the welcome view need not produce another growth callback.
         playbackNotice?.clearAll()
+        playbackFeedback?.dismiss()
         seekFeedback?.dismiss()
         volumeFeedback?.dismiss()
         skipNoticeCount = 0
@@ -5961,6 +6000,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     /// Only PlayerView forwards these events. Scroll views and playback controls
     /// keep their own input, rather than being intercepted by an app-wide monitor.
     private func handlePlaybackScroll(_ event: NSEvent) -> Bool {
+        cancelVideoClick()
         guard hasMediaSession, let core,
               core.state == .playing || core.state == .paused || core.state == .ended,
               !turbo.blocksPlaybackControls,
@@ -6082,6 +6122,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func handlePlaybackMagnify(_ event: NSEvent) -> Bool {
+        cancelVideoClick()
         let mode: SPPlaybackPinchGesture.Mode
         switch SPPlaybackGestureSettings.pinchAction {
         case .resizeWindow: mode = .resizeWindow
