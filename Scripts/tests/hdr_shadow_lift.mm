@@ -54,6 +54,27 @@ RGB reference(const Pixel& pixel, bool edr, double peakNits) {
     return {encode(rgb[0] * gain), encode(rgb[1] * gain), encode(rgb[2] * gain)};
 }
 
+// Independent double-precision reference for the new black-preserving manual
+// controls. This keeps the preset-order test independent from Metal helpers.
+RGB manualReference(RGB rgb, double brightness = .03, double contrast = 1.2) {
+    const double y = rgb[0] * .22897 + rgb[1] * .69174 + rgb[2] * .07929;
+    if (y <= 1e-7 || y >= 1) return rgb;
+    const double floor = 1e-7;
+    const double normalized = (y - floor) / (1 - floor);
+    const double exposure = std::exp2(4 * brightness);
+    const double biased = exposure * normalized / (1 + (exposure - 1) * normalized);
+    const double low = std::pow(biased, contrast);
+    const double high = std::pow(1 - biased, contrast);
+    const double target = floor + (1 - floor) * low / (low + high);
+    double gain = target / y;
+    if (gain > 1) {
+        const double maximum = std::max({rgb[0], rgb[1], rgb[2]});
+        const double ceiling = encode(656.477 / 100);
+        gain = maximum >= ceiling ? 1 : gain / (1 + (gain - 1) * maximum / ceiling);
+    }
+    return {rgb[0] * gain, rgb[1] * gain, rgb[2] * gain};
+}
+
 id<MTLLibrary> compile(id<MTLDevice> device, NSString *source) {
     NSError *error = nil;
     id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
@@ -286,11 +307,12 @@ void fragmentChecks(id<MTLDevice> device, NSString *source, id<MTLLibrary> libra
         RGB motionOnce = reference(motionBase[i], true, 656.477f);
         Pixel twiceInput = {float(once[0]), float(once[1]), float(once[2]), 1};
         RGB twice = reference(twiceInput, true, 656.477f);
-        Pixel manualFirst = base[i];
-        for (int c = 0; c < 3; ++c) manualFirst[c] = (manualFirst[c] + .03f - .5f) * 1.2f + .5f;
+        RGB manualFirstValues = manualReference({base[i][0], base[i][1], base[i][2]});
+        Pixel manualFirst = {float(manualFirstValues[0]), float(manualFirstValues[1]), float(manualFirstValues[2]), 1};
+        const RGB expectedAdjusted = manualReference(once);
         RGB wrongOrder = reference(manualFirst, true, 656.477f);
         for (int c = 0; c < 3; ++c) {
-            const double expectedManual = std::max(0.0, (once[c] + .03 - .5) * 1.2 + .5);
+            const double expectedManual = expectedAdjusted[c];
             maxLiftError = std::max(maxLiftError, std::abs(lifted[i][c] - once[c]));
             maxManualError = std::max(maxManualError, std::abs(adjusted[i][c] - expectedManual));
             maxCaptionError = std::max(maxCaptionError, std::abs(captioned[i][c] - (lifted[i][c] + subtitleP3[c]) * .5));

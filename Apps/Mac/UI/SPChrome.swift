@@ -96,6 +96,7 @@ final class SPIconButton: NSButton {
     private var keyboardFocused = false
     private var accessibilityFocused = false
     var showsSelection = false { didSet { refreshTint() } }
+    var hasInteractionFocus: Bool { keyboardFocused || accessibilityFocused }
     // When nil, the button manages its own hover highlight.
     var onHoverChanged: ((NSButton, Bool) -> Void)?
     var onFocusChanged: ((Bool) -> Void)?
@@ -3104,6 +3105,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     var onVolumeBoostIntent: (() -> Void)?  // Intent to cross the locked boundary.
     var onMute: (() -> Void)?
     var onFullscreen: (() -> Void)?
+    var onPictureInPicture: (() -> Void)?
     var onSettingsToggle: (() -> Void)?
     var onRateSelected: ((Double) -> Void)?
     var onSpeedSettings: (() -> Void)?
@@ -3119,6 +3121,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     private let playBtn = SPPlayPauseButton(size: SPM.btnMain)
     private let muteBtn = SPIconButton(symbol: "speaker.wave.2.fill", pointSize: SPM.symAux, size: SPM.btnAux)
     private let fsBtn = SPIconButton(symbol: "arrow.up.left.and.arrow.down.right", pointSize: SPM.symAux, size: SPM.btnAux)
+    private let pipBtn = SPIconButton(symbol: "pip.enter", pointSize: SPM.symAux, size: SPM.btnAux)
     private let settingsBtn = SPIconButton(symbol: "gearshape", pointSize: SPM.symAux, size: SPM.btnAux)
     private let playlistBtn = SPIconButton(symbol: "list.bullet", pointSize: SPM.symAux, size: SPM.btnAux)
     private let volSlider = SPVolumeControl(frame: .zero)
@@ -3277,6 +3280,22 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         playBtn.target = self; playBtn.action = #selector(playTapped)
         muteBtn.target = self; muteBtn.action = #selector(muteTapped)
         fsBtn.target = self; fsBtn.action = #selector(fsTapped)
+        pipBtn.target = self; pipBtn.action = #selector(pictureInPictureTapped)
+        pipBtn.refusesFirstResponder = false
+        pipBtn.setAccessibilityIdentifier("sp.chrome.pictureInPicture")
+        pipBtn.isEnabled = false
+        pipBtn.alphaValue = 0.4
+        pipBtn.onFocusChanged = { [weak self] focused in
+            guard let self else { return }
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                noAnim { self.pipBtn.layer?.backgroundColor = focused ? SPT.fillHover.cgColor : nil }
+            } else if focused {
+                self.glowMove(to: self.pipBtn)
+            } else {
+                self.glowExit(from: self.pipBtn)
+            }
+        }
+        setPictureInPictureSelected(false)
         settingsBtn.target = self; settingsBtn.action = #selector(settingsTapped)
         setSettingsSelected(false)
         playlistBtn.target = self; playlistBtn.action = #selector(playlistTapped)
@@ -3347,7 +3366,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         // Omitted feature chips never enter the view or layout hierarchy.
         var installedViews: [NSView] = [track, playBtn, volumeGroup]
         if SPFeatures.enhancements { installedViews += [motionBtn] }
-        installedViews += [rateChip, playlistBtn, subtitlesBtn, settingsBtn, fsBtn,
+        installedViews += [rateChip, playlistBtn, subtitlesBtn, settingsBtn, pipBtn, fsBtn,
                            timeLabel, bubble, previewCard]
         for v in installedViews { addSubview(v) }
 
@@ -3386,6 +3405,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         playlistBtn.onHoverChanged = handler
         subtitlesBtn.onHoverChanged = handler
         fsBtn.onHoverChanged = handler
+        pipBtn.onHoverChanged = handler
     }
 
     private func glowSet(_ g: CALayer, frame: CGRect) {
@@ -3667,7 +3687,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         volumeGroup.frame = volumeFrame
         volumeGroup.layoutSubtreeIfNeeded()
         var rx = colX + colW
-        var rightActions: [NSButton] = [fsBtn, settingsBtn, subtitlesBtn]
+        var rightActions: [NSButton] = [fsBtn, pipBtn, settingsBtn, subtitlesBtn]
         if SPFeatures.enhancements { rightActions.append(motionBtn) }
         rightActions.append(playlistBtn)
         motionBtn.setCompact(compact)
@@ -3742,7 +3762,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     var ownsKeyboardFocus: Bool {
-        volumeGroup.hasFocusedControl || timeLabel.hasInteractionFocus || motionBtn.hasInteractionFocus
+        volumeGroup.hasFocusedControl || timeLabel.hasInteractionFocus || motionBtn.hasInteractionFocus || pipBtn.hasInteractionFocus
     }
 
     func settingsButtonRect(in parent: NSView) -> NSRect {
@@ -3769,6 +3789,10 @@ final class SPChromeView: NSView, PlayerChromePresenting {
 
     func render(_ presentation: ChromePresentation) {
         let previous = lastRenderedModel
+        let pipAvailable = presentation.motion.hasMedia &&
+            (presentation.lifecycle == .playing || presentation.lifecycle == .paused || presentation.lifecycle == .ended)
+        pipBtn.isEnabled = pipAvailable
+        pipBtn.alphaValue = pipAvailable ? 1 : 0.4
         if previous == nil || previous?.position != presentation.position ||
            previous?.duration != presentation.duration ||
            previous?.playbackRate != presentation.playbackRate {
@@ -4044,9 +4068,20 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         playlistBtn.setAccessibilityValue(shown ? L("chrome.a11y.on") : L("chrome.a11y.off"))
     }
 
+    func setPictureInPictureSelected(_ selected: Bool) {
+        pipBtn.showsSelection = selected
+        pipBtn.state = selected ? .on : .off
+        pipBtn.setSymbol(selected ? "pip.exit" : "pip.enter", pointSize: SPM.symAux)
+        let label = selected ? L("video.pip.return") : L("video.context.pictureInPicture")
+        pipBtn.toolTip = label
+        pipBtn.setAccessibilityLabel(label)
+        pipBtn.setAccessibilityValue(selected ? L("chrome.a11y.on") : L("chrome.a11y.off"))
+    }
+
     @objc private func playTapped() { onPlayPause?() }
     @objc private func muteTapped() { onMute?() }
     @objc private func fsTapped() { onFullscreen?() }
+    @objc private func pictureInPictureTapped() { onPictureInPicture?() }
     @objc private func settingsTapped() { onSettingsToggle?() }
     @objc private func playlistTapped() { onTogglePlaylist?() }
     @objc private func motionSmoothingTapped() { onMotionSmoothingToggle?() }

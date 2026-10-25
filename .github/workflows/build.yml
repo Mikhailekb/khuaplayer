@@ -73,6 +73,20 @@ jobs:
       - name: Check picture adjustments
         run: ./Scripts/test_color_adjust.sh
 
+      - name: Check picture shader on Metal
+        shell: bash
+        run: |
+          if ./Scripts/test_picture_adjust.sh; then
+            exit 0
+          else
+            status=$?
+            if [ "$status" -eq 77 ]; then
+              echo "Metal device unavailable on this runner; GPU picture checks skipped."
+              exit 0
+            fi
+            exit "$status"
+          fi
+
       - name: Check playback, playlist and torrent models
         run: |
           ./Scripts/test_brand_migration.sh

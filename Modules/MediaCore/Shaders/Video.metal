@@ -271,6 +271,88 @@ float3 sp709ToSource(int gamut, float3 lin) {
     return lin;
 }
 
+// Adjust the displayed, already encoded picture. SDR passthrough keeps its
+// source transfer function; decoding every source as sRGB here would be wrong.
+float3 spPictureLumaWeights(int outputGamut) {
+    const float3 rec709 = float3(0.2126, 0.7152, 0.0722);
+    if (outputGamut == 4) return float3(0.22897, 0.69174, 0.07929);
+    if (outputGamut == 0) return rec709;
+    const float3 weights = float3(dot(spSourceTo709(outputGamut, float3(1, 0, 0)), rec709),
+                                  dot(spSourceTo709(outputGamut, float3(0, 1, 0)), rec709),
+                                  dot(spSourceTo709(outputGamut, float3(0, 0, 1)), rec709));
+    return weights / (weights.r + weights.g + weights.b);
+}
+
+float spPictureTone(float y, float brightness, float contrast, float gamma) {
+    // Fixed black and reference white prevent the gray veil produced by an
+    // additive bias or a straight contrast line through 0.5. Extended HDR
+    // highlights remain above reference white, untouched by these tone curves.
+    if (y <= 0.0 || y >= 1.0) return y;
+    float t = y;
+    if (brightness != 0.0) {
+        const float gain = exp2(clamp(brightness, -0.5, 0.5) * 4.0);
+        t = gain * t / (1.0 + (gain - 1.0) * t);
+    }
+    if (contrast != 1.0) {
+        const float c = clamp(contrast, 0.5, 2.0);
+        const float low = pow(t, c), high = pow(1.0 - t, c);
+        t = low / (low + high);
+    }
+    if (gamma != 1.0) t = pow(t, 1.0 / clamp(gamma, 0.5, 2.0));
+    return t;
+}
+
+float3 spPictureAdjust(float3 encoded, float brightness, float contrast,
+                       float saturation, float gamma, float hue,
+                       int outputGamut, float headroom) {
+    if (brightness == 0.0 && contrast == 1.0 && saturation == 1.0
+        && gamma == 1.0 && hue == 0.0) return encoded;
+    const float3 weights = spPictureLumaWeights(outputGamut);
+    float3 rgb = max(encoded, float3(0.0));
+    const float ceiling = max(1.0, headroom);
+    if (brightness != 0.0 || contrast != 1.0 || gamma != 1.0) {
+        const float y = dot(rgb, weights);
+        // Exact digital black can leave sub-ULP matrix cancellation noise.
+        // Do not turn that numerical residue into visible color at low contrast
+        // and high gamma; it is far below a single supported source code step.
+        const float floor = 1e-7;
+        if (y > floor && y < 1.0) {
+            // Remap the useful interval onto the curve so its lower endpoint
+            // joins the numerical floor continuously during interpolation.
+            const float normalized = (y - floor) / (1.0 - floor);
+            const float target = floor + (1.0 - floor)
+                * spPictureTone(normalized, brightness, contrast, gamma);
+            float gain = target / y;
+            if (gain > 1.0) {
+                const float maximum = max(rgb.r, max(rgb.g, rgb.b));
+                // A shared shoulder preserves RGB ratios and highlight detail
+                // instead of flattening individual channels at the display cap.
+                gain = maximum >= ceiling ? 1.0
+                    : gain / (1.0 + (gain - 1.0) * maximum / ceiling);
+            }
+            rgb *= gain;
+        }
+    }
+    if (hue != 0.0 || saturation != 1.0) {
+        const float y = dot(rgb, weights);
+        const float3 axis = normalize(weights);
+        const float3 chroma = rgb - float3(y);
+        const float angle = hue * 0.017453292519943295f;
+        float3 rotated = chroma * cos(angle) + cross(axis, chroma) * sin(angle);
+        rotated *= clamp(saturation, 0.0, 2.0);
+        // Compress chroma uniformly when a rotation/boost leaves the display
+        // gamut. Channel clipping would change both luma and the requested hue.
+        const float upper = max(ceiling, max(rgb.r, max(rgb.g, rgb.b)));
+        float amount = 1.0;
+        for (int c = 0; c < 3; ++c) {
+            if (rotated[c] < 0.0) amount = min(amount, -y / rotated[c]);
+            else if (rotated[c] > 0.0) amount = min(amount, (upper - y) / rotated[c]);
+        }
+        rgb = float3(y) + rotated * max(0.0, amount);
+    }
+    return rgb;
+}
+
 float spXdrGain(float yEnc, float ratio) {
     float y = clamp(yEnc, 0.0, 1.0);
     float c = y * 255.0;
@@ -642,19 +724,10 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
 
     if (u.uvals[20] != 0.0 || u.uvals[21] != 1.0 || u.uvals[22] != 1.0
         || u.uvals[23] != 1.0 || u.uvals[32] != 0.0) {
-        out += float3(u.uvals[20]);
-        out = (out - 0.5) * u.uvals[21] + 0.5;
-        // Hue rotates chroma around the luma axis (Rodrigues rotation about
-        // the normalized weights). Neutral pixels, luma, and chroma magnitude
-        // are preserved exactly, matching how the other controls behave.
-        const float3 lumaAxis = normalize(float3(0.2126, 0.7152, 0.0722));
-        const float luma = dot(out, float3(0.2126, 0.7152, 0.0722));
-        const float3 chroma = out - float3(luma);
-        const float hueA = u.uvals[32] * 0.017453292519943295f;
-        out = float3(luma) + chroma * cos(hueA)
-            + cross(lumaAxis, chroma) * sin(hueA);
-        out = mix(float3(luma), out, u.uvals[22]);
-        out = pow(max(out, 0.0), float3(1.0 / max(u.uvals[23], 0.1)));
+        const int outputGamut = edrOut ? 4 : (sdrPassthrough ? gamut : 0);
+        const float headroom = edrOut ? oetfSRGB(max(u.uvals[24] / 100.0, 1.0)) : 1.0;
+        out = spPictureAdjust(out, u.uvals[20], u.uvals[21], u.uvals[22],
+                              u.uvals[23], u.uvals[32], outputGamut, headroom);
     }
 
     if ((hasHdr || sdrBoost) && edrOut) {

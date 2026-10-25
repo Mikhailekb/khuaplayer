@@ -1,10 +1,14 @@
 import AppKit
+import QuartzCore
 
-/// An app-managed floating video window using the existing Metal view.
-/// Moving the view preserves the decoder, torrent session and display colors.
+/// The floating window keeps the existing Metal view and decoder. Its controls
+/// send ordinary playback commands back to the owning player.
 @MainActor
 final class SPFloatingVideoController: NSObject, NSWindowDelegate {
     var onTogglePlayback: (() -> Void)?
+    var onSeek: ((Double) -> Void)?
+    var onVolumeChange: ((Double) -> Void)?
+    var onToggleMute: (() -> Void)?
     var onFocusLoss: (() -> Void)?
     var onLayoutChange: (() -> Void)?
     var onDidRestore: (() -> Void)?
@@ -22,7 +26,7 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
     private var originalAutoresizing: NSView.AutoresizingMask = []
     private var aspectRatio: CGFloat = 16 / 9
     private var presentsWindow = true
-    private var playing = false
+    private var playback = SPFloatingVideoPlayback()
     private var closingPanel = false
 
     @discardableResult
@@ -40,29 +44,28 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
         }
         self.aspectRatio = aspectRatio.isFinite && aspectRatio > 0 ? min(4, max(0.25, aspectRatio)) : 16 / 9
         presentsWindow = showWindow
-
-        let screen = sourceWindow?.screen ?? NSScreen.main
-        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        var width = min(420, max(280, visible.width * 0.26))
+        let visible = (sourceWindow?.screen ?? NSScreen.main)?.visibleFrame ??
+            NSRect(x: 0, y: 0, width: 1280, height: 800)
         let maximumHeight = max(180, visible.height * 0.65)
-        if width / self.aspectRatio + SPFloatingVideoContent.controlsHeight > maximumHeight {
-            width = max(160, (maximumHeight - SPFloatingVideoContent.controlsHeight) * self.aspectRatio)
-        }
-        let size = NSSize(width: width, height: width / self.aspectRatio + SPFloatingVideoContent.controlsHeight)
+        let width = min(420, max(280, visible.width * 0.26), maximumHeight * self.aspectRatio)
+        let size = NSSize(width: width, height: width / self.aspectRatio)
         let frame = NSRect(x: max(visible.minX, visible.maxX - size.width - 24),
                            y: visible.minY + 48, width: size.width, height: size.height)
         let panel = SPFloatingVideoPanel(contentRect: frame,
-                                        styleMask: [.borderless, .resizable, .nonactivatingPanel],
-                                        backing: .buffered, defer: false)
+            styleMask: [.borderless, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isMovableByWindowBackground = true
+        panel.acceptsMouseMovedEvents = true
         panel.hasShadow = true
-        panel.backgroundColor = .black
-        panel.contentMinSize = NSSize(width: 160, height: 160 / self.aspectRatio + SPFloatingVideoContent.controlsHeight)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        let minimumWidth = min(280, max(160, maximumHeight * self.aspectRatio))
+        panel.contentMinSize = NSSize(width: minimumWidth, height: minimumWidth / self.aspectRatio)
+        panel.contentAspectRatio = NSSize(width: self.aspectRatio, height: 1)
         panel.delegate = self
         panel.title = sourceWindow?.title ?? ""
         panel.setAccessibilityIdentifier("sp.floatingVideoWindow")
@@ -70,6 +73,9 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
 
         let content = SPFloatingVideoContent(frame: NSRect(origin: .zero, size: size))
         content.onTogglePlayback = { [weak self] in self?.onTogglePlayback?() }
+        content.onSeek = { [weak self] in self?.onSeek?($0) }
+        content.onVolumeChange = { [weak self] in self?.onVolumeChange?($0) }
+        content.onToggleMute = { [weak self] in self?.onToggleMute?() }
         content.onReturn = { [weak self] in self?.returnToPlayer() }
         content.onClose = { [weak self] in self?.returnToPlayer() }
         self.content = content
@@ -77,7 +83,7 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
         videoView.autoresizingMask = []
         content.attach(videoView)
         panel.contentView = content
-        content.update(isPlaying: playing)
+        content.update(playback)
         content.layoutSubtreeIfNeeded()
         if showWindow { panel.orderFront(nil) }
         onLayoutChange?()
@@ -92,6 +98,7 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
         let parent = originalParent
         let next = originalNextSibling
         panel.delegate = nil
+        content?.cancelPendingHide()
         video?.removeFromSuperview()
         if let video, let parent {
             if let next, next.superview === parent {
@@ -114,8 +121,15 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
     }
 
     func update(isPlaying: Bool) {
-        playing = isPlaying
-        content?.update(isPlaying: isPlaying)
+        playback.isPlaying = isPlaying
+        content?.update(playback)
+    }
+
+    func update(isPlaying: Bool, position: Double, duration: Double,
+                volumePercent: Double, muted: Bool) {
+        playback = SPFloatingVideoPlayback(isPlaying: isPlaying, position: position,
+            duration: duration, volumePercent: volumePercent, muted: muted)
+        content?.update(playback)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -136,20 +150,15 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
         onLayoutChange?()
     }
 
-    func windowDidChangeScreen(_ notification: Notification) {
-        onLayoutChange?()
-    }
+    func windowDidChangeScreen(_ notification: Notification) { onLayoutChange?() }
 
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
         let previous = sender.contentView?.bounds.size ?? .zero
         var proposed = sender.contentRect(forFrameRect: NSRect(origin: .zero, size: frameSize)).size
         let vertical = abs(proposed.height - previous.height) > abs(proposed.width - previous.width)
-        if vertical {
-            proposed.width = max(160, (proposed.height - SPFloatingVideoContent.controlsHeight) * aspectRatio)
-        } else {
-            proposed.width = max(160, proposed.width)
-        }
-        proposed.height = proposed.width / aspectRatio + SPFloatingVideoContent.controlsHeight
+        let minimumWidth = sender.contentMinSize.width
+        proposed.width = max(minimumWidth, vertical ? proposed.height * aspectRatio : proposed.width)
+        proposed.height = proposed.width / aspectRatio
         return sender.frameRect(forContentRect: NSRect(origin: .zero, size: proposed)).size
     }
 
@@ -164,6 +173,14 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
     }
 }
 
+private struct SPFloatingVideoPlayback {
+    var isPlaying = false
+    var position: Double = 0
+    var duration: Double = 0
+    var volumePercent: Double = 100
+    var muted = false
+}
+
 @MainActor
 private final class SPFloatingVideoPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -172,72 +189,239 @@ private final class SPFloatingVideoPanel: NSPanel {
 
 @MainActor
 private final class SPFloatingVideoContent: NSView {
-    static let controlsHeight: CGFloat = 32
     var onTogglePlayback: (() -> Void)?
+    var onSeek: ((Double) -> Void)?
+    var onVolumeChange: ((Double) -> Void)?
+    var onToggleMute: (() -> Void)?
     var onReturn: (() -> Void)?
     var onClose: (() -> Void)?
     private weak var video: NSView?
+    private let controls = SPFloatingVideoControls()
     private let playPause = NSButton()
     private let returnButton = NSButton()
     private let closeButton = NSButton()
+    private let muteButton = NSButton()
+    private let volume = SPFloatingVideoSlider(value: 100, minValue: 0, maxValue: 100, target: nil, action: nil)
+    private let timeline = SPFloatingVideoSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let currentTime = NSTextField(labelWithString: "0:00")
+    private let totalTime = NSTextField(labelWithString: "0:00")
     private let dragArea = SPFloatingVideoDragArea()
+    private var playback = SPFloatingVideoPlayback()
+    private var hovered = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
+        layer?.cornerRadius = 10
+        layer?.masksToBounds = true
         configure(playPause, symbol: "play.fill", title: L("video.pip.playPause"),
-                  identifier: "sp.floatingVideo.playPause", action: #selector(togglePlayback))
+                  identifier: "sp.floatingVideo.playPause", action: #selector(togglePlayback), pointSize: 34)
         configure(returnButton, symbol: "pip.exit", title: L("video.pip.return"),
                   identifier: "sp.floatingVideo.return", action: #selector(returnVideo))
         configure(closeButton, symbol: "xmark", title: L("video.pip.close"),
                   identifier: "sp.floatingVideo.close", action: #selector(closeVideo))
+        configure(muteButton, symbol: "speaker.wave.2", title: L("settings.mute"),
+                  identifier: "sp.floatingVideo.mute", action: #selector(toggleMute))
+        volume.target = self
+        volume.action = #selector(changeVolume)
+        volume.isContinuous = true
+        volume.setAccessibilityIdentifier("sp.floatingVideo.volume")
+        volume.setAccessibilityLabel(L("chrome.volume.a11y.label"))
+        timeline.target = self
+        timeline.action = #selector(seek)
+        timeline.isContinuous = false
+        timeline.setAccessibilityIdentifier("sp.floatingVideo.timeline")
+        timeline.setAccessibilityLabel(L("video.pip.seek"))
+        timeline.onTrackingChange = { [weak self] _ in
+            guard let self else { return }
+            self.updateControlsVisibility()
+        }
+        volume.onTrackingChange = timeline.onTrackingChange
+        for slider in [volume, timeline] { controls.addSubview(slider) }
+        for (label, identifier) in [(currentTime, "sp.floatingVideo.currentTime"), (totalTime, "sp.floatingVideo.totalTime")] {
+            label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
+            label.textColor = .white
+            label.isSelectable = false
+            label.setAccessibilityIdentifier(identifier)
+            controls.addSubview(label)
+        }
+        totalTime.alignment = .right
         addSubview(dragArea)
+        addSubview(controls)
+        controls.receivesInput = false
+        controls.alphaValue = 0
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var mouseDownCanMoveWindow: Bool { true }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: .zero,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved], owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true; updateControlsVisibility() }
+    override func mouseMoved(with event: NSEvent) { hovered = true; updateControlsVisibility() }
+    override func mouseExited(with event: NSEvent) { hovered = false; updateControlsVisibility() }
+
     func attach(_ view: NSView) {
         video = view
-        addSubview(view, positioned: .below, relativeTo: playPause)
+        addSubview(view, positioned: .below, relativeTo: dragArea)
         needsLayout = true
     }
 
-    func update(isPlaying: Bool) {
-        playPause.image = NSImage(systemSymbolName: isPlaying ? "pause.fill" : "play.fill",
-                                  accessibilityDescription: L("video.pip.playPause"))
+    func update(_ value: SPFloatingVideoPlayback) {
+        playback = value
+        let duration = value.duration.isFinite && value.duration > 0 ? value.duration : 0
+        if !timeline.isTracking {
+            timeline.maxValue = duration > 0 ? duration : 1
+            timeline.doubleValue = value.position.isFinite ? min(duration, max(0, value.position)) : 0
+        }
+        timeline.isEnabled = duration > 0
+        currentTime.stringValue = Self.clock(timeline.doubleValue)
+        totalTime.stringValue = Self.clock(duration)
+        if !volume.isTracking {
+            volume.doubleValue = value.volumePercent.isFinite ? min(100, max(0, value.volumePercent)) : 100
+        }
+        muteButton.image = NSImage(systemSymbolName: value.muted || volume.doubleValue == 0 ? "speaker.slash" : "speaker.wave.2",
+                                   accessibilityDescription: L("settings.mute"))
+        playPause.image = NSImage(systemSymbolName: value.isPlaying ? "pause.fill" : "play.fill",
+                                  accessibilityDescription: L("video.pip.playPause"))?
+            .withSymbolConfiguration(.init(pointSize: 34, weight: .regular))
+        updateControlsVisibility()
     }
 
     override func layout() {
         super.layout()
-        video?.frame = NSRect(x: 0, y: Self.controlsHeight, width: bounds.width,
-                              height: max(0, bounds.height - Self.controlsHeight))
-        playPause.frame = NSRect(x: bounds.midX - 16, y: 0, width: 32, height: 32)
-        returnButton.frame = NSRect(x: 8, y: 0, width: 32, height: 32)
-        closeButton.frame = NSRect(x: max(0, bounds.width - 40), y: 0, width: 32, height: 32)
-        dragArea.frame = NSRect(x: 0, y: max(Self.controlsHeight, bounds.height - 18),
-                                width: bounds.width, height: min(18, max(0, bounds.height - Self.controlsHeight)))
+        video?.frame = bounds
+        controls.frame = bounds
+        let top = max(0, bounds.height - 38)
+        closeButton.frame = NSRect(x: 6, y: top, width: 32, height: 32)
+        returnButton.frame = NSRect(x: 40, y: top, width: 32, height: 32)
+        let volumeWidth = min(100, max(60, bounds.width * 0.23))
+        volume.frame = NSRect(x: bounds.width - volumeWidth - 12, y: top + 6, width: volumeWidth, height: 20)
+        muteButton.frame = NSRect(x: volume.frame.minX - 36, y: top, width: 32, height: 32)
+        playPause.frame = NSRect(x: bounds.midX - 30, y: bounds.midY - 30, width: 60, height: 60)
+        currentTime.frame = NSRect(x: 12, y: 22, width: max(55, bounds.width / 2 - 20), height: 20)
+        totalTime.frame = NSRect(x: bounds.midX, y: 22, width: max(55, bounds.width / 2 - 12), height: 20)
+        timeline.frame = NSRect(x: 10, y: 4, width: max(0, bounds.width - 20), height: 20)
+        dragArea.frame = NSRect(x: 0, y: max(0, bounds.height - 26), width: bounds.width, height: 26)
+        controls.needsLayout = true
+    }
+
+    func cancelPendingHide() {
+        controls.layer?.removeAllAnimations()
+    }
+
+    private func updateControlsVisibility() {
+        setControlsVisible(hovered || timeline.isTracking || volume.isTracking)
+    }
+
+    private func setControlsVisible(_ visible: Bool) {
+        guard controls.receivesInput != visible || controls.alphaValue != (visible ? 1 : 0) else { return }
+        controls.receivesInput = visible
+        controls.layer?.removeAllAnimations()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.15
+            controls.animator().alphaValue = visible ? 1 : 0
+        }
     }
 
     private func configure(_ button: NSButton, symbol: String, title: String,
-                           identifier: String, action: Selector) {
+                           identifier: String, action: Selector, pointSize: CGFloat = 20) {
         button.bezelStyle = .inline
         button.isBordered = false
         button.imagePosition = .imageOnly
         button.contentTintColor = .white
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(.init(pointSize: pointSize, weight: .regular))
         button.toolTip = title
         button.setAccessibilityLabel(title)
         button.setAccessibilityIdentifier(identifier)
         button.target = self
         button.action = action
-        addSubview(button)
+        controls.addSubview(button)
+    }
+
+    private static func clock(_ value: Double) -> String {
+        let seconds = value.isFinite ? max(0, Int(min(Double(Int.max / 2), value))) : 0
+        if seconds >= 3600 { return String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60) }
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 
     @objc private func togglePlayback() { onTogglePlayback?() }
     @objc private func returnVideo() { onReturn?() }
     @objc private func closeVideo() { onClose?() }
+    @objc private func toggleMute() { onToggleMute?() }
+    @objc private func changeVolume() { onVolumeChange?(volume.doubleValue) }
+    @objc private func seek() {
+        guard timeline.isEnabled else { return }
+        currentTime.stringValue = Self.clock(timeline.doubleValue)
+        onSeek?(timeline.doubleValue)
+    }
+}
+
+@MainActor
+private final class SPFloatingVideoControls: NSView {
+    var receivesInput = true
+    private let shade = CAGradientLayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        shade.colors = [NSColor.black.withAlphaComponent(0.45).cgColor, NSColor.clear.cgColor,
+                        NSColor.clear.cgColor, NSColor.black.withAlphaComponent(0.5).cgColor]
+        shade.locations = [0, 0.25, 0.65, 1]
+        shade.startPoint = CGPoint(x: 0.5, y: 1)
+        shade.endPoint = CGPoint(x: 0.5, y: 0)
+        layer?.addSublayer(shade)
+        setAccessibilityIdentifier("sp.floatingVideo.controls")
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func layout() { super.layout(); shade.frame = bounds }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard receivesInput, let hit = super.hitTest(point), hit is NSControl, !(hit is NSTextField) else { return nil }
+        return hit
+    }
+}
+
+@MainActor
+final class SPFloatingVideoSlider: NSSlider {
+    var isTracking = false
+    var onTrackingChange: ((Bool) -> Void)?
+
+    override init(frame: NSRect) { super.init(frame: frame); cell = SPFloatingVideoSliderCell() }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var mouseDownCanMoveWindow: Bool { false }
+    func beginTracking() { isTracking = true; onTrackingChange?(true) }
+    func endTracking() { isTracking = false; onTrackingChange?(false) }
+    override func mouseDown(with event: NSEvent) {
+        beginTracking()
+        defer { endTracking() }
+        super.mouseDown(with: event)
+    }
+}
+
+@MainActor
+private final class SPFloatingVideoSliderCell: NSSliderCell {
+    override func drawBar(inside rect: NSRect, flipped: Bool) {
+        let track = NSRect(x: rect.minX, y: rect.midY - 1.5, width: rect.width, height: 3)
+        NSColor.white.withAlphaComponent(0.35).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
+        let fraction = maxValue > minValue ? min(1, max(0, (doubleValue - minValue) / (maxValue - minValue))) : 0
+        NSColor.white.setFill()
+        NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY,
+            width: track.width * fraction, height: track.height), xRadius: 1.5, yRadius: 1.5).fill()
+    }
+    override func drawKnob(_ rect: NSRect) {
+        let knob = NSRect(x: rect.midX - 3.5, y: rect.midY - 3.5, width: 7, height: 7)
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: knob).fill()
+    }
 }
 
 @MainActor

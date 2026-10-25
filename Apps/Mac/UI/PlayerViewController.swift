@@ -907,6 +907,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         c.onVolumeBoostIntent = { [weak self] in self?.handleVolumeBoostIntent() }
         c.onMute = { [weak self] in self?.perform(.toggleMute) }
         c.onFullscreen = { [weak self] in self?.perform(.toggleFullscreen) }
+        c.onPictureInPicture = { [weak self] in self?.videoPictureInPictureAction(NSMenuItem()) }
+        c.setPictureInPictureSelected(floatingVideo.isActive)
         c.onSettingsToggle = { [weak self] in self?.togglePlaybackSettingsAction(nil) }
         c.setSettingsSelected(isSettingsPanelShown)
         c.onTogglePlaylist = { [weak self] in self?.togglePlaylistAction(nil) }
@@ -1361,6 +1363,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func makeFloatingVideoController() -> SPFloatingVideoController {
         let controller = SPFloatingVideoController()
         controller.onTogglePlayback = { [weak self] in self?.perform(.togglePlayback) }
+        controller.onSeek = { [weak self] seconds in self?.perform(.seekAbsolute(seconds)) }
+        controller.onVolumeChange = { [weak self] percent in self?.perform(.setVolumePercent(percent)) }
+        controller.onToggleMute = { [weak self] in self?.perform(.toggleMute) }
         controller.onFocusLoss = { [weak self] in
             guard let self else { return }
             self.stopRepeat()
@@ -1383,6 +1388,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         controller.onDidRestore = { [weak self] in
             guard let self else { return }
+            self.chrome?.setPictureInPictureSelected(false)
             self.layoutPlaybackSettings()
             self.relocateVideoOverlays()
             self.core?.setWindowVisibleForRendering(self.view.window?.occlusionState.contains(.visible) == true)
@@ -1409,7 +1415,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if currentCropTag > 0 { aspect = CGFloat(currentCropTag) / 100 }
         if abs(currentRotation) % 180 == 90 { aspect = 1 / aspect }
         if floatingVideo.present(videoView: playerView, aspectRatio: aspect, sourceWindow: view.window) {
-            floatingVideo.update(isPlaying: core?.state == .playing)
+            chrome?.setPictureInPictureSelected(true)
+            updateFloatingVideoPresentation()
             playbackCursor?.setChromeHidden(false)
             core?.setWindowVisibleForRendering(true)
         }
@@ -3874,7 +3881,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             installPendingChromeSoon()
         }
         playbackSleep.update(isPlaying: state == .playing, hasVideo: hasVideoSession)
-        floatingVideo.update(isPlaying: state == .playing)
+        updateFloatingVideoPresentation()
         playbackCursor?.setHasVideo(hasVideoSession)
         WindowDragEffect.applyTestHookIfNeeded(core: core, state: state, view: playerView)
 
@@ -4045,6 +4052,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     func playerCore(_ core: SPPlayerCore, didUpdatePosition position: Double, duration: Double) {
+        updateFloatingVideoPresentation()
         captionsAttachIfNeeded()
         captionsAutomationHookIfNeeded()
         // First-frame presentation publishes a position edge. This makes the
@@ -4529,11 +4537,19 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func publishVolumePresentation() {
         guard let core else { return }
+        updateFloatingVideoPresentation()
         transitionPresentation(.volumeChanged(
             percent: Double(core.volume) * 100,
             muted: core.isMuted,
             boost: currentVolumeBoostPresentation
         ))
+    }
+
+    private func updateFloatingVideoPresentation() {
+        guard floatingVideo.isActive, let core else { return }
+        floatingVideo.update(isPlaying: core.state == .playing, position: core.position,
+                             duration: core.duration, volumePercent: Double(core.volume) * 100,
+                             muted: core.isMuted)
     }
 
     private var currentVolumeBoostPresentation: VolumeBoostPresentation {

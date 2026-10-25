@@ -53530,6 +53530,113 @@
           }
         }
       }
+    },
+    "video.pip.seek": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wiedergabeposition"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seek"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Posición de reproducción"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Position de lecture"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Posisi pemutaran"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Posizione di riproduzione"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "再生位置"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "재생 위치"
+          }
+        },
+        "nl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Afspeelpositie"
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pozycja odtwarzania"
+          }
+        },
+        "pt": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Posição de reprodução"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Перемотка"
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ตำแหน่งการเล่น"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Oynatma konumu"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vị trí phát"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "播放位置"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "播放位置"
+          }
+        }
+      }
     }
   },
   "version": "1.0"
