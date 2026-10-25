@@ -29,16 +29,19 @@ struct VideoClickGestureChecks {
         expect(up(&gesture) == nil, "A release without a video press does nothing")
         down(&gesture)
         let first = up(&gesture)
-        expect(first != nil, "An ordinary video click requests deferred confirmation")
-        expect(up(&gesture) == nil, "Monitor and responder release delivery cannot schedule twice")
-        expect(gesture.consume(first!), "The single click commits after its confirmation delay")
-        expect(!gesture.consume(first!), "A scheduled callback is idempotent")
+        expect(first != nil, "An ordinary video click is available on release")
+        expect(gesture.consume(first!), "The release commits synchronously without a timer or another input")
+        expect(up(&gesture) == nil, "Monitor and responder release delivery cannot toggle twice")
+        expect(!gesture.consume(first!), "The same release cannot be consumed twice")
 
         down(&gesture)
         let beforeDouble = up(&gesture)!
+        var toggles = gesture.consume(beforeDouble) ? 1 : 0
+        expect(toggles == 1, "The first click acts immediately even when a double click will follow")
         down(&gesture, count: 2)
-        expect(!gesture.consume(beforeDouble), "The second press cancels the first click before fullscreen")
-        expect(up(&gesture) == nil, "A double click never creates a playback toggle")
+        if let token = up(&gesture), gesture.consume(token) { toggles += 1 }
+        expect(toggles == 1, "The second click enters fullscreen without adding another playback toggle")
+        expect(!gesture.consume(beforeDouble), "Fullscreen does not replay or roll back the completed first click")
         down(&gesture, count: 3)
         expect(up(&gesture) == nil, "A triple click does not leave an extra playback action")
 
@@ -65,7 +68,7 @@ struct VideoClickGestureChecks {
         down(&gesture)
         let cancelled = up(&gesture)!
         gesture.cancel()
-        expect(!gesture.consume(cancelled), "Session, focus, panel and gesture cancellation invalidate delayed work")
+        expect(!gesture.consume(cancelled), "Session, focus, panel and gesture cancellation invalidate an unconsumed release")
         down(&gesture)
         gesture.cancel()
         expect(up(&gesture) == nil, "Cancellation also removes an unfinished press")
@@ -74,12 +77,12 @@ struct VideoClickGestureChecks {
         let superseded = up(&gesture)!
         down(&gesture)
         let current = up(&gesture)!
-        expect(!gesture.consume(superseded), "Old delayed work cannot consume a newer click")
+        expect(!gesture.consume(superseded), "An old release cannot consume a newer click")
         expect(gesture.consume(current), "Only the current click can commit")
         down(&gesture)
         let supersededByControl = up(&gesture)!
         down(&gesture, eligible: false)
-        expect(!gesture.consume(supersededByControl), "A new control press cancels pending surface playback")
+        expect(!gesture.consume(supersededByControl), "A new control press cancels an unconsumed surface release")
         expect(up(&gesture) == nil, "The control release does not inherit the earlier video press")
         print("Video click gesture checks passed (\(checks) assertions).")
     }

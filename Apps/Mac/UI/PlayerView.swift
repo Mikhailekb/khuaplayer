@@ -14,6 +14,7 @@ final class PlayerView: NSView {
     var onResignFirstResponder: (() -> Void)?
     var onScrollWheel: ((NSEvent) -> Bool)?
     var onMagnify: ((NSEvent) -> Bool)?
+    var onContextMenu: ((NSEvent) -> NSMenu?)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -52,6 +53,10 @@ final class PlayerView: NSView {
     override func draw(_ dirtyRect: NSRect) {}
 
     override func mouseDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.control) {
+            showContextMenu(with: event)
+            return
+        }
         onMouseDown?(event)
         if event.clickCount == 2 {
             onDoubleClick?()
@@ -60,6 +65,15 @@ final class PlayerView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         onMouseUp?(event)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? { onContextMenu?(event) }
+
+    override func rightMouseDown(with event: NSEvent) { showContextMenu(with: event) }
+
+    private func showContextMenu(with event: NSEvent) {
+        guard let menu = menu(for: event) else { return }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
     override func keyDown(with event: NSEvent) {

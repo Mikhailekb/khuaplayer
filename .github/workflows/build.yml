@@ -79,6 +79,9 @@ jobs:
           ./Scripts/test_turbo_speed.sh
           ./Scripts/test_video_click.sh
           ./Scripts/test_playback_feedback.sh
+          ./Scripts/test_video_context_menu.sh
+          ./Scripts/test_video_context_policy.sh
+          ./Scripts/test_floating_video.sh
           ./Scripts/test_playlist_filesystem.sh
           ./Scripts/test_playlist_keyboard.sh
           ./Scripts/test_torrent_models.sh

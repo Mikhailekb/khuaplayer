@@ -1,8 +1,8 @@
 import Foundation
 import CoreGraphics
 
-/// A surface click is committed only after AppKit's double-click interval.
-/// Tokens prevent a delayed release from crossing another input or session.
+/// A surface click is available immediately when the pointer is released.
+/// Tokens let the event monitor and responder consume that release only once.
 struct SPVideoClickGesture {
     typealias Token = UInt64
     static let movementTolerance: CGFloat = 4

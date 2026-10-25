@@ -22,6 +22,16 @@ struct PlaybackFeedbackChecks {
         bezel(view).sublayers!.first { $0.name == "sp.playback.feedback.glyph" }! as! CAShapeLayer
     }
 
+    static func isLinear(_ animation: CAAnimation) -> Bool {
+        guard let timing = animation.timingFunction else { return false }
+        var point: [Float] = [0, 0]
+        for index in [1, 2] {
+            timing.getControlPoint(at: index, values: &point)
+            if abs(point[0] - point[1]) > 0.001 { return false }
+        }
+        return true
+    }
+
     static func render(_ view: SPPlaybackFeedbackView, to path: String) {
         // Render only our detached component, never the user's windows/screen.
         let size = CGSize(width: 320, height: 240)
@@ -35,6 +45,31 @@ struct PlaybackFeedbackChecks {
         view.layer!.render(in: context)
         let bitmap = NSBitmapImageRep(cgImage: context.makeImage()!)
         try! bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+    }
+
+    static func renderSample(_ view: SPPlaybackFeedbackView, fraction: Double, to path: String) {
+        // Sample the detached component's linear animation values; no display,
+        // player window or screen capture is involved.
+        let disk = bezel(view)
+        let icon = glyph(view)
+        let fade = disk.animation(forKey: "playbackFade") as! CABasicAnimation
+        let grow = icon.animation(forKey: "playbackGlyphGrow") as! CABasicAnimation
+        let from = (grow.fromValue as! NSNumber).doubleValue
+        let to = (grow.toValue as! NSNumber).doubleValue
+        let scale = from + (to - from) * fraction
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        disk.opacity = Float(1 - fraction)
+        icon.transform = CATransform3DMakeScale(scale, scale, 1)
+        CATransaction.commit()
+        check(CATransform3DIsIdentity(disk.transform), "The sampled backdrop never expands")
+        check(icon.position == CGPoint(x: disk.bounds.midX, y: disk.bounds.midY),
+              "The sampled glyph stays centered during interpolation")
+        check(fade.fromValue as? Int == 1 && fade.toValue as? Int == 0,
+              "The sampled opacity follows the component's full uniform fade")
+        render(view, to: path)
+        disk.opacity = 1
+        icon.transform = CATransform3DIdentity
     }
 
     static func main() {
@@ -51,11 +86,18 @@ struct PlaybackFeedbackChecks {
         check(!play.contains(CGPoint(x: 48, y: 49)), "Play triangle leaves its upper-right exterior clear")
         check(bezel(view).cornerRadius * 2 == bezel(view).bounds.width, "Backdrop remains circular")
         check(abs(bezel(view).backgroundColor!.alpha - 0.55) < 0.001, "Backdrop remains translucent")
-        check(bezel(view).animation(forKey: "playbackGrow") != nil, "Normal motion grows the bezel")
-        check(bezel(view).animation(forKey: "playbackFade")?.duration == 0.5, "Feedback has one short fade")
-        let fade = bezel(view).animation(forKey: "playbackFade") as! CAKeyframeAnimation
-        check(fade.values?.last as? Int == 0 && fade.fillMode == .forwards && !fade.isRemovedOnCompletion,
+        check(bezel(view).animationKeys() == ["playbackFade"], "The circular backdrop never grows or pulses")
+        check(bezel(view).animation(forKey: "playbackFade")?.duration == 0.35, "Feedback has one short fade")
+        let fade = bezel(view).animation(forKey: "playbackFade") as! CABasicAnimation
+        check(fade.toValue as? Int == 0 && fade.fillMode == .forwards && !fade.isRemovedOnCompletion,
               "The terminal transparent frame persists even when cleanup is delayed")
+        check(isLinear(fade), "Opacity fades uniformly without a hold or spring")
+        let grow = glyph(view).animation(forKey: "playbackGlyphGrow") as! CABasicAnimation
+        check(grow.fromValue as? Double == 1 && grow.toValue as? Double == 1.12 && isLinear(grow),
+              "Only the white glyph has a subtle linear growth")
+        check(glyph(view).anchorPoint == CGPoint(x: 0.5, y: 0.5) &&
+              glyph(view).position == CGPoint(x: bezel(view).bounds.midX, y: bezel(view).bounds.midY),
+              "Glyph interpolation stays anchored at the backdrop center")
 
         runLoop(0.3)
         view.show(isPlaying: false)
@@ -69,21 +111,24 @@ struct PlaybackFeedbackChecks {
         runLoop(0.3)
         check(view.isHidden && view.displayedPlaying == nil, "The latest animation hides after completion")
         check(bezel(view).animationKeys()?.isEmpty ?? true, "Finished feedback leaves no animations running")
+        check(glyph(view).animationKeys()?.isEmpty ?? true, "Finished feedback clears its glyph animation")
 
         view.show(isPlaying: true)
         view.dismiss()
         runLoop(0.1)
         view.show(isPlaying: false)
-        runLoop(0.42)
+        runLoop(0.28)
         check(!view.isHidden, "A dismissed session cannot hide the next session's feedback")
         view.dismiss()
         check(view.isHidden && view.displayedPlaying == nil, "Dismiss clears presentation state")
         check(bezel(view).animationKeys()?.isEmpty ?? true, "Dismiss removes animations")
+        check(glyph(view).animationKeys()?.isEmpty ?? true, "Dismiss clears glyph motion")
 
         let reduced = SPPlaybackFeedbackView(frame: .zero, reducedMotion: { true })
         reduced.place(in: CGRect(x: 0, y: 0, width: 320, height: 240))
         reduced.show(isPlaying: true)
-        check(bezel(reduced).animation(forKey: "playbackGrow") == nil, "Reduced Motion never scales the icon")
+        check(bezel(reduced).animationKeys() == ["playbackFade"] && (glyph(reduced).animationKeys()?.isEmpty ?? true),
+              "Reduced Motion never scales the backdrop or icon")
         check(bezel(reduced).animation(forKey: "playbackFade")?.duration == 0.25, "Reduced Motion uses a short fade")
         runLoop(0.3)
         check(reduced.isHidden, "Reduced Motion also completes without a timer loop")
@@ -96,6 +141,10 @@ struct PlaybackFeedbackChecks {
             render(view, to: output.appendingPathComponent("playback-resume.png").path)
             view.show(isPlaying: false)
             render(view, to: output.appendingPathComponent("playback-pause.png").path)
+            renderSample(view, fraction: 0.5,
+                         to: output.appendingPathComponent("playback-pause-mid.png").path)
+            renderSample(view, fraction: 0.8,
+                         to: output.appendingPathComponent("playback-pause-late.png").path)
             view.dismiss()
             print("Rendered detached component states: \(output.path)")
         }

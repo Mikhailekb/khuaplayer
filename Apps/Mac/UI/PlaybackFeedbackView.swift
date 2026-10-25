@@ -6,7 +6,7 @@ final class SPPlaybackFeedbackView: NSView {
     private enum G {
         static let canvas: CGFloat = 160
         static let diameter: CGFloat = 72
-        static let duration: TimeInterval = 0.5
+        static let duration: TimeInterval = 0.35
         static let reducedDuration: TimeInterval = 0.25
     }
 
@@ -66,15 +66,15 @@ final class SPPlaybackFeedbackView: NSView {
 
     override func layout() {
         super.layout()
-        // The transparent canvas contains the entire growing circle, so its
-        // animation never relies on drawing outside an NSView's bounds.
+        // The backdrop stays fixed; only the white glyph has a subtle motion.
         let diameter = min(G.diameter, min(bounds.width, bounds.height) * 0.45)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         bezel.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
         bezel.position = CGPoint(x: bounds.midX, y: bounds.midY)
         bezel.cornerRadius = diameter / 2
-        glyph.frame = bezel.bounds
+        glyph.bounds = bezel.bounds
+        glyph.position = CGPoint(x: diameter / 2, y: diameter / 2)
         glyph.path = makeGlyph(isPlaying: displayedPlaying ?? true, diameter: diameter)
         CATransaction.commit()
     }
@@ -85,17 +85,20 @@ final class SPPlaybackFeedbackView: NSView {
         displayedPlaying = isPlaying
         isHidden = false
         bezel.removeAllAnimations()
+        glyph.removeAllAnimations()
         bezel.opacity = 1
         bezel.transform = CATransform3DIdentity
+        glyph.transform = CATransform3DIdentity
         needsLayout = true
         layoutSubtreeIfNeeded()
 
         let reduce = reducedMotion()
         let duration = reduce ? G.reducedDuration : G.duration
-        let fade = CAKeyframeAnimation(keyPath: "opacity")
-        fade.values = [1, 1, 0]
-        fade.keyTimes = [0, 0.15, 1]
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1
+        fade.toValue = 0
         fade.duration = duration
+        fade.timingFunction = CAMediaTimingFunction(name: .linear)
         // Stay transparent if the main queue is busy when cleanup is due.
         fade.fillMode = .forwards
         fade.isRemovedOnCompletion = false
@@ -103,18 +106,19 @@ final class SPPlaybackFeedbackView: NSView {
         if !reduce {
             let grow = CABasicAnimation(keyPath: "transform.scale")
             grow.fromValue = 1
-            grow.toValue = 1.8
+            grow.toValue = 1.12
             grow.duration = duration
             grow.fillMode = .forwards
             grow.isRemovedOnCompletion = false
-            grow.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            bezel.add(grow, forKey: "playbackGrow")
+            grow.timingFunction = CAMediaTimingFunction(name: .linear)
+            glyph.add(grow, forKey: "playbackGlyphGrow")
         }
 
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.generation == currentGeneration else { return }
             self.hideWork = nil
             self.bezel.removeAllAnimations()
+            self.glyph.removeAllAnimations()
             self.displayedPlaying = nil
             self.isHidden = true
         }
@@ -125,8 +129,10 @@ final class SPPlaybackFeedbackView: NSView {
     func dismiss() {
         cancelPendingHide()
         bezel.removeAllAnimations()
+        glyph.removeAllAnimations()
         bezel.opacity = 1
         bezel.transform = CATransform3DIdentity
+        glyph.transform = CATransform3DIdentity
         displayedPlaying = nil
         isHidden = true
     }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Check video single/double-click arbitration without launching the player.
+# Check immediate video clicks and double-click arbitration without launching the player.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CHECK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kinolet-video-click.XXXXXX")"

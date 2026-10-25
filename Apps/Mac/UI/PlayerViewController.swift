@@ -96,7 +96,7 @@ private final class LegacyChromeAdapter: PlayerChromePresenting {
     func cancelTransientInteraction() {}
 }
 
-final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenuItemValidation {
+final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenuItemValidation, SPVideoContextMenuActions {
     /// One low-priority lane process-wide. Subtitle ranking is CPU-only and may
     /// cover thousands of names; serializing it prevents several player windows
     /// from turning a background convenience into a burst of foreground CPU.
@@ -106,12 +106,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private let playerView = PlayerView()
     private var core: SPPlayerCore?
     private let playbackSleep = SPPlaybackSleepController()
+    private var repeatVideoIdentity: String?
+    private var videoSharePicker: NSSharingServicePicker?
+    private lazy var floatingVideo = makeFloatingVideoController()
 
     private lazy var dragEffect = WindowDragEffect()
 
     private func handleVideoMouseDown(_ event: NSEvent) {
-        view.window?.makeFirstResponder(playerView)
+        playerView.window?.makeFirstResponder(playerView)
         noteVideoMouseDown(event)
+        guard !floatingVideo.isActive else { return }
         guard let core, core.hasEverPresentedThisSession, WindowDragEffect.enabled else { return }
 
         guard dragEffect.mouseDown(event, in: playerView) else { return }
@@ -433,11 +437,17 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         playerView.onDoubleClick = { [weak self] in
             guard let self else { return }
             cancelVideoClick()
+            if floatingVideo.isActive {
+                floatingVideo.restore()
+                view.window?.makeKeyAndOrderFront(nil)
+                return
+            }
             showControlsTemporarily()
             perform(.toggleFullscreen)
         }
         playerView.onMouseDown = { [weak self] event in self?.handleVideoMouseDown(event) }
         playerView.onMouseUp = { [weak self] event in self?.resolveClickCandidate(event) }
+        playerView.onContextMenu = { [weak self] event in self?.makeVideoContextMenu(event) }
         dragEffect.apply = { [weak self] strength, colorStrength, anchor in
             self?.core?.setWindowDragEffectStrength(strength, colorStrength: colorStrength, anchorPx: anchor)
         }
@@ -669,6 +679,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 forName: name, object: win, queue: .main
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
+                    if self?.floatingVideo.isActive == true { self?.floatingVideo.restore() }
                     self?.gestureFullscreenTransition = true
                     self?.setSettingsPanelShown(false)
                     self?.setPlaylistShown(false)
@@ -734,12 +745,14 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         observerTokens.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification,
             object: win, queue: .main
-        ) { [weak self] note in
-            guard let self, let w = note.object as? NSWindow else { return }
-            let visible = w.occlusionState.contains(.visible)
-            self.core?.setWindowVisibleForRendering(visible)
-            if visible { self.runPendingDirectoryScanWhenFirstFramePresented() }
-            else { self.scheduleQuietOpenPanelPrewarm() }
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let w = self.view.window else { return }
+                let visible = self.floatingVideo.isActive || w.occlusionState.contains(.visible)
+                self.core?.setWindowVisibleForRendering(visible)
+                if visible { self.runPendingDirectoryScanWhenFirstFramePresented() }
+                else { self.scheduleQuietOpenPanelPrewarm() }
+            }
         })
         observerTokens.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didDeminiaturizeNotification, object: win, queue: .main
@@ -1232,12 +1245,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private var videoClick = SPVideoClickGesture()
-    private var videoClickWork: DispatchWorkItem?
     nonisolated(unsafe) private var clickUpMonitor: Any?
 
     private func noteVideoMouseDown(_ event: NSEvent) {
         cancelVideoClick()
-        guard let win = view.window else { return }
+        guard let win = playerView.window else { return }
         videoClick.mouseDown(clickCount: event.clickCount,
                              eligible: event.type == .leftMouseDown &&
                                 !event.modifierFlags.contains(.control) && hasMediaSession,
@@ -1251,7 +1263,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                     switch ev.type {
                     case .leftMouseDown, .rightMouseDown, .otherMouseDown:
                         // A new press on controls or a context menu also
-                        // supersedes a video click waiting for confirmation.
+                        // supersedes an unfinished video press.
                         self.cancelVideoClick()
                     case .leftMouseDragged:
                         self.cancelClickCandidateIfDragged()
@@ -1268,34 +1280,174 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func cancelVideoClick() {
         videoClick.cancel()
-        videoClickWork?.cancel()
-        videoClickWork = nil
     }
 
     private func cancelClickCandidateIfDragged() {
-        guard let win = view.window else { cancelVideoClick(); return }
+        guard let win = playerView.window else { cancelVideoClick(); return }
         videoClick.mouseDragged(windowOrigin: win.frame.origin, pointer: NSEvent.mouseLocation)
     }
 
     private func resolveClickCandidate(_ event: NSEvent) {
-        guard let win = view.window,
+        guard let win = playerView.window,
               let token = videoClick.mouseUp(sameWindow: event.window === win,
                                              windowOrigin: win.frame.origin,
                                              pointer: NSEvent.mouseLocation) else { return }
-        // Waiting for the system interval lets a double click enter full screen
-        // without briefly pausing/resuming the movie on its first release.
-        let work = DispatchWorkItem { [weak self, weak win] in
-            guard let self, self.videoClick.consume(token) else { return }
-            self.videoClickWork = nil
-            guard let win, self.view.window === win, win.isKeyWindow,
-                  win.attachedSheet == nil, self.hasMediaSession,
-                  !self.isSettingsPanelShown, !self.isPlaylistShown,
-                  let state = self.core?.state,
-                  state == .playing || state == .paused || state == .ended else { return }
-            self.perform(.togglePlayback)
+        guard videoClick.consume(token), win.attachedSheet == nil,
+              hasMediaSession, !isSettingsPanelShown, !isPlaylistShown,
+              let state = core?.state,
+              state == .playing || state == .paused || state == .ended else { return }
+        perform(.togglePlayback)
+    }
+
+    private var videoActionIdentity: String? {
+        guard hasMediaSession else { return nil }
+        if let context = torrentContext {
+            return context.descriptor.hash + ":" + String(context.file.id)
         }
-        videoClickWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + NSEvent.doubleClickInterval, execute: work)
+        return openMediaPath
+    }
+
+    private var isRepeatingVideo: Bool {
+        videoActionIdentity != nil && repeatVideoIdentity == videoActionIdentity
+    }
+
+    private var videoSharingItem: URL? {
+        SPVideoContextPolicy.sharingURL(localPath: torrentContext == nil ? openMediaPath : nil,
+                                        torrentHash: torrentContext?.descriptor.hash,
+                                        torrentName: torrentContext?.descriptor.name)
+    }
+
+    private func makeVideoContextMenu(_ event: NSEvent) -> NSMenu? {
+        cancelVideoClick()
+        stopRepeat()
+        endTurbo(reason: "videoContextMenu")
+        cancelPlaybackScroll()
+        guard hasMediaSession else { return nil }
+        return SPVideoContextMenu.make(target: self,
+                                       hasVideo: hasVideoSession && core?.hasEverPresentedThisSession == true,
+                                       isRepeating: isRepeatingVideo,
+                                       isPictureInPicture: floatingVideo.isActive,
+                                       canShare: videoSharingItem != nil)
+    }
+
+    @objc func videoRepeatAction(_ sender: NSMenuItem) {
+        guard hasVideoSession, let identity = videoActionIdentity else { return }
+        repeatVideoIdentity = isRepeatingVideo ? nil : identity
+        if isRepeatingVideo {
+            core?.clearLoop()
+            playlistAdvanceAfterScanPath = nil
+            if let core, core.state == .ended { _ = repeatFinishedVideoIfNeeded(core) }
+        }
+    }
+
+    private func repeatFinishedVideoIfNeeded(_ core: SPPlayerCore) -> Bool {
+        guard isRepeatingVideo else { return false }
+        guard let identity = videoActionIdentity,
+              SPVideoContextPolicy.canRepeatEnded(isTorrent: torrentContext != nil,
+                  position: core.position, duration: core.duration, growing: core.sourceGrowing,
+                  waiting: core.sourceWaiting, stalled: core.sourceStalled,
+                  waitingForIndex: core.sourceWaitingForIndex, availableEnd: core.availableEndSeconds)
+        else { return true }
+        DispatchQueue.main.async { [weak self, weak core] in
+            guard let self, let core, self.core === core,
+                  self.videoActionIdentity == identity, self.isRepeatingVideo,
+                  core.state == .ended else { return }
+            self.yieldDirectoryScanToForegroundIO()
+            core.play()
+        }
+        return true
+    }
+
+    private func makeFloatingVideoController() -> SPFloatingVideoController {
+        let controller = SPFloatingVideoController()
+        controller.onTogglePlayback = { [weak self] in self?.perform(.togglePlayback) }
+        controller.onFocusLoss = { [weak self] in
+            guard let self else { return }
+            self.stopRepeat()
+            self.endTurbo(reason: "floatingVideoFocusLost")
+            self.cancelPlaybackScroll()
+            self.cancelVideoClick()
+            self.pinchGesture.reset()
+            self.playbackFeedback?.dismiss()
+            self.seekFeedback?.dismiss()
+            self.volumeFeedback?.dismiss()
+            self.playbackCursor?.setChromeHidden(false)
+        }
+        controller.onLayoutChange = { [weak self] in
+            guard let self else { return }
+            self.core?.displayScreenChanged()
+            self.core?.notePausedLayoutChange()
+            self.core?.setWindowVisibleForRendering(self.floatingVideo.isActive ||
+                self.view.window?.occlusionState.contains(.visible) == true)
+            self.relocateVideoOverlays()
+        }
+        controller.onDidRestore = { [weak self] in
+            guard let self else { return }
+            self.layoutPlaybackSettings()
+            self.relocateVideoOverlays()
+            self.core?.setWindowVisibleForRendering(self.view.window?.occlusionState.contains(.visible) == true)
+        }
+        return controller
+    }
+
+    @objc func videoPictureInPictureAction(_ sender: NSMenuItem) {
+        cancelVideoClick()
+        if floatingVideo.isActive { floatingVideo.restore(); return }
+        guard hasVideoSession, core?.hasEverPresentedThisSession == true else { return }
+        setSettingsPanelShown(false)
+        setPlaylistShown(false)
+        setMotionCompare(false)
+        playbackFeedback?.dismiss()
+        seekFeedback?.dismiss()
+        volumeFeedback?.dismiss()
+        let size = playerView.bounds.size
+        var aspect = size.height > 0 ? size.width / size.height : 16 / 9
+        if let info = core?.videoInfo, info.width > 0, info.height > 0 {
+            aspect = CGFloat(info.width) / CGFloat(info.height)
+        }
+        if currentForcedAspectTag > 0 { aspect = CGFloat(currentForcedAspectTag) / 100 }
+        if currentCropTag > 0 { aspect = CGFloat(currentCropTag) / 100 }
+        if abs(currentRotation) % 180 == 90 { aspect = 1 / aspect }
+        if floatingVideo.present(videoView: playerView, aspectRatio: aspect, sourceWindow: view.window) {
+            floatingVideo.update(isPlaying: core?.state == .playing)
+            playbackCursor?.setChromeHidden(false)
+            core?.setWindowVisibleForRendering(true)
+        }
+    }
+
+    @objc func videoCopyFrameAction(_ sender: NSMenuItem) {
+        guard hasVideoSession, let core else { return }
+        core.captureScreenshotPNG { [weak self] png in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard let png, !png.isEmpty else {
+                    self.showTransientNotice(L("alert.screenshotFailed"))
+                    return
+                }
+                let pasteboard = NSPasteboard.general
+                pasteboard.declareTypes([.png], owner: nil)
+                if pasteboard.setData(png, forType: .png) {
+                    self.showTransientNotice(L("video.context.frameCopied"))
+                }
+            }
+        }
+    }
+
+    @objc func videoInfoAction(_ sender: NSMenuItem) {
+        if let window = view.window, floatingVideo.isActive {
+            window.deminiaturize(nil)
+            window.makeKeyAndOrderFront(nil)
+            guard window.attachedSheet == nil else { return }
+        }
+        perform(.showMediaInfo)
+    }
+
+    @objc func videoShareAction(_ sender: NSMenuItem) {
+        guard let item = videoSharingItem else { return }
+        let picker = NSSharingServicePicker(items: [item])
+        videoSharePicker = picker
+        picker.show(relativeTo: NSRect(x: playerView.bounds.midX, y: playerView.bounds.midY,
+                                      width: 1, height: 1), of: playerView, preferredEdge: .minY)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -1919,6 +2071,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         flushResumePositionNow(forceDiskSync: false)
 
+        let previousRepeatVideoIdentity = repeatVideoIdentity
+        let previousVideoIdentity = videoActionIdentity
         let previousTorrentContext = torrentContext
         cancelTorrentPlaybackWindowPolicy()
         let incomingTorrentContext = url.isFileURL ? nil :
@@ -1935,6 +2089,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         hasMediaSession = true
         captionsRegisterCore(core)
         openMediaPath = stdPath
+        if videoActionIdentity != previousVideoIdentity { repeatVideoIdentity = nil }
         recentRecordedThisOpen = false
         replayResumeResetArmedPath = nil
         SPMainThreadSentinel.phase("open.dismissWelcome") {
@@ -1992,6 +2147,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             playlistProfileRestorePending = previousProfileRestorePending
             if !previousHasMediaSession { captionsMediaWillClose() }
             openMediaPath = previousOpenMediaPath
+            repeatVideoIdentity = previousRepeatVideoIdentity
             recentRecordedThisOpen = previousRecentRecordedThisOpen
             replayResumeResetArmedPath = previousReplayResumeResetArmedPath
             let restoredMode = previousHasMediaSession ? previousInterpolationMode : .off
@@ -2549,6 +2705,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var closingWindowInProgress = false
 
     func handleWindowClose(destroyingWindow: Bool = false) {
+        floatingVideo.restore()
+        repeatVideoIdentity = nil
+        videoSharePicker = nil
         invalidateTorrentCacheRestart()
         cancelTorrentPauseBuffer(resetManualStop: true)
         cancelTorrentPlaybackWindowPolicy()
@@ -3510,12 +3669,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func schedulePlaylistAdvanceIfFinished(_ core: SPPlayerCore) {
+        guard !isRepeatingVideo else { return }
         guard torrentCacheRestartToken == nil else { return }
         if let context = torrentContext {
             guard playlistAutoAdvance, !torrentResolving, !core.sourceWaiting, !core.sourceStalled,
                   core.duration.isFinite, core.duration > 0, core.position >= core.duration - 1 else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.core?.state == .ended, self.playlistAutoAdvance,
+                guard let self, self.core?.state == .ended, self.playlistAutoAdvance, !self.isRepeatingVideo,
                       self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
                       self.torrentContext?.file.id == context.file.id else { return }
                 self.playNextMedia()
@@ -3538,7 +3698,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let root = playlistController.rootURL
         DispatchQueue.main.async { [weak self] in
             guard let self, self.openMediaPath == path, self.core?.state == .ended,
-                  self.playlistAutoAdvance, !self.playlistInitialOpenPending,
+                  self.playlistAutoAdvance, !self.isRepeatingVideo, !self.playlistInitialOpenPending,
                   self.playlistController.rootURL == root else { return }
             self.playNextMedia()
         }
@@ -3714,6 +3874,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             installPendingChromeSoon()
         }
         playbackSleep.update(isPlaying: state == .playing, hasVideo: hasVideoSession)
+        floatingVideo.update(isPlaying: state == .playing)
         playbackCursor?.setHasVideo(hasVideoSession)
         WindowDragEffect.applyTestHookIfNeeded(core: core, state: state, view: playerView)
 
@@ -3736,7 +3897,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         if state == .ended {
             persistCompletedResumeState(core)
-            schedulePlaylistAdvanceIfFinished(core)
+            if !repeatFinishedVideoIfNeeded(core) { schedulePlaylistAdvanceIfFinished(core) }
         } else if state == .playing {
             resetResumeStateForReplayIfNeeded(core)
         }
@@ -3749,6 +3910,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             maybeRunSubtitleAutoload()
         }
         if state == .failed {
+            floatingVideo.restore()
+            repeatVideoIdentity = nil
             cancelTransientInteractions()
             setSettingsPanelShown(false)
 
@@ -4293,8 +4456,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         case .toggleFullscreen:
             toggleFullscreen()
         case .setLoopPointA:
+            repeatVideoIdentity = nil
             if let core { core.setLoopPointA(core.position) }
         case .setLoopPointB:
+            repeatVideoIdentity = nil
             if let core { core.setLoopPointB(core.position) }
         case .clearLoop:
             core?.clearLoop()
@@ -5363,9 +5528,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             feedback = existing
         } else {
             feedback = SPPlaybackFeedbackView(frame: .zero)
-            view.addSubview(feedback, positioned: .above, relativeTo: playerView)
             playbackFeedback = feedback
         }
+        placeVideoOverlay(feedback)
         feedback.place(in: playerView.frame)
         feedback.show(isPlaying: isPlaying)
     }
@@ -5376,15 +5541,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             feedback = existing
         } else {
             feedback = SPSeekFeedbackView(frame: .zero)
-            view.addSubview(feedback, positioned: .above, relativeTo: playerView)
             seekFeedback = feedback
         }
+        placeVideoOverlay(feedback)
         feedback.place(in: playerView.frame)
         feedback.show(delta: delta)
     }
 
     private var volumeFeedbackBounds: CGRect {
         var rect = playerView.frame
+        if floatingVideo.isActive { return rect }
         if let window = view.window {
             let contentTop = view.convert(window.contentLayoutRect, from: nil).maxY
             rect.size.height = max(0, min(rect.maxY, contentTop) - rect.minY)
@@ -5398,18 +5564,37 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if let existing = volumeFeedback { feedback = existing }
         else {
             feedback = SPVolumeFeedbackView(frame: .zero)
-            view.addSubview(feedback, positioned: .above, relativeTo: playerView)
             volumeFeedback = feedback
         }
+        placeVideoOverlay(feedback)
         feedback.place(in: volumeFeedbackBounds)
         // Read back the result after policy clamps and mute changes.
         feedback.show(percent: Double(core.volume) * 100, muted: core.isMuted)
     }
 
+    private func placeVideoOverlay(_ overlay: NSView) {
+        guard let parent = playerView.superview else { return }
+        if overlay.superview !== parent {
+            overlay.removeFromSuperview()
+            parent.addSubview(overlay, positioned: .above, relativeTo: playerView)
+        }
+    }
+
+    private func relocateVideoOverlays() {
+        if let feedback = playbackFeedback { placeVideoOverlay(feedback); feedback.place(in: playerView.frame) }
+        if let feedback = seekFeedback { placeVideoOverlay(feedback); feedback.place(in: playerView.frame) }
+        if let feedback = volumeFeedback { placeVideoOverlay(feedback); feedback.place(in: volumeFeedbackBounds) }
+        if playbackNotice != nil { layoutPlaybackNotice() }
+    }
+
     private func playbackNoticeView() -> SPPlaybackNoticeView {
-        if let notice = playbackNotice { return notice }
+        if let notice = playbackNotice {
+            placeVideoOverlay(notice)
+            layoutPlaybackNotice()
+            return notice
+        }
         let notice = SPPlaybackNoticeView(frame: .zero)
-        view.addSubview(notice)
+        placeVideoOverlay(notice)
         playbackNotice = notice
         layoutPlaybackNotice()
         return notice
@@ -5431,7 +5616,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func layoutPlaybackSettings() {
         let inset = view.window.map { max(0, view.bounds.maxY - $0.contentLayoutRect.maxY) } ?? 0
-        if playerView.frame != view.bounds { playerView.frame = view.bounds }
+        if !floatingVideo.isActive, playerView.frame != view.bounds { playerView.frame = view.bounds }
         chromePresenter?.layout(in: view.bounds)
         if !Self.useNewUI {
             controlBar.setFrameSize(NSSize(width: view.bounds.width, height: controlBar.frame.height))
@@ -5767,6 +5952,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func layoutPlaybackNotice() {
         guard let notice = playbackNotice else { return }
+        placeVideoOverlay(notice)
+        if floatingVideo.isActive {
+            notice.place(in: playerView.frame, topInset: 18)
+            return
+        }
         var topInset: CGFloat = 0
         if let win = view.window, let content = win.contentView {
             topInset = content.bounds.maxY - win.contentLayoutRect.maxY
@@ -5982,6 +6172,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func toggleFullscreen() {
+        if floatingVideo.isActive {
+            floatingVideo.restore()
+            view.window?.makeKeyAndOrderFront(nil)
+        }
         view.window?.toggleFullScreen(nil)
     }
 
@@ -6123,6 +6317,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func handlePlaybackMagnify(_ event: NSEvent) -> Bool {
         cancelVideoClick()
+        guard !floatingVideo.isActive else { return false }
         let mode: SPPlaybackPinchGesture.Mode
         switch SPPlaybackGestureSettings.pinchAction {
         case .resizeWindow: mode = .resizeWindow
