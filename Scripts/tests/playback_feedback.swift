@@ -52,21 +52,22 @@ struct PlaybackFeedbackChecks {
         // player window or screen capture is involved.
         let disk = bezel(view)
         let icon = glyph(view)
-        let fade = disk.animation(forKey: "playbackFade") as! CABasicAnimation
+        let fade = disk.animation(forKey: "playbackFade") as! CAKeyframeAnimation
         let grow = icon.animation(forKey: "playbackGlyphGrow") as! CABasicAnimation
         let from = (grow.fromValue as! NSNumber).doubleValue
         let to = (grow.toValue as! NSNumber).doubleValue
         let scale = from + (to - from) * fraction
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        disk.opacity = Float(1 - fraction)
+        let holdFraction = fade.keyTimes![1].doubleValue
+        disk.opacity = Float(fraction <= holdFraction ? 1 : (1 - fraction) / (1 - holdFraction))
         icon.transform = CATransform3DMakeScale(scale, scale, 1)
         CATransaction.commit()
         check(CATransform3DIsIdentity(disk.transform), "The sampled backdrop never expands")
         check(icon.position == CGPoint(x: disk.bounds.midX, y: disk.bounds.midY),
               "The sampled glyph stays centered during interpolation")
-        check(fade.fromValue as? Int == 1 && fade.toValue as? Int == 0,
-              "The sampled opacity follows the component's full uniform fade")
+        check(fade.values?.first as? Int == 1 && fade.values?.last as? Int == 0,
+              "The sampled opacity holds before fading to transparency")
         render(view, to: path)
         disk.opacity = 1
         icon.transform = CATransform3DIdentity
@@ -82,16 +83,20 @@ struct PlaybackFeedbackChecks {
         view.show(isPlaying: true)
         check(!view.isHidden && view.displayedPlaying == true, "Resume shows the play glyph")
         let play = glyph(view).path!
-        check(play.contains(CGPoint(x: 30, y: 36)), "Play triangle has a solid left interior")
-        check(!play.contains(CGPoint(x: 48, y: 49)), "Play triangle leaves its upper-right exterior clear")
+        check(play.contains(CGPoint(x: 39, y: 48)), "Play triangle has a solid left interior")
+        check(!play.contains(CGPoint(x: 66, y: 67.5)), "Play triangle leaves its upper-right exterior clear")
         check(bezel(view).cornerRadius * 2 == bezel(view).bounds.width, "Backdrop remains circular")
         check(abs(bezel(view).backgroundColor!.alpha - 0.55) < 0.001, "Backdrop remains translucent")
         check(bezel(view).animationKeys() == ["playbackFade"], "The circular backdrop never grows or pulses")
-        check(bezel(view).animation(forKey: "playbackFade")?.duration == 0.35, "Feedback has one short fade")
-        let fade = bezel(view).animation(forKey: "playbackFade") as! CABasicAnimation
-        check(fade.toValue as? Int == 0 && fade.fillMode == .forwards && !fade.isRemovedOnCompletion,
+        check(bezel(view).animation(forKey: "playbackFade")?.duration == 0.75, "Feedback remains readable for three quarters of a second")
+        check(bezel(view).bounds.width == 96, "The fixed backdrop is larger")
+        check(glyph(view).path!.boundingBoxOfPath.height >= 48, "The play symbol is at least fifty percent larger")
+        let fade = bezel(view).animation(forKey: "playbackFade") as! CAKeyframeAnimation
+        check(fade.values?.last as? Int == 0 && fade.fillMode == .forwards && !fade.isRemovedOnCompletion,
               "The terminal transparent frame persists even when cleanup is delayed")
-        check(isLinear(fade), "Opacity fades uniformly without a hold or spring")
+        check(fade.values?.prefix(2).allSatisfy { ($0 as? Int) == 1 } == true &&
+              abs(fade.keyTimes![1].doubleValue * fade.duration - 0.3) < 0.001,
+              "The icon holds full opacity before its smooth fade")
         let grow = glyph(view).animation(forKey: "playbackGlyphGrow") as! CABasicAnimation
         check(grow.fromValue as? Double == 1 && grow.toValue as? Double == 1.12 && isLinear(grow),
               "Only the white glyph has a subtle linear growth")
@@ -102,13 +107,13 @@ struct PlaybackFeedbackChecks {
         runLoop(0.3)
         view.show(isPlaying: false)
         let pause = glyph(view).path!
-        check(pause.contains(CGPoint(x: 28, y: 36)) && pause.contains(CGPoint(x: 44, y: 36)), "Pause has two solid bars")
-        check(!pause.contains(CGPoint(x: 36, y: 36)), "Pause keeps the gap between bars")
+        check(pause.contains(CGPoint(x: 36, y: 48)) && pause.contains(CGPoint(x: 60, y: 48)), "Pause has two solid bars")
+        check(!pause.contains(CGPoint(x: 48, y: 48)), "Pause keeps the gap between bars")
         runLoop(0.25)
         check(!view.isHidden && view.displayedPlaying == false, "An obsolete hide cannot erase the latest click")
         view.place(in: CGRect(x: 2, y: 4, width: 320, height: 180))
         check(view.frame.midX == 162 && view.frame.midY == 94, "A resize keeps feedback centered")
-        runLoop(0.3)
+        runLoop(0.55)
         check(view.isHidden && view.displayedPlaying == nil, "The latest animation hides after completion")
         check(bezel(view).animationKeys()?.isEmpty ?? true, "Finished feedback leaves no animations running")
         check(glyph(view).animationKeys()?.isEmpty ?? true, "Finished feedback clears its glyph animation")
@@ -117,7 +122,7 @@ struct PlaybackFeedbackChecks {
         view.dismiss()
         runLoop(0.1)
         view.show(isPlaying: false)
-        runLoop(0.28)
+        runLoop(0.68)
         check(!view.isHidden, "A dismissed session cannot hide the next session's feedback")
         view.dismiss()
         check(view.isHidden && view.displayedPlaying == nil, "Dismiss clears presentation state")
@@ -129,8 +134,8 @@ struct PlaybackFeedbackChecks {
         reduced.show(isPlaying: true)
         check(bezel(reduced).animationKeys() == ["playbackFade"] && (glyph(reduced).animationKeys()?.isEmpty ?? true),
               "Reduced Motion never scales the backdrop or icon")
-        check(bezel(reduced).animation(forKey: "playbackFade")?.duration == 0.25, "Reduced Motion uses a short fade")
-        runLoop(0.3)
+        check(abs((bezel(reduced).animation(forKey: "playbackFade")?.duration ?? 0) - 0.65) < 0.001, "Reduced Motion retains the readable hold without scaling")
+        runLoop(0.7)
         check(reduced.isHidden, "Reduced Motion also completes without a timer loop")
 
         if CommandLine.arguments.count == 2 {

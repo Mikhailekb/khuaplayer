@@ -5,9 +5,12 @@ import QuartzCore
 final class SPPlaybackFeedbackView: NSView {
     private enum G {
         static let canvas: CGFloat = 160
-        static let diameter: CGFloat = 72
-        static let duration: TimeInterval = 0.35
-        static let reducedDuration: TimeInterval = 0.25
+        static let diameter: CGFloat = 96
+        static let designDiameter: CGFloat = 72
+        static let glyphEnlargement: CGFloat = 1.125
+        static let hold: TimeInterval = 0.3
+        static let fade: TimeInterval = 0.45
+        static let reducedFade: TimeInterval = 0.35
     }
 
     private let bezel = CALayer()
@@ -67,7 +70,7 @@ final class SPPlaybackFeedbackView: NSView {
     override func layout() {
         super.layout()
         // The backdrop stays fixed; only the white glyph has a subtle motion.
-        let diameter = min(G.diameter, min(bounds.width, bounds.height) * 0.45)
+        let diameter = min(G.diameter, min(bounds.width, bounds.height) * 0.6)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         bezel.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
@@ -93,12 +96,12 @@ final class SPPlaybackFeedbackView: NSView {
         layoutSubtreeIfNeeded()
 
         let reduce = reducedMotion()
-        let duration = reduce ? G.reducedDuration : G.duration
-        let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = 1
-        fade.toValue = 0
+        let duration = G.hold + (reduce ? G.reducedFade : G.fade)
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [1, 1, 0]
+        fade.keyTimes = [0, NSNumber(value: G.hold / duration), 1]
         fade.duration = duration
-        fade.timingFunction = CAMediaTimingFunction(name: .linear)
+        fade.timingFunctions = [.init(name: .linear), .init(name: .linear)]
         // Stay transparent if the main queue is busy when cleanup is due.
         fade.fillMode = .forwards
         fade.isRemovedOnCompletion = false
@@ -160,8 +163,10 @@ final class SPPlaybackFeedbackView: NSView {
                                     cornerWidth: 1.5, cornerHeight: 1.5)
             }
         }
-        var transform = CGAffineTransform(scaleX: diameter / G.diameter,
-                                         y: diameter / G.diameter)
+        let scale = diameter / G.designDiameter * G.glyphEnlargement
+        let offset = diameter / 2 - G.designDiameter / 2 * scale
+        var transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale,
+                                         tx: offset, ty: offset)
         return path.copy(using: &transform) ?? path
     }
 }
