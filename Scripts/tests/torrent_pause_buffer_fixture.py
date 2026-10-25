@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import socket
 import threading
 import time
 import urllib.parse
@@ -28,14 +29,21 @@ class FixtureServer(ThreadingHTTPServer):
         self.events_lock = threading.Lock()
         self.request_count = 0
         self.capacity = {}
+        self.attempts = {}
         super().__init__(("127.0.0.1", 0), Handler)
 
     def begin_request(self, **fields):
         with self.events_lock:
             self.request_count += 1
             count = self.request_count
-            self.write_event_locked(kind="request", count=count, **fields)
+            self.write_event_locked(kind="request", count=count, monotonic=time.monotonic(), **fields)
             return count
+
+    def attempt(self, tag):
+        with self.events_lock:
+            value = self.attempts.get(tag, 0) + 1
+            self.attempts[tag] = value
+            return value
 
     def write_event_locked(self, **fields):
         with self.events.open("a", encoding="utf-8") as output:
@@ -142,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(401, headers={"WWW-Authenticate": 'Basic realm="fixture"'})
             return
         if endpoint not in {
-            "/valid", "/slow", "/gated-growth", "/short", "/slow-short", "/quota-shrink", "/capacity-cycle", "/wrong-start", "/wrong-end",
+            "/valid", "/slow", "/gated-growth", "/short", "/recover-short", "/preheaders", "/slow-short", "/quota-shrink", "/capacity-cycle", "/wrong-start", "/wrong-end",
             "/wrong-total", "/no-range", "/encoded", "/missing-range",
             "/oversize", "/auth", "/redirect-target", "/delay-headers",
         }:
@@ -151,6 +159,12 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             query = urllib.parse.parse_qs(url.query)
+            tag = query.get("tag", [""])[0]
+            attempt = self.server.attempt(tag)
+            if endpoint == "/preheaders" and self.server.events.with_name("hold-preheaders-" + tag).exists():
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
             file_length = int(query.get("length", [str(DEFAULT_LENGTH)])[0])
             match = RANGE.fullmatch(self.headers.get("Range", ""))
             if match is None or file_length <= 0:
@@ -179,7 +193,8 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.3)
         self.answer(200 if endpoint == "/no-range" else 206,
                     size=declared_size, headers=headers)
-        truncated = endpoint in {"/short", "/slow-short"} or (endpoint == "/quota-shrink" and start == 0)
+        truncated = endpoint in {"/short", "/slow-short"} or (endpoint == "/quota-shrink" and start == 0) or (
+            endpoint == "/recover-short" and attempt == 1)
         body_size = expected // 2 if truncated else declared_size
         remaining = body_size
         tag = query.get("tag", [""])[0]
@@ -209,6 +224,16 @@ class Handler(BaseHTTPRequestHandler):
                     while gate.exists():
                         time.sleep(0.005)
             if endpoint in {"/slow", "/slow-short", "/quota-shrink", "/capacity-cycle"}:
+                time.sleep(0.005)
+        if endpoint == "/recover-short" and attempt == 1 and "close_gate" in query:
+            # The test acknowledges an actual delegate progress callback before
+            # permitting this deliberately truncated response to close.
+            name = query["close_gate"][0]
+            if Path(name).name != name:
+                raise ValueError("invalid fixture close gate")
+            gate = self.server.events.with_name(name)
+            self.server.record_gate(requestTarget=self.path, byteCount=self.bytes_sent)
+            while gate.exists():
                 time.sleep(0.005)
 
 

@@ -74,13 +74,25 @@ final class SPTorrentPauseBuffer {
     private var requestContext: RequestContext?
     private var interruptedRead: InterruptedRead?
     private var pendingCapacityStop: SPTorrentPrefetchCapacityStop?
+    private var retryTask: Task<Void, Never>?
+    private var retryAttempt = 0
+    private let retryDelays: [Duration]
 
-    deinit { reader?.cancel() }
+    init(retryDelays: [Duration] = [.seconds(3), .seconds(6), .seconds(12), .seconds(15)]) {
+        // Normal paused window ACKs refresh every two seconds. The initial
+        // grace lets their exact capacity proof arrive before a new nonce.
+        self.retryDelays = retryDelays.isEmpty ? [.seconds(3)] : retryDelays.map { max(.milliseconds(1), $0) }
+    }
 
-    /// Start is idempotent for a filling or filled window. Failures remain sticky
-    /// for the source until stop/start or cancel; advancing playback cannot retry
-    /// them. Only an exact worker capacity proof permits automatic continuation
-    /// after an interrupted response. The upper bound comes from worker policy: retained
+    deinit {
+        reader?.cancel()
+        retryTask?.cancel()
+    }
+
+    /// Start is idempotent for a filling or filled window. Transient transport
+    /// interruptions retry with bounded backoff; invalid responses remain sticky.
+    /// Only an exact worker capacity proof authorizes capacity waiting. The upper
+    /// bound comes from worker policy: retained
     /// history and already-read ahead bytes
     /// have already consumed capacity. Never allocate another cache-sized window
     /// after `offset`. Explicit stop/start resumes a stopped window's suffix.
@@ -112,6 +124,7 @@ final class SPTorrentPauseBuffer {
            interrupted.request.belongs(to: next), interrupted.request.matches(proof),
            window.map({ next.start >= $0.start }) == true,
            proof.nextOffset == interrupted.nextOffset {
+            cancelRetry()
             interruptedRead = nil
             pendingCapacityStop = nil
             window = next
@@ -119,6 +132,12 @@ final class SPTorrentPauseBuffer {
             acceptCapacityStop(next)
             return
         }
+        // A metadata cursor can move backward while a retry is pending. It
+        // cannot lend an earlier unvalidated gap to this interrupted response.
+        // An explicit playback seek cancels this manager before starting again.
+        if retryTask != nil, let previous = window,
+           previous.identity == identity, previous.source == source, previous.fileLength == fileLength,
+           next.start < previous.start { return }
         if snapshot.state == .failed, let previous = window,
            previous.identity == identity, previous.source == source, previous.fileLength == fileLength { return }
         if next == window {
@@ -135,7 +154,8 @@ final class SPTorrentPauseBuffer {
         } ?? false
         let keepRead = sameSource && next.start <= actualEnd && reader != nil && snapshot.state == .filling &&
                        previous.map { next.end >= $0.end } == true && actualEnd < next.end
-        if !keepRead {
+        let keepRetry = sameSource && retryTask != nil && snapshot.state == .filling
+        if !keepRead && !keepRetry {
             let hadRead = reader != nil
             let received = invalidateRead()
             // Cancellation returns its final locked count. Bytes accepted
@@ -147,10 +167,19 @@ final class SPTorrentPauseBuffer {
         let nextCoveredEnd = reuse ? min(actualEnd, next.end) : next.start
         window = next
         coveredEndOffset = nextCoveredEnd
+        if !sameSource { retryAttempt = 0 }
         if coveredEndOffset >= next.end {
+            cancelRetry()
+            interruptedRead = nil
+            pendingCapacityStop = nil
+            retryAttempt = 0
             publish(next, state: sameSource && snapshot.state == .waitingForCapacity ? .waitingForCapacity : .filled)
             return
         }
+        // A fresh ACK may move the exact start or upper bound while waiting.
+        // Use its new bounds when the original deadline fires, without allowing
+        // the owner's frequent polling to bypass or postpone the backoff.
+        if keepRetry { publish(next, state: .filling, failure: snapshot.failure); return }
         // A growing target keeps the original finite request. On success its
         // terminal callback starts only the newly approved suffix. A shrinking
         // target still cancels immediately, before any replacement read.
@@ -160,6 +189,7 @@ final class SPTorrentPauseBuffer {
     }
 
     private func beginRead(_ next: Window) {
+        cancelRetry()
         requestStartOffset = coveredEndOffset
         let generation = UUID()
         requestGeneration = generation
@@ -194,6 +224,7 @@ final class SPTorrentPauseBuffer {
         guard let window else { return }
         let hadRead = reader != nil
         let received = invalidateRead()
+        retryAttempt = 0
         if hadRead { coveredEndOffset = min(window.end, max(coveredEndOffset, requestStartOffset + received)) }
         if snapshot.state != .filled { publish(window, state: .stopped) }
     }
@@ -201,6 +232,7 @@ final class SPTorrentPauseBuffer {
     /// Seek/source changes invalidate the cache-coverage assumption.
     func cancel() {
         invalidateRead()
+        retryAttempt = 0
         window = nil
         coveredEndOffset = 0
         requestStartOffset = 0
@@ -211,6 +243,7 @@ final class SPTorrentPauseBuffer {
 
     @discardableResult
     private func invalidateRead() -> Int64 {
+        cancelRetry()
         requestGeneration = UUID()
         let received = reader?.cancel() ?? 0
         reader = nil
@@ -218,6 +251,29 @@ final class SPTorrentPauseBuffer {
         interruptedRead = nil
         pendingCapacityStop = nil
         return received
+    }
+
+    private func cancelRetry() {
+        retryTask?.cancel()
+        retryTask = nil
+    }
+
+    private func scheduleRetry(_ failure: Failure, in window: Window) {
+        let generation = requestGeneration
+        let delay = retryDelays[min(retryAttempt, retryDelays.count - 1)]
+        retryAttempt = min(retryAttempt + 1, retryDelays.count - 1)
+        retryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: delay) } catch { return }
+            guard let self, self.requestGeneration == generation,
+                  self.reader == nil, self.snapshot.state == .filling,
+                  let current = self.window else { return }
+            self.retryTask = nil
+            self.beginRead(current)
+        }
+        // Keep buffering enabled while recovering. A single idle timeout or
+        // expected early stream close must not require the user to press Resume.
+        // onChange may synchronously stop/cancel and thereby cancel this task.
+        publish(window, state: .filling, failure: failure)
     }
 
     private func receive(_ event: SPTorrentPauseRead.Event, generation: UUID) {
@@ -246,8 +302,11 @@ final class SPTorrentPauseBuffer {
                     return
                 }
             }
+            if failure == nil { retryAttempt = 0 }
             if failure == nil, coveredEndOffset < window.end {
                 beginRead(window)
+            } else if let failure, failure == .shortRead || failure == .transport {
+                scheduleRetry(failure, in: window)
             } else {
                 publish(window, state: failure == nil ? .filled : .failed, failure: failure)
             }

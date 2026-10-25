@@ -32,9 +32,11 @@ private struct Context {
     var starts = 0
     var cancellations = 0
     var lastCapacityStop: SPTorrentPrefetchCapacityStop?
+    var lastOffset: Int64?
     func start(identity: Identity, streamURL: URL, offset: Int64, fileLength: Int64, forwardEndOffset: Int64,
                capacityStop: SPTorrentPrefetchCapacityStop? = nil) {
         lastCapacityStop = capacityStop
+        lastOffset = offset
         starts += 1; snapshot.state = .filling
     }
     func cancel() { cancellations += 1; snapshot.state = .idle }
@@ -46,6 +48,7 @@ private struct Context {
         let fileID: Int
         var openGeneration: Int64 = 1
         var seekGeneration: Int64 = 1
+        var historyLowerBound: Int64 = 0
         let forwardUpperBound: Int64 = 65536
         var prefetchCapacityStop: SPTorrentPrefetchCapacityStop?
     }
@@ -95,6 +98,23 @@ private struct Context {
               "Resuming playback preserves the same valid prefetch reader")
         check(vc.torrentPauseBufferMonitor != nil,
               "Both playing and paused sessions retain a frontier monitor")
+
+        vc.torrentAppliedPlaybackWindow!.historyLowerBound = 4096
+        vc.core!.sourceReadOffset = 256
+        vc.update()
+        check(vc.torrentPauseBuffer.lastOffset == 4096,
+              "A stale metadata read cursor cannot start prefetch below the worker's accepted lower bound")
+        vc.stateChanged(.paused)
+        vc.core!.sourceReadOffset = 0
+        vc.update()
+        check(vc.torrentPauseBuffer.lastOffset == 4096,
+              "A paused source also skips the rejected old byte region after a metadata rewind")
+        vc.core!.sourceReadOffset = 8192
+        vc.update()
+        check(vc.torrentPauseBuffer.lastOffset == 8192,
+              "An actual read frontier inside the accepted window remains unchanged")
+        vc.torrentAppliedPlaybackWindow!.historyLowerBound = 0
+        vc.core!.sourceReadOffset = 256
 
         let proof = SPTorrentPrefetchCapacityStop(requestID: UUID(), fileID: 7,
             rangeStart: 256, rangeEnd: 65536, nextOffset: 32768, revision: 1)

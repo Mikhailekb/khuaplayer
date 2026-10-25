@@ -3217,7 +3217,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         guard !torrentPauseBufferManuallyStopped else { return }
         torrentPauseBuffer.start(identity: .init(hash: context.descriptor.hash, fileID: context.file.id,
             sessionGeneration: context.descriptor.leaseID), streamURL: context.streamURL,
-            offset: core.sourceReadOffset, fileLength: context.file.length,
+            offset: max(core.sourceReadOffset, applied.historyLowerBound), fileLength: context.file.length,
             forwardEndOffset: applied.forwardUpperBound, capacityStop: applied.prefetchCapacityStop)
     }
 
@@ -3245,7 +3245,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             torrentPauseBuffer.cancel()
         } else {
             torrentPauseBufferManuallyStopped = false
-            // Explicit action retries a failure; periodic status polling never does.
+            // Explicit action retries terminal failures immediately. Transient
+            // network recovery is scheduled by the buffer with bounded backoff.
             if torrentPauseBuffer.snapshot.state == .failed { torrentPauseBuffer.stop() }
             updateTorrentPauseBuffer()
         }

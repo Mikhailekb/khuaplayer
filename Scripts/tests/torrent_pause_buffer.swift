@@ -27,6 +27,7 @@ struct TorrentPauseBufferChecks {
         port = fixturePort
         eventFile = URL(fileURLWithPath: CommandLine.arguments[2])
         do {
+            try await automaticRecoveryChecks()
             try await capacityProofChecks()
             try await exactWindowChecks()
             try await slidingWindowChecks()
@@ -43,6 +44,129 @@ struct TorrentPauseBufferChecks {
         }
     }
 
+    static func automaticRecoveryChecks() async throws {
+        let manager = SPTorrentPauseBuffer()
+        let prefixGate = eventFile.deletingLastPathComponent().appendingPathComponent("hold-recovery-prefix")
+        try Data().write(to: prefixGate)
+        var sourceParts = URLComponents(url: url("recover-short", "recover-partial"), resolvingAgainstBaseURL: false)!
+        sourceParts.queryItems!.append(URLQueryItem(name: "close_gate", value: prefixGate.lastPathComponent))
+        let source = sourceParts.url!
+        manager.onChange = { snapshot in
+            if snapshot.receivedBytes > 0 { try? FileManager.default.removeItem(at: prefixGate) }
+        }
+        manager.start(identity: identity, streamURL: source, offset: 1000,
+                      fileLength: fileLength, forwardEndOffset: 201_000)
+        try await awaitTransientFailure(manager)
+        let acceptedPrefix = manager.snapshot.receivedBytes
+        manager.onChange = nil
+        check(acceptedPrefix > 0 && acceptedPrefix <= 100_000 && manager.snapshot.state == .filling,
+              "a transient partial response keeps buffering enabled instead of requiring manual Resume")
+        try await awaitState(manager, .filled)
+        let recovered = requests("recover-partial")
+        check(recovered.count == 2 && recovered[1]["range"] as? String == "bytes=\(1000 + acceptedPrefix)-200999" &&
+              requestID(recovered[0]) != requestID(recovered[1]),
+              "a real truncated response automatically resumes exactly its validated suffix with a fresh nonce")
+
+        let preheaders = SPTorrentPauseBuffer(retryDelays: [.milliseconds(150)])
+        let gate = eventFile.deletingLastPathComponent().appendingPathComponent("hold-preheaders-recover-preheaders")
+        try Data().write(to: gate)
+        preheaders.start(identity: identity, streamURL: url("preheaders", "recover-preheaders"), offset: 1234,
+                         fileLength: fileLength, forwardEndOffset: 101_234)
+        try await awaitTransientFailure(preheaders)
+        check(preheaders.snapshot.failure == .transport && preheaders.snapshot.receivedBytes == 0,
+              "a transport close before response headers retains zero accepted bytes and remains recoverable")
+        let oldNonce = requestID(requests("recover-preheaders")[0])
+        try FileManager.default.removeItem(at: gate)
+        try await awaitState(preheaders, .filled)
+        let beforeHeadersReads = requests("recover-preheaders")
+        check(beforeHeadersReads.last?["range"] as? String == "bytes=1234-101233" &&
+              requestID(beforeHeadersReads.last!) != oldNonce,
+              "pre-header recovery retries the original finite range without claiming unvalidated coverage")
+
+        let backoff = SPTorrentPauseBuffer(retryDelays: [.milliseconds(100), .milliseconds(200), .milliseconds(400)])
+        let backoffSource = url("short", "retry-backoff")
+        backoff.start(identity: identity, streamURL: backoffSource, offset: 0,
+                      fileLength: fileLength, forwardEndOffset: 8 * 1_024 * 1_024)
+        try await awaitTransientFailure(backoff)
+        let pollDeadline = ProcessInfo.processInfo.systemUptime + 2
+        var pollCount: Int64 = 0
+        while requests("retry-backoff").count < 5 && ProcessInfo.processInfo.systemUptime < pollDeadline {
+            pollCount += 1
+            backoff.start(identity: identity, streamURL: backoffSource, offset: pollCount,
+                          fileLength: fileLength, forwardEndOffset: 8 * 1_024 * 1_024 + pollCount)
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let attempts = requests("retry-backoff")
+        check(attempts.count == 5, "frequent advancing ACKs neither bypass nor indefinitely postpone automatic recovery")
+        let times = attempts.compactMap { $0["monotonic"] as? Double }
+        check(times.count == 5 && times[1] - times[0] >= 0.08 && times[2] - times[1] >= 0.18 &&
+              times[3] - times[2] >= 0.38 && times[4] - times[3] >= 0.38,
+              "repeated transient failures use increasing retry delays and a capped request frequency")
+        backoff.stop()
+        let stoppedCount = requests("retry-backoff").count
+        try await Task.sleep(for: .milliseconds(500))
+        check(backoff.snapshot.state == .stopped && requests("retry-backoff").count == stoppedCount,
+              "manual Stop cancels a pending automatic recovery and all late callbacks")
+
+        let advanced = SPTorrentPauseBuffer(retryDelays: [.milliseconds(100)])
+        let advancedSource = url("recover-short", "retry-advanced")
+        advanced.start(identity: identity, streamURL: advancedSource, offset: 0,
+                       fileLength: fileLength, forwardEndOffset: 200_000)
+        try await awaitTransientFailure(advanced)
+        advanced.start(identity: identity, streamURL: advancedSource, offset: 150_000,
+                       fileLength: fileLength, forwardEndOffset: 300_000)
+        check(advanced.snapshot.rangeStart == 150_000 && advanced.snapshot.receivedBytes == 0,
+              "a newer approved start beyond the delivered frontier does not borrow an unvalidated byte gap")
+        try await awaitState(advanced, .filled)
+        check(requests("retry-advanced").last?["range"] as? String == "bytes=150000-299999",
+              "the existing retry deadline uses the latest exact worker-approved start and upper bound")
+
+        let stopped = SPTorrentPauseBuffer(retryDelays: [.milliseconds(100)])
+        stopped.onChange = { snapshot in
+            if snapshot.failure == .transport || snapshot.failure == .shortRead { stopped.stop() }
+        }
+        stopped.start(identity: identity, streamURL: url("short", "retry-reentrant-stop"), offset: 0,
+                      fileLength: fileLength, forwardEndOffset: 100_000)
+        try await awaitState(stopped, .stopped)
+        try await Task.sleep(for: .milliseconds(200))
+        check(requests("retry-reentrant-stop").count == 1,
+              "synchronous Stop from the recovery notification prevents its scheduled retry")
+        stopped.onChange = nil
+
+        let replaced = SPTorrentPauseBuffer(retryDelays: [.milliseconds(100)])
+        replaced.start(identity: identity, streamURL: url("short", "retry-replaced-old"), offset: 0,
+                       fileLength: fileLength, forwardEndOffset: 100_000)
+        try await awaitTransientFailure(replaced)
+        replaced.cancel()
+        replaced.start(identity: identity, streamURL: url("valid", "retry-replaced-new"), offset: 1000,
+                       fileLength: fileLength, forwardEndOffset: 101_000)
+        try await awaitState(replaced, .filled)
+        try await Task.sleep(for: .milliseconds(200))
+        check(requests("retry-replaced-old").count == 1 && requests("retry-replaced-new").count == 1,
+              "source replacement invalidates the old recovery timer before it can mutate or restart the new source")
+
+        var disposable: SPTorrentPauseBuffer? = SPTorrentPauseBuffer(retryDelays: [.milliseconds(100)])
+        weak var weakDisposable = disposable
+        disposable!.start(identity: identity, streamURL: url("short", "retry-deinit"), offset: 0,
+                          fileLength: fileLength, forwardEndOffset: 100_000)
+        try await awaitTransientFailure(disposable!)
+        disposable = nil
+        check(weakDisposable == nil, "a sleeping retry task does not retain its manager")
+        try await Task.sleep(for: .milliseconds(200))
+        check(requests("retry-deinit").count == 1, "deinitialization cancels the pending recovery request")
+
+        let terminal = SPTorrentPauseBuffer(retryDelays: [.milliseconds(30)])
+        for endpoint in ["wrong-start", "auth", "redirect-other"] {
+            let tag = "retry-terminal-" + endpoint
+            terminal.start(identity: identity, streamURL: url(endpoint, tag), offset: 0,
+                           fileLength: fileLength, forwardEndOffset: 100_000)
+            try await awaitState(terminal, .failed)
+            try await Task.sleep(for: .milliseconds(120))
+            check(requests(tag).count == 1,
+                  "\(endpoint) remains terminal and never enters automatic transient recovery")
+        }
+    }
+
     static func capacityProofChecks() async throws {
         let manager = SPTorrentPauseBuffer()
         let tag = "capacity-proof"
@@ -51,7 +175,7 @@ struct TorrentPauseBufferChecks {
         _ = try await capacityState(tag, upper: upper)
         manager.start(identity: identity, streamURL: source, offset: 0,
                       fileLength: fileLength, forwardEndOffset: 2 * upper)
-        try await awaitState(manager, .failed)
+        try await awaitTransientFailure(manager)
         var proof = capacityProof(try await capacityState(tag))!
         let failed = manager.snapshot
         for invalid in [SPTorrentPrefetchCapacityStop(requestID: UUID(), fileID: proof.fileID,
@@ -63,7 +187,7 @@ struct TorrentPauseBufferChecks {
                         SPTorrentPrefetchCapacityStop(requestID: proof.requestID, fileID: proof.fileID,
                             rangeStart: proof.rangeStart, rangeEnd: proof.rangeEnd + 1, nextOffset: proof.nextOffset, revision: proof.revision)] {
             manager.start(identity: identity, streamURL: source, offset: 0,
-                          fileLength: fileLength, forwardEndOffset: upper, capacityStop: invalid)
+                          fileLength: fileLength, forwardEndOffset: 2 * upper, capacityStop: invalid)
         }
         check(manager.snapshot == failed && requests(tag).count == 1,
               "wrong request, file, range or delivered frontier cannot turn a real transport error into capacity wait")
@@ -101,7 +225,7 @@ struct TorrentPauseBufferChecks {
             _ = try await capacityState(tag, upper: upper)
             manager.start(identity: identity, streamURL: source, offset: 0,
                           fileLength: fileLength, forwardEndOffset: staleUpper, capacityStop: proof)
-            try await awaitState(manager, .failed)
+            try await awaitTransientFailure(manager)
             let nextProof = capacityProof(try await capacityState(tag))!
             check(nextProof.requestID != proof.requestID && manager.snapshot.receivedBytes == upper,
                   "capacity cycle \(cycle) requires fresh proof for its new finite request")
@@ -157,7 +281,7 @@ struct TorrentPauseBufferChecks {
         _ = try await capacityState(lateTag, upper: earlyUpper)
         manager.start(identity: identity, streamURL: lateSource, offset: 0,
                       fileLength: fileLength, forwardEndOffset: 2 * earlyUpper)
-        try await awaitState(manager, .failed)
+        try await awaitTransientFailure(manager)
         let lateProof = capacityProof(try await capacityState(lateTag))!
         let advanced = earlyUpper + 64 * 1_024
         _ = try await capacityState(lateTag, upper: earlyExpanded)
@@ -183,7 +307,7 @@ struct TorrentPauseBufferChecks {
         _ = try await capacityState(rewindTag, upper: 2000)
         manager.start(identity: identity, streamURL: rewindSource, offset: 1000,
                       fileLength: fileLength, forwardEndOffset: 3000)
-        try await awaitState(manager, .failed)
+        try await awaitTransientFailure(manager)
         let rewindFailure = manager.snapshot
         let rewindProof = capacityProof(try await capacityState(rewindTag))!
         manager.start(identity: identity, streamURL: rewindSource, offset: 0,
@@ -195,6 +319,42 @@ struct TorrentPauseBufferChecks {
                       fileLength: fileLength, forwardEndOffset: 2000, capacityStop: rewindProof)
         check(manager.snapshot.state == .waitingForCapacity && manager.snapshot.receivedBytes == 1000,
               "a rejected backward frontier does not consume proof for the original validated window")
+
+        let delayedTag = "capacity-proof-after-paused-refresh"
+        let delayedSource = capacitySource(delayedTag)
+        let delayedUpper: Int64 = 64 * 1_024
+        _ = try await capacityState(delayedTag, upper: delayedUpper)
+        manager.start(identity: identity, streamURL: delayedSource, offset: 0,
+                      fileLength: fileLength, forwardEndOffset: 2 * delayedUpper)
+        try await awaitTransientFailure(manager)
+        let delayedProof = capacityProof(try await capacityState(delayedTag))!
+        try await Task.sleep(for: .milliseconds(2100))
+        check(requests(delayedTag).count == 1 && manager.snapshot.state == .filling,
+              "the default recovery grace leaves time for the paused two-second capacity ACK refresh")
+        manager.start(identity: identity, streamURL: delayedSource, offset: 0,
+                      fileLength: fileLength, forwardEndOffset: delayedUpper, capacityStop: delayedProof)
+        try await Task.sleep(for: .milliseconds(1100))
+        check(requests(delayedTag).count == 1 && manager.snapshot.state == .waitingForCapacity,
+              "an exact late capacity proof cancels generic recovery before it replaces the finite request nonce")
+
+        let zero = SPTorrentPauseBuffer(retryDelays: [.milliseconds(100), .milliseconds(200)])
+        let zeroTag = "capacity-zero-body-recovery"
+        let zeroSource = capacitySource(zeroTag)
+        _ = try await capacityState(zeroTag, upper: delayedUpper)
+        zero.start(identity: identity, streamURL: zeroSource, offset: delayedUpper,
+                   fileLength: fileLength, forwardEndOffset: 2 * delayedUpper)
+        try await wait {
+            Set(requests(zeroTag).compactMap { requestID($0) }).count >= 3 && zero.snapshot.failure != nil
+        }
+        let zeroAttempts = requests(zeroTag)
+        check(Set(zeroAttempts.compactMap { requestID($0) }).count == 3 && zero.snapshot.receivedBytes == 0,
+              "repeated zero-body quota closes have bounded recovery frequency and never invent progress")
+        let zeroProof = capacityProof(try await capacityState(zeroTag))!
+        zero.start(identity: identity, streamURL: zeroSource, offset: delayedUpper,
+                   fileLength: fileLength, forwardEndOffset: delayedUpper, capacityStop: zeroProof)
+        try await Task.sleep(for: .milliseconds(300))
+        check(zero.snapshot.state == .waitingForCapacity && requests(zeroTag).count == zeroAttempts.count,
+              "zero-credit capacity proof parks recovery without a retry loop")
 
         let invalidTag = "capacity-invalid-headers"
         let invalidSource = url("wrong-start", invalidTag)
@@ -455,13 +615,14 @@ struct TorrentPauseBufferChecks {
         try await wait { manager.snapshot.receivedBytes > 0 }
         manager.start(identity: identity, streamURL: growingFailureSource, offset: 0,
                       fileLength: fileLength, forwardEndOffset: 2 * boundary)
-        try await awaitState(manager, .failed)
+        try await awaitTransientFailure(manager)
         let failedGrowth = manager.snapshot
         manager.start(identity: identity, streamURL: growingFailureSource, offset: failedGrowth.receivedBytes / 2,
                       fileLength: fileLength, forwardEndOffset: 3 * boundary)
         try await Task.sleep(for: .milliseconds(100))
-        check(manager.snapshot == failedGrowth && requests("growing-failure").count == 1,
-              "a failed original range launches no suffix and stays failed as playback frontier and target advance")
+        check(manager.snapshot.state == .filling && manager.snapshot.failure != nil &&
+              manager.snapshot.rangeStart == failedGrowth.receivedBytes / 2 && requests("growing-failure").count == 1,
+              "frontier and target updates preserve the transient retry deadline instead of immediately relaunching")
 
         var stoppedOnChange = false
         manager.onChange = { snapshot in
@@ -510,70 +671,59 @@ struct TorrentPauseBufferChecks {
     }
 
     static func quotaShrinkChecks() async throws {
-        let manager = SPTorrentPauseBuffer()
+        let manager = SPTorrentPauseBuffer(retryDelays: [.milliseconds(200)])
         let source = url("quota-shrink", "quota-before-ack")
         let originalUpper: Int64 = 8 * 1_024 * 1_024
         manager.start(identity: identity, streamURL: source, offset: 0,
                       fileLength: fileLength, forwardEndOffset: originalUpper)
-        try await awaitState(manager, .failed)
-        let failed = manager.snapshot
-        let prefix = failed.receivedBytes
-        FileHandle.standardError.write(Data("QUOTA premature-body failure=\(String(describing: failed.failure)) validatedPrefix=\(prefix)\n".utf8))
-        check([.shortRead, .transport].contains(failed.failure) && prefix == originalUpper / 2,
-              "a real premature Content-Length body preserves only validated bytes before the quota ACK arrives")
+        try await awaitTransientFailure(manager)
+        let prefix = manager.snapshot.receivedBytes
+        check([.shortRead, .transport].contains(manager.snapshot.failure) && prefix > 0 && prefix <= originalUpper / 2,
+              "a premature Content-Length body preserves validated bytes while waiting for automatic recovery")
         manager.start(identity: identity, streamURL: source, offset: 0,
                       fileLength: fileLength, forwardEndOffset: prefix + 1)
         try await Task.sleep(for: .milliseconds(50))
-        check(manager.snapshot == failed && requests("quota-before-ack").count == 1,
-              "a smaller ACK extending beyond the validated prefix cannot clear a transport failure or retry")
+        check(manager.snapshot.state == .filling && manager.snapshot.receivedBytes == prefix &&
+              requests("quota-before-ack").count == 1,
+              "a smaller ACK updates the bounded target without bypassing recovery backoff")
         manager.start(identity: identity, streamURL: source, offset: 0,
                       fileLength: fileLength, forwardEndOffset: originalUpper + 1_024)
         try await Task.sleep(for: .milliseconds(50))
-        check(manager.snapshot == failed && requests("quota-before-ack").count == 1,
-              "a growing ACK alone cannot retry a truncated request")
-        manager.start(identity: identity, streamURL: source, offset: 0,
-                      fileLength: fileLength, forwardEndOffset: prefix)
-        check(manager.snapshot == failed && requests("quota-before-ack").count == 1,
-              "an unmarked truncated response stays failed even when a later ACK fits its validated prefix")
-        manager.stop()
+        check(manager.snapshot.state == .filling && requests("quota-before-ack").count == 1,
+              "a growing ACK does not trigger an immediate retry of a truncated request")
         manager.start(identity: identity, streamURL: source, offset: 0,
                       fileLength: fileLength, forwardEndOffset: prefix)
         check(manager.snapshot.state == .filled && manager.snapshot.failure == nil &&
               manager.snapshot.receivedBytes == prefix && manager.snapshot.rangeEnd == prefix - 1 &&
               requests("quota-before-ack").count == 1,
-              "only explicit Resume can reuse an unmarked failed response's prefix without HTTP")
-        let reconciled = manager.snapshot
-        for _ in 0..<10 {
-            manager.start(identity: identity, streamURL: source, offset: 0,
-                          fileLength: fileLength, forwardEndOffset: prefix)
-        }
-        try await Task.sleep(for: .milliseconds(50))
-        check(manager.snapshot == reconciled && requests("quota-before-ack").count == 1,
-              "the reconciled quota window stays terminal during repeated ACK polling")
+              "a target entirely covered by validated bytes completes without pretending the close was a capacity proof")
+        try await Task.sleep(for: .milliseconds(300))
+        check(requests("quota-before-ack").count == 1,
+              "completing an approved smaller target cancels its pending retry")
         let expandedUpper = prefix + 2 * 1_024 * 1_024
         manager.start(identity: identity, streamURL: source, offset: 0,
                       fileLength: fileLength, forwardEndOffset: expandedUpper)
         try await awaitState(manager, .filled)
         check(requests("quota-before-ack").count == 2 && requests("quota-before-ack")[1]["range"] as? String ==
               "bytes=\(prefix)-\(expandedUpper - 1)",
-              "a later expanded quota reads only the new finite suffix after explicit Resume")
+              "a later expanded quota reads only the new finite suffix")
 
         let staleSource = url("quota-shrink", "quota-new-epoch")
         manager.start(identity: identity, streamURL: staleSource, offset: 0,
                       fileLength: fileLength, forwardEndOffset: originalUpper)
-        try await awaitState(manager, .failed)
+        try await awaitTransientFailure(manager)
         let nextIdentity = SPTorrentPauseBuffer.Identity(hash: identity.hash, fileID: identity.fileID,
                                                         sessionGeneration: UUID())
         manager.start(identity: nextIdentity, streamURL: staleSource, offset: 0,
                       fileLength: fileLength, forwardEndOffset: prefix)
         check(manager.snapshot.state == .filling && manager.snapshot.receivedBytes == 0 &&
               manager.snapshot.identity == nextIdentity,
-              "a new playback epoch cannot reconcile using the old epoch's validated prefix")
+              "a new playback epoch cannot inherit the old epoch's validated prefix or retry deadline")
         manager.stop()
         let stopped = manager.snapshot
         try await Task.sleep(for: .milliseconds(150))
         check(stopped.state == .stopped && manager.snapshot == stopped,
-              "Stop invalidates the replacement epoch before late quota callbacks can reconcile it")
+              "Stop invalidates the replacement epoch before late callbacks can recover it")
         manager.cancel()
 
         let rejectedSource = url("wrong-start", "quota-invalid-response")
@@ -584,7 +734,7 @@ struct TorrentPauseBufferChecks {
         manager.start(identity: identity, streamURL: rejectedSource, offset: 1000,
                       fileLength: fileLength, forwardEndOffset: 1000)
         check(manager.snapshot == rejected && requests("quota-invalid-response").count == 1,
-              "a quota shrink never clears protocol or authorization failures, even for an empty target")
+              "a quota shrink never clears invalid response headers, even for an empty target")
     }
 
     static func stopResumeChecks() async throws {
@@ -690,7 +840,7 @@ struct TorrentPauseBufferChecks {
 
         manager.start(identity: identity, streamURL: url("short", "short"), offset: 0,
                       fileLength: fileLength, forwardEndOffset: min(fileLength, (0) + 1_000_000))
-        try await awaitState(manager, .failed)
+        try await awaitTransientFailure(manager)
         check(manager.snapshot.receivedBytes > 0 && manager.snapshot.receivedBytes < manager.snapshot.budgetBytes &&
               [.shortRead, .transport].contains(manager.snapshot.failure),
               "a truncated body cannot publish filled even after valid range headers")
@@ -789,6 +939,11 @@ struct TorrentPauseBufferChecks {
             guard ProcessInfo.processInfo.systemUptime < deadline else { throw CheckError.timeout }
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    static func awaitTransientFailure(_ manager: SPTorrentPauseBuffer) async throws {
+        try await wait { manager.snapshot.state == .filling &&
+            [.shortRead, .transport].contains(manager.snapshot.failure) }
     }
 
     static func awaitState(_ manager: SPTorrentPauseBuffer, _ state: SPTorrentPauseBuffer.State,
