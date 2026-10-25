@@ -4552,11 +4552,12 @@ new file mode 100644
 diff --git a/server/web/api/route.go b/server/web/api/route.go
 --- a/server/web/api/route.go
 +++ b/server/web/api/route.go
-@@ -28,6 +28,7 @@
+@@ -28,6 +28,8 @@
  	authorized.POST("/torrent/upload", torrentUpload)
  
  	authorized.POST("/cache", cache)
 +	authorized.POST("/playback/window", playbackWindow)
++	authorized.POST("/playback/cache", playbackCache)
  
  	route.HEAD("/stream", stream)
  	route.GET("/stream", stream)
@@ -5016,4 +5017,521 @@ new file mode 100644
 +		t.Fatal("late old prefetch became active")
 +	}
 +	assertNoMissingPiecePriority(t, c)
++}
+diff --git a/server/torr/cache_ranges.go b/server/torr/cache_ranges.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/cache_ranges.go
+@@ -0,0 +1,43 @@
++package torr
++
++import (
++	"errors"
++	"github.com/anacrolix/torrent"
++	"github.com/anacrolix/torrent/metainfo"
++	"server/torr/state"
++	"server/torr/storage/torrstor"
++	utils2 "server/utils"
++	"sort"
++)
++
++var ErrCachedTorrentNotFound = errors.New("active cached torrent file not found")
++
++// SnapshotFileCache observes an already active torrent. GetTorrent deliberately
++// cannot be used here: it renews expiry and may reopen a stored torrent.
++func SnapshotFileCache(hashHex string, fileIndex int) (torrstor.FileCacheSnapshot, error) {
++	if bts == nil {
++		return torrstor.FileCacheSnapshot{}, ErrCachedTorrentNotFound
++	}
++	tor := bts.GetTorrent(metainfo.NewHashFromHex(hashHex))
++	if tor == nil {
++		return torrstor.FileCacheSnapshot{}, ErrCachedTorrentNotFound
++	}
++	return tor.snapshotFileCache(fileIndex)
++}
++
++func (t *Torrent) snapshotFileCache(fileIndex int) (torrstor.FileCacheSnapshot, error) {
++	t.muTorrent.Lock()
++	defer t.muTorrent.Unlock()
++	if t.Stat == state.TorrentClosed || t.Torrent == nil || t.Torrent.Info() == nil || t.cache == nil {
++		return torrstor.FileCacheSnapshot{}, ErrCachedTorrentNotFound
++	}
++	// Preserve the same natural sorted IDs as Status, but retain each actual
++	// metainfo offset; sorted file lengths are not the torrent's byte layout.
++	files := append([]*torrent.File(nil), t.Torrent.Files()...)
++	sort.Slice(files, func(i, j int) bool { return utils2.CompareStrings(files[i].Path(), files[j].Path()) })
++	if fileIndex <= 0 || fileIndex > len(files) {
++		return torrstor.FileCacheSnapshot{}, ErrCachedTorrentNotFound
++	}
++	file := files[fileIndex-1]
++	return t.cache.FileCacheSnapshot(fileIndex, file.Offset(), file.Length())
++}
+diff --git a/server/torr/storage/torrstor/cache_ranges.go b/server/torr/storage/torrstor/cache_ranges.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/storage/torrstor/cache_ranges.go
+@@ -0,0 +1,76 @@
++package torrstor
++
++import (
++	"errors"
++	"math"
++)
++
++// Each extent is a file-relative half-open interval backed by a complete RAM
++// payload, not a future retention window or the torrent library's progress bit.
++type CachedByteRange [2]int64
++
++type FileCacheSnapshot struct {
++	Hash          string            `json:"hash"`
++	FileIndex     int               `json:"file_index"`
++	FileOffset    int64             `json:"file_offset"`
++	FileLength    int64             `json:"file_length"`
++	PieceLength   int64             `json:"piece_length"`
++	ResidentBytes int64             `json:"resident_bytes"`
++	Ranges        []CachedByteRange `json:"ranges"`
++}
++
++const MaxCachedFileRanges = 32768
++
++var ErrCacheSnapshotTooFragmented = errors.New("resident cache snapshot is too fragmented")
++
++// FileCacheSnapshot only observes existing allocations. It never creates a
++// torrent reader, changes policy, touches access times or requests missing data.
++func (c *Cache) FileCacheSnapshot(fileIndex int, fileOffset, fileLength int64) (FileCacheSnapshot, error) {
++	if c == nil {
++		return FileCacheSnapshot{}, ErrPlaybackCacheClosed
++	}
++	c.muPolicy.Lock()
++	defer c.muPolicy.Unlock()
++	if c.isClosed.Load() {
++		return FileCacheSnapshot{}, ErrPlaybackCacheClosed
++	}
++	if fileIndex <= 0 || fileOffset < 0 || fileLength <= 0 || fileOffset > math.MaxInt64-fileLength || c.pieceLength <= 0 || fileOffset+fileLength > c.totalLength {
++		return FileCacheSnapshot{}, ErrInvalidPlaybackWindow
++	}
++	result := FileCacheSnapshot{Hash: c.hash.HexString(), FileIndex: fileIndex, FileOffset: fileOffset, FileLength: fileLength, PieceLength: c.pieceLength, Ranges: make([]CachedByteRange, 0)}
++	first, last := int(fileOffset/c.pieceLength), int((fileOffset+fileLength-1)/c.pieceLength)
++	pieces := c.getPieces()
++	for id := first; id <= last; id++ {
++		p := pieces[id]
++		if p == nil {
++			continue
++		}
++		expected := c.pieceBytes(id)
++		p.mu.Lock()
++		resident := expected > 0 && p.Complete && p.Size >= expected && p.mPiece != nil && int64(len(p.mPiece.buffer)) >= expected
++		p.mu.Unlock()
++		if !resident {
++			continue
++		}
++		start := int64(id) * c.pieceLength
++		end := start + expected
++		lower, upper := max(start, fileOffset)-fileOffset, min(end, fileOffset+fileLength)-fileOffset
++		if upper <= lower {
++			continue
++		}
++		result.ResidentBytes += upper - lower
++		count := len(result.Ranges)
++		if count > 0 && result.Ranges[count-1][1] == lower {
++			result.Ranges[count-1][1] = upper
++		} else {
++			if count >= MaxCachedFileRanges {
++				return FileCacheSnapshot{}, ErrCacheSnapshotTooFragmented
++			}
++			result.Ranges = append(result.Ranges, CachedByteRange{lower, upper})
++		}
++	}
++	if c.isClosed.Load() {
++		return FileCacheSnapshot{}, ErrPlaybackCacheClosed
++	}
++	return result, nil
++}
+diff --git a/server/torr/storage/torrstor/cache_ranges_test.go b/server/torr/storage/torrstor/cache_ranges_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/storage/torrstor/cache_ranges_test.go
+@@ -0,0 +1,120 @@
++package torrstor
++
++import (
++	"errors"
++	"reflect"
++	"sync"
++	"testing"
++)
++
++func TestFileCacheSnapshotUsesCompleteAllocatedPayloadAndPreservesHoles(t *testing.T) {
++	c := policyCache(t, 1000, 83, 16)
++	for _, id := range []int{0, 2, 4, 5} {
++		putPolicyPiece(c, id, true)
++	}
++	putPolicyPiece(c, 1, false)
++	c.pieces[3].Complete = true
++	c.pieces[3].Size = 16 // stale metadata, no actual allocation
++	snap, err := c.FileCacheSnapshot(2, 11, 72)
++	want := []CachedByteRange{{0, 5}, {21, 37}, {53, 72}}
++	if err != nil || !reflect.DeepEqual(snap.Ranges, want) || snap.ResidentBytes != 40 || snap.FileOffset != 11 || snap.PieceLength != 16 {
++		t.Fatalf("snapshot %+v %v", snap, err)
++	}
++	if c.Readers() != 0 || len(c.windows) != 0 {
++		t.Fatal("observation created ownership or a reader")
++	}
++	before := c.pieces[2].Accessed
++	c.FileCacheSnapshot(2, 11, 72)
++	if c.pieces[2].Accessed != before {
++		t.Fatal("observation refreshed payload access age")
++	}
++	c.pieces[2].Release()
++	snap, err = c.FileCacheSnapshot(2, 11, 72)
++	if err != nil || !reflect.DeepEqual(snap.Ranges, []CachedByteRange{{0, 5}, {53, 72}}) || snap.ResidentBytes != 24 {
++		t.Fatalf("eviction not visible %+v %v", snap, err)
++	}
++	// Other-file data and incomplete pieces alone must report an empty file.
++	empty, err := c.FileCacheSnapshot(9, 16, 16)
++	if err != nil || len(empty.Ranges) != 0 || empty.ResidentBytes != 0 || empty.Ranges == nil {
++		t.Fatalf("empty file %+v %v", empty, err)
++	}
++}
++
++func TestFileCacheSnapshotMergesOnlyAdjacentAndCountsShortLastPiece(t *testing.T) {
++	c := policyCache(t, 1000, 51, 16)
++	for _, id := range []int{0, 1, 2, 3} {
++		putPolicyPiece(c, id, true)
++	}
++	s, err := c.FileCacheSnapshot(1, 0, 51)
++	if err != nil || !reflect.DeepEqual(s.Ranges, []CachedByteRange{{0, 51}}) || s.ResidentBytes != 51 {
++		t.Fatalf("complete short tail %+v %v", s, err)
++	}
++	c.pieces[3].mu.Lock()
++	c.pieces[3].mPiece.buffer = c.pieces[3].mPiece.buffer[:2]
++	c.pieces[3].mu.Unlock()
++	s, err = c.FileCacheSnapshot(1, 0, 51)
++	if err != nil || !reflect.DeepEqual(s.Ranges, []CachedByteRange{{0, 48}}) || s.ResidentBytes != 48 {
++		t.Fatalf("short allocation treated as resident %+v %v", s, err)
++	}
++}
++
++func TestFileCacheSnapshotValidationAndBoundedFragmentation(t *testing.T) {
++	c := policyCache(t, 1000, 100, 10)
++	for _, bad := range [][3]int64{{0, 0, 10}, {1, -1, 1}, {1, 0, 0}, {1, 95, 10}, {1, 9223372036854775807, 1}} {
++		if _, err := c.FileCacheSnapshot(int(bad[0]), bad[1], bad[2]); !errors.Is(err, ErrInvalidPlaybackWindow) {
++			t.Fatalf("invalid geometry accepted %v %v", bad, err)
++		}
++	}
++	fragmented := policyCache(t, 1<<20, int64(MaxCachedFileRanges*2+1), 1)
++	for id := 0; id < fragmented.pieceCount; id += 2 {
++		putPolicyPiece(fragmented, id, true)
++	}
++	if _, err := fragmented.FileCacheSnapshot(1, 0, fragmented.totalLength); !errors.Is(err, ErrCacheSnapshotTooFragmented) {
++		t.Fatalf("unbounded or misleading fragmentation %v", err)
++	}
++	c.isClosed.Store(true)
++	if _, err := c.FileCacheSnapshot(1, 0, 100); !errors.Is(err, ErrPlaybackCacheClosed) {
++		t.Fatalf("closed snapshot %v", err)
++	}
++}
++
++func TestFileCacheSnapshotConcurrentPayloadCompletionAndEviction(t *testing.T) {
++	c := policyCache(t, 1<<20, 1<<10, 16)
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() {
++		defer wg.Done()
++		for n := 0; n < 200; n++ {
++			p := c.pieces[n%64]
++			p.mu.Lock()
++			p.Size = 16
++			p.Complete = n%3 != 0
++			p.mPiece.buffer = make([]byte, 16)
++			p.mu.Unlock()
++			if n%2 == 0 {
++				p.Release()
++			}
++		}
++	}()
++	go func() {
++		defer wg.Done()
++		for n := 0; n < 200; n++ {
++			s, err := c.FileCacheSnapshot(1, 3, 1000)
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			var count int64
++			for _, r := range s.Ranges {
++				if r[0] < 0 || r[1] > 1000 || r[0] >= r[1] {
++					t.Error("bad extent")
++				}
++				count += r[1] - r[0]
++			}
++			if count != s.ResidentBytes {
++				t.Error("inconsistent byte count")
++			}
++		}
++	}()
++	wg.Wait()
++}
+diff --git a/server/web/api/cache_ranges.go b/server/web/api/cache_ranges.go
+new file mode 100644
+--- /dev/null
++++ b/server/web/api/cache_ranges.go
+@@ -0,0 +1,49 @@
++package api
++
++import (
++	"encoding/hex"
++	"errors"
++	"net/http"
++	"server/torr"
++	"server/torr/storage/torrstor"
++)
++
++import "github.com/gin-gonic/gin"
++
++type fileCacheRequest struct {
++	Hash      string `json:"hash"`
++	FileIndex int    `json:"file_index"`
++}
++
++func playbackCache(c *gin.Context) { handlePlaybackCache(c, applyPlaybackCache) }
++
++func handlePlaybackCache(c *gin.Context, apply func(fileCacheRequest) (torrstor.FileCacheSnapshot, error)) {
++	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2048)
++	var req fileCacheRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid cache snapshot JSON"})
++		return
++	}
++	hash, err := hex.DecodeString(req.Hash)
++	if err != nil || len(hash) != 20 || req.FileIndex <= 0 {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid cache snapshot file"})
++		return
++	}
++	result, err := apply(req)
++	if err != nil {
++		status := http.StatusBadRequest
++		if errors.Is(err, torrstor.ErrPlaybackCacheClosed) || errors.Is(err, errPlaybackNotFound) || errors.Is(err, torr.ErrCachedTorrentNotFound) {
++			status = http.StatusNotFound
++		}
++		if errors.Is(err, torrstor.ErrCacheSnapshotTooFragmented) {
++			status = http.StatusRequestEntityTooLarge
++		}
++		c.JSON(status, gin.H{"error": err.Error()})
++		return
++	}
++	c.JSON(http.StatusOK, result)
++}
++
++func applyPlaybackCache(req fileCacheRequest) (torrstor.FileCacheSnapshot, error) {
++	return torr.SnapshotFileCache(req.Hash, req.FileIndex)
++}
+diff --git a/server/web/api/cache_ranges_test.go b/server/web/api/cache_ranges_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/web/api/cache_ranges_test.go
+@@ -0,0 +1,204 @@
++package api
++
++import (
++	"context"
++	"crypto/sha1"
++	"encoding/json"
++	"fmt"
++	"github.com/anacrolix/torrent"
++	"github.com/anacrolix/torrent/bencode"
++	"github.com/anacrolix/torrent/metainfo"
++	"github.com/gin-gonic/gin"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"reflect"
++	config "server/settings"
++	"server/torr"
++	"server/torr/storage/torrstor"
++	"server/web/auth"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestFileCacheSnapshotHTTPValidationAndAuthentication(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	for _, body := range []string{`{}`, `{"hash":"bad","file_index":1}`, `{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","file_index":0}`, `{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","file_index":true}`, strings.Repeat(" ", 2050) + `{}`} {
++		called := false
++		r := gin.New()
++		r.POST("/playback/cache", func(c *gin.Context) {
++			handlePlaybackCache(c, func(fileCacheRequest) (torrstor.FileCacheSnapshot, error) {
++				called = true
++				return torrstor.FileCacheSnapshot{}, nil
++			})
++		})
++		req := httptest.NewRequest("POST", "/playback/cache", strings.NewReader(body))
++		req.Header.Set("Content-Type", "application/json")
++		w := httptest.NewRecorder()
++		r.ServeHTTP(w, req)
++		if w.Code != 400 || called {
++			t.Fatalf("invalidrequeststatus%d called%v", w.Code, called)
++		}
++	}
++	previous := config.HttpAuth
++	config.HttpAuth = true
++	defer func() { config.HttpAuth = previous }()
++	r := gin.New()
++	r.Use(auth.BasicAuth(gin.Accounts{"user": "secret"}))
++	SetupRoute(r)
++	req := httptest.NewRequest("POST", "/playback/cache", strings.NewReader(`{}`))
++	w := httptest.NewRecorder()
++	r.ServeHTTP(w, req)
++	if w.Code != 401 {
++		t.Fatalf("cacheobservationnotprotected:%d", w.Code)
++	}
++}
++
++func TestFileCacheSnapshotActualHTTPUsesMetainfoOffsetsAndResidentPayload(t *testing.T) {
++	const child = "KINOLET_CACHE_SNAPSHOT_HTTP"
++	if os.Getenv(child) != "1" {
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestFileCacheSnapshotActualHTTPUsesMetainfoOffsetsAndResidentPayload$", "-test.v")
++		cmd.Env = append(os.Environ(), child+"=1")
++		out, err := cmd.CombinedOutput()
++		if err != nil {
++			t.Fatalf("isolatedsnapshotHTTP:%v\n%s", err, out)
++		}
++		t.Logf("%s", out)
++		return
++	}
++	gin.SetMode(gin.TestMode)
++	config.Path = t.TempDir()
++	config.Args = &config.ExecArgs{}
++	const piece = int64(64 << 10)
++	config.BTsets = &config.BTSets{CacheSize: 8 * piece, TorrentDisconnectTimeout: 30, DisableTCP: true, DisableUTP: true, DisableDHT: true, DisablePEX: true, DisableUPNP: true, DisableUpload: true, ConnectionsLimit: 1}
++	config.PubIPv4 = "203.0.113.1"
++	config.HttpAuth = true
++	trackerList := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("udp://127.0.0.1:1/announce\n")) }))
++	defer trackerList.Close()
++	config.BTsets.TrackersListURL = trackerList.URL
++	bt := torr.NewBTS()
++	if err := bt.Connect(); err != nil {
++		t.Fatal(err)
++	}
++	defer bt.Disconnect()
++	// Natural order is A,B but the real torrent byte order is B,A.
++	info := metainfo.Info{Name: "Show", PieceLength: piece, Files: []metainfo.FileInfo{{Length: piece + 13, Path: []string{"B.mkv"}}, {Length: 2*piece + 198, Path: []string{"A.mkv"}}}}
++	payload := make([]byte, info.TotalLength())
++	for i := range payload {
++		payload[i] = byte(i*31 + i/17)
++	}
++	for offset := int64(0); offset < int64(len(payload)); offset += piece {
++		sum := sha1.Sum(payload[offset:min(int64(len(payload)), offset+piece)])
++		info.Pieces = append(info.Pieces, sum[:]...)
++	}
++	mi := metainfo.MetaInfo{InfoBytes: bencode.MustMarshal(info)}
++	tor, err := torr.NewTorrent(&torrent.TorrentSpec{InfoHash: mi.HashInfoBytes(), InfoBytes: mi.InfoBytes}, bt)
++	if err != nil || !tor.GotInfo() {
++		t.Fatalf("newtorrent:%v", err)
++	}
++	cache := tor.GetCache()
++	r := gin.New()
++	r.Use(auth.BasicAuth(gin.Accounts{"test": "private"}))
++	SetupRoute(r)
++	server := httptest.NewServer(r)
++	defer server.Close()
++	client := server.Client()
++	client.Timeout = 3 * time.Second
++	snapshot := func(index, status int) torrstor.FileCacheSnapshot {
++		t.Helper()
++		body := fmt.Sprintf(`{"hash":%q,"file_index":%d}`, mi.HashInfoBytes().HexString(), index)
++		req, _ := http.NewRequest("POST", server.URL+"/playback/cache", strings.NewReader(body))
++		req.Header.Set("Content-Type", "application/json")
++		req.SetBasicAuth("test", "private")
++		resp, err := client.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer resp.Body.Close()
++		if resp.StatusCode != status {
++			data, _ := io.ReadAll(resp.Body)
++			t.Fatalf("status%d want%d %s", resp.StatusCode, status, data)
++		}
++		var s torrstor.FileCacheSnapshot
++		if status == 200 {
++			if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
++				t.Fatal(err)
++			}
++		}
++		return s
++	}
++	empty := snapshot(1, 200)
++	if empty.ResidentBytes != 0 || len(empty.Ranges) != 0 || empty.Ranges == nil {
++		t.Fatalf("emptycurrentfile%+v", empty)
++	}
++	for _, id := range []int{0, 1, 3} {
++		start := int64(id) * piece
++		data := payload[start:min(int64(len(payload)), start+piece)]
++		if n, err := cache.Piece(info.Piece(id)).WriteAt(data, 0); err != nil || n != len(data) {
++			t.Fatal("write")
++		}
++		tor.Torrent.Piece(id).VerifyData()
++		if !tor.Torrent.PieceState(id).Complete {
++			t.Fatal("SHA1failed")
++		}
++	}
++	cache.Piece(info.Piece(2)).WriteAt(payload[2*piece:2*piece+128], 0)
++	before := cache.GetState()
++	if before.Filled <= 2*piece {
++		t.Fatal("globalcounterisnotlarge")
++	}
++	a := snapshot(1, 200)
++	want := []torrstor.CachedByteRange{{0, piece - 13}, {2*piece - 13, 2*piece + 198}}
++	if a.FileOffset != piece+13 || a.FileLength != 2*piece+198 || !reflect.DeepEqual(a.Ranges, want) || a.ResidentBytes != piece-13+211 {
++		t.Fatalf("Aactualoffsetorholeswrong:%+v", a)
++	}
++	b := snapshot(2, 200)
++	if b.FileOffset != 0 || b.ResidentBytes != piece+13 || !reflect.DeepEqual(b.Ranges, []torrstor.CachedByteRange{{0, piece + 13}}) {
++		t.Fatalf("Bactualoffset%+v", b)
++	}
++	after := cache.GetState()
++	if before.Filled != after.Filled || cache.Readers() != 0 {
++		t.Fatal("snapshotchangedcache/readers")
++	}
++	for id := 0; id < info.NumPieces(); id++ {
++		if tor.Torrent.PieceState(id).Priority != torrent.PiecePriorityNone {
++			t.Fatalf("snapshotcreatedpiecepriority%d", id)
++		}
++	}
++	if _, err := cache.UpdatePlaybackWindow(1, piece+13, 2*piece+198, "active", 2*piece-13, 2*piece-13, 2*piece+198, 1, false); err != nil {
++		t.Fatal(err)
++	}
++	evicted := snapshot(1, 200)
++	if evicted.ResidentBytes != 211 || !reflect.DeepEqual(evicted.Ranges, []torrstor.CachedByteRange{{2*piece - 13, 2*piece + 198}}) {
++		t.Fatalf("evictedbytesstillcolored%+v", evicted)
++	}
++	snapshot(99, 404)
++	t.Logf("legacy_global_resident=%d selected_A_complete=%d file_offset=%d holes=%v post_eviction=%d readers=%d no_external_peers=true", before.Filled, a.ResidentBytes, a.FileOffset, a.Ranges, evicted.ResidentBytes, cache.Readers())
++	var wg sync.WaitGroup
++	started := make(chan struct{})
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		close(started)
++		for n := 0; n < 50; n++ {
++			_, err := torr.SnapshotFileCache(mi.HashInfoBytes().HexString(), 1)
++			if err != nil && err != torr.ErrCachedTorrentNotFound {
++				t.Errorf("close observation %v", err)
++				return
++			}
++		}
++	}()
++	<-started
++	tor.Close()
++	wg.Wait()
++	snapshot(1, 404)
++	if bt.GetTorrent(mi.HashInfoBytes()) != nil {
++		t.Fatal("closedobservationresurrectedtorrent")
++	}
 +}

@@ -310,6 +310,54 @@ void rollbackChecks() {
     expect(result.blocking && !result.waiting && result.changed,
            "rolling back a visible interval hides it until a fresh delay elapses");
 }
+
+void waitReasonChecks() {
+    using spplaywait::WaitReason;
+    expect(spplaywait::waitReason(false, false) == WaitReason::none,
+           "healthy playback has no waiting explanation");
+    expect(spplaywait::waitReason(false, true) == WaitReason::none,
+           "background source IO cannot manufacture a visible download notice");
+    expect(spplaywait::waitReason(true, true) == WaitReason::sourceIO,
+           "a visible hold with pending source IO explains that it is waiting for data");
+    expect(spplaywait::waitReason(true, false) == WaitReason::pipelineHold,
+           "a visible hold without source IO never blames downloading");
+
+    spplaywait::Policy policy;
+    auto value = input();
+    value.rebufferHold = true;
+    policy.update(value);
+    value.nowUs = delay;
+    auto result = policy.update(value);
+    expect(result.waiting && result.blocking && !value.rawWaiting,
+           "the existing remote pipeline hold can be visible without a pending read");
+    expect(spplaywait::waitReason(result.waiting, value.rawWaiting) == WaitReason::pipelineHold,
+           "an exhausted media queue is explained as playback preparation");
+
+    value.rawWaiting = true;
+    ++value.nowUs;
+    result = policy.update(value);
+    expect(result.waiting && !result.changed,
+           "source IO may begin without another visible-waiting edge");
+    expect(spplaywait::waitReason(result.waiting, value.rawWaiting) == WaitReason::sourceIO,
+           "the explanation follows the current source IO fact while the hold remains visible");
+
+    value.rawWaiting = false;
+    ++value.nowUs;
+    result = policy.update(value);
+    expect(result.waiting && !result.changed,
+           "completing source IO need not complete an existing pipeline hold");
+    expect(spplaywait::waitReason(result.waiting, value.rawWaiting) == WaitReason::pipelineHold,
+           "completing source IO removes the download explanation immediately");
+
+    value.rebufferHold = false;
+    ++value.nowUs;
+    result = policy.update(value);
+    expect(!result.waiting && spplaywait::waitReason(result.waiting, true) == WaitReason::none,
+           "recovered playback clears its reason even when background IO continues");
+    policy.reset();
+    expect(spplaywait::waitReason(policy.waiting(), true) == WaitReason::none,
+           "source reset cannot retain the preceding source's explanation");
+}
 }
 
 int main() {
@@ -321,5 +369,6 @@ int main() {
     eligibilityAndResetChecks();
     generationChecks();
     rollbackChecks();
+    waitReasonChecks();
     std::cout << "Source playback waiting checks passed (" << checks << " assertions)." << std::endl;
 }

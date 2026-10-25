@@ -147,6 +147,7 @@ struct TorrentServerChecks {
         try await playbackWindowChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await playbackSeekHandoverChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await prefetchCapacityProofChecks(fixture: CommandLine.arguments[1], scratch: scratch)
+        try await cacheSnapshotChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         print("Torrent server protocol checks passed (\(assertions) assertions).")
     }
 
@@ -797,4 +798,51 @@ struct TorrentServerChecks {
               events().filter { $0["seeking"] as? Bool == true }.count == markersAtShutdown,
               "Shutdown cancels pending marker work without restarting a worker or retrying its former lease")
     }
+    static func cacheSnapshotChecks(fixture: String, scratch: URL) async throws {
+        let directory = scratch.appendingPathComponent("cache-snapshot", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let server = SPTorrentServer(workerURL: URL(fileURLWithPath: fixture), temporaryDirectory: directory,
+                                    metadataTimeout: 0.5, idleTimeout: 30, peerDiscoveryEnabled: false)
+        ownedServer = server
+        defer { server.shutdown(); ownedServer = nil }
+        let descriptor = try await server.add(magnet: link(95))
+        let file = descriptor.files[0]
+        let result = try await server.cacheSnapshot(descriptor, file: file)
+        check(result.fileID == 7 && result.fileOffset == 13 && result.ranges == [.init(lowerBound: 0, upperBound: 65523)] && result.residentBytes == 65523,
+              "Authenticated compact snapshot preserves authoritative selected-file offset and complete resident extents")
+        func events() -> [[String: Any]] {
+            guard let data = try? Data(contentsOf: directory.appendingPathComponent("fixture-events.jsonl")),
+                  let text = String(data: data, encoding: .utf8) else { return [] }
+            return text.split(separator: "\n").compactMap { (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any] }
+        }
+        check(events().contains { $0["kind"] as? String == "cache-snapshot" && $0["file_index"] as? Int == 7 && $0["hash"] as? String == descriptor.hash },
+              "Snapshot requests carry the exact torrent and authoritative file ID")
+        let oldCount = events().filter { $0["kind"] as? String == "cache-snapshot" }.count
+        do { _ = try await server.cacheSnapshot(descriptor, file: SPTorrentFile(id: 99, path: "invented.mkv", length: 100)); check(false, "invented file reached cache API") }
+        catch SPTorrentServerError.invalidLease { check(true, "An invented snapshot file is rejected before HTTP") }
+        check(events().filter { $0["kind"] as? String == "cache-snapshot" }.count == oldCount,
+              "Invalid file metadata sends no cache observation request")
+        let override = directory.appendingPathComponent("cache-reply-override-" + descriptor.hash + ".json")
+        try JSONSerialization.data(withJSONObject: ["ranges": [], "resident_bytes": 0]).write(to: override)
+        check(try await server.cacheSnapshot(descriptor, file: file).ranges.isEmpty,
+              "The UI receives empty current-file coverage independently of global cache totals")
+        for bad in [["hash": String(repeating: "0", count: 40)], ["file_index": 2], ["resident_bytes": 1], ["ranges": [[0, file.length + 1]]]] as [[String: Any]] {
+            try JSONSerialization.data(withJSONObject: bad).write(to: override)
+            do { _ = try await server.cacheSnapshot(descriptor, file: file); check(false, "malformed cache coverage accepted") }
+            catch SPTorrentServerError.invalidResponse { check(true, "Malformed or mismatched cache observations cannot color the timeline") }
+        }
+        try FileManager.default.removeItem(at: override)
+        let gate = directory.appendingPathComponent("hold-cache-reply-" + descriptor.hash)
+        try Data().write(to: gate)
+        let pending = Task { try await server.cacheSnapshot(descriptor, file: file) }
+        check(try await wait({ FileManager.default.fileExists(atPath: directory.appendingPathComponent("cache-reply-started-" + descriptor.hash).path) }),
+              "A snapshot may remain in flight while its source lease closes")
+        server.release(descriptor)
+        try FileManager.default.removeItem(at: gate)
+        do { _ = try await pending.value; check(false, "closed lease accepted stale cache coverage") }
+        catch is CancellationError { check(true, "A closed source discards its late cache snapshot") }
+        do { _ = try await server.cacheSnapshot(descriptor, file: file); check(false, "released lease queried cache") }
+        catch SPTorrentServerError.invalidLease { check(true, "Released leases cannot keep observing a torrent cache") }
+    }
+
 }

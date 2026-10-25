@@ -1,5 +1,61 @@
 import Foundation
 import CryptoKit
+import CoreFoundation
+
+/// Half-open, file-relative bytes backed by complete resident torrent pieces.
+struct SPTorrentCachedByteRange: Equatable, Sendable {
+    let lowerBound: Int64
+    let upperBound: Int64
+}
+
+/// A cache observation, independent of download totals and retention budgets.
+/// Holes remain holes; consumers must not interpolate missing media bytes.
+struct SPTorrentCacheSnapshot: Equatable, Sendable {
+    let fileID: Int
+    let fileOffset: Int64
+    let fileLength: Int64
+    let pieceLength: Int64
+    let residentBytes: Int64
+    let ranges: [SPTorrentCachedByteRange]
+
+    init?(json: Any, expectedHash: String, file: SPTorrentFile) {
+        guard let object = json as? [String: Any],
+              object["hash"] as? String == expectedHash,
+              Self.integer(object["file_index"]) == Int64(file.id),
+              let offset = Self.integer(object["file_offset"]), offset >= 0,
+              let length = Self.integer(object["file_length"]), length > 0, length == file.length,
+              offset <= Int64.max - length,
+              let piece = Self.integer(object["piece_length"]), piece > 0,
+              let resident = Self.integer(object["resident_bytes"]), resident >= 0, resident <= length,
+              let encoded = object["ranges"] as? [[Any]], encoded.count <= 32_768 else { return nil }
+        var parsed: [SPTorrentCachedByteRange] = []
+        parsed.reserveCapacity(encoded.count)
+        var count: Int64 = 0
+        for pair in encoded {
+            guard pair.count == 2, let lower = Self.integer(pair[0]), let upper = Self.integer(pair[1]),
+                  lower >= 0, upper > lower, upper <= length,
+                  parsed.last.map({ $0.upperBound < lower }) ?? true,
+                  lower == 0 || (offset + lower) % piece == 0,
+                  upper == length || (offset + upper) % piece == 0 else { return nil }
+            let (sum, overflow) = count.addingReportingOverflow(upper - lower)
+            guard !overflow, sum <= length else { return nil }
+            count = sum
+            parsed.append(SPTorrentCachedByteRange(lowerBound: lower, upperBound: upper))
+        }
+        guard count == resident else { return nil }
+        fileID = file.id
+        fileOffset = offset
+        fileLength = length
+        pieceLength = piece
+        residentBytes = resident
+        ranges = parsed
+    }
+
+    private static func integer(_ value: Any?) -> Int64? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        return Int64(number.stringValue)
+    }
+}
 
 struct SPTorrentFile: Codable, Equatable, Sendable, Identifiable {
     let id: Int

@@ -9,4 +9,4 @@ xcrun swiftc -swift-version 6 -parse-as-library \
   "$ROOT/Apps/Mac/UI/FloatingVideoController.swift" \
   "$ROOT/Scripts/tests/floating_video.swift" \
   -o "$CHECK_DIR/floating-video-checks"
-"$CHECK_DIR/floating-video-checks"
+"$CHECK_DIR/floating-video-checks" "$@"

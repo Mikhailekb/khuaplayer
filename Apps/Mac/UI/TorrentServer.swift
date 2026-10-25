@@ -70,7 +70,7 @@ struct SPTorrentPlaybackWindow: Equatable, Sendable {
 @MainActor
 final class SPTorrentServer {
     static let shared = SPTorrentServer()
-    nonisolated static let workerVersion = "MatriX.147-khua.6"
+    nonisolated static let workerVersion = "MatriX.147-khua.7"
     /// Default for callers without an active worker; runtime status uses the
     /// configuration captured by the worker, never the desired preference.
     nonisolated static let cacheSizeBytes = SPTorrentConfiguration().cacheSizeBytes
@@ -327,6 +327,26 @@ final class SPTorrentServer {
             "Filled": object["preloaded_bytes"] as? NSNumber ?? 0,
             "Capacity": configuration.cacheSizeBytes
         ])
+    }
+
+    /// Observes complete resident ranges for one actual torrent file. This
+    /// request never opens a media reader or grants download/cache priority.
+    func cacheSnapshot(_ descriptor: SPTorrentDescriptor, file: SPTorrentFile) async throws -> SPTorrentCacheSnapshot {
+        try Task.checkCancellation()
+        guard leaseHashes[descriptor.leaseID] == descriptor.hash,
+              let record = records[descriptor.hash], record.files.contains(file),
+              let worker, worker.process.isRunning else { throw SPTorrentServerError.invalidLease }
+        let expectedGeneration = worker.generation
+        let reply = try await jsonRequest(path: "/playback/cache", body: [
+            "hash": descriptor.hash, "file_index": file.id
+        ], expectedGeneration: expectedGeneration)
+        try Task.checkCancellation()
+        guard self.worker?.generation == expectedGeneration,
+              leaseHashes[descriptor.leaseID] == descriptor.hash else { throw CancellationError() }
+        guard let snapshot = SPTorrentCacheSnapshot(json: reply, expectedHash: descriptor.hash, file: file) else {
+            throw SPTorrentServerError.invalidResponse
+        }
+        return snapshot
     }
 
     /// Core extracts these credentials into Authorization and removes userinfo

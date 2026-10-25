@@ -19,6 +19,7 @@
 #include "SPReadSourceView.hpp"
 #include "SPDoviTransport.hpp"
 #include "SPVideoOrientation.hpp"
+#include "SPCachedTimeline.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -186,6 +187,10 @@ public:
 
     int64_t timelineOriginUs() const { return timelineOriginUs_; }
 
+    // Immutable facts published by the serialized demux owner. Consumers never
+    // inspect AVStream or trigger source reads while painting cache coverage.
+    std::shared_ptr<const spcachetime::SourceMap> sourceTimeMapSnapshot() const;
+
     int readPacket(AVPacket* pkt, bool allowHTTPYield = true);
 
     bool lastPacketIsReplay() const { return lastPacketReplay_; }
@@ -308,6 +313,10 @@ public:
     int warmNextKeyframeClusters(int fromIdx, int64_t* lastUsInOut);
 
 private:
+    void captureSourceTimeMap(bool force = false);
+    mutable std::mutex sourceTimeMapMutex_;
+    std::shared_ptr<const spcachetime::SourceMap> sourceTimeMap_;
+    int64_t sourceTimeMapCaptureUs_ = 0;
     void buildStreamInfo(AVStream* s);
     void selectStreams();
     int rawSeekToAbsUs(int64_t absUs, int streamIndex,

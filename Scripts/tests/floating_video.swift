@@ -36,6 +36,19 @@ struct FloatingVideoChecks {
         try bitmap.representation(using: .png, properties: [:])!.write(to: path)
     }
 
+    static func barWhite(_ slider: NSSlider, at fraction: Double) -> Double {
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 400, pixelsHigh: 20,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)!
+        NSColor.black.setFill()
+        NSRect(x: 0, y: 0, width: 400, height: 20).fill()
+        (slider.cell as! NSSliderCell).drawBar(inside: NSRect(x: 0, y: 0, width: 400, height: 20), flipped: false)
+        NSGraphicsContext.restoreGraphicsState()
+        return bitmap.colorAt(x: Int(fraction * 400), y: 10)!.usingColorSpace(.deviceRGB)!.redComponent
+    }
+
     static func main() throws {
         setbuf(stdout, nil)
         NSApplication.shared.setActivationPolicy(.prohibited)
@@ -63,6 +76,7 @@ struct FloatingVideoChecks {
         controller.onDidRestore = { restored += 1 }
         controller.onLayoutChange = { layouts += 1 }
         controller.update(isPlaying: false, position: 394, duration: 1014, volumePercent: 72, muted: false)
+        controller.setBufferedRanges([0.2...0.4, 0.5...0.6, 0.8...0.9], visible: true)
         expect(!controller.isActive && controller.window == nil, "Starts without another window")
         expect(controller.present(videoView: video, aspectRatio: 16 / 9, sourceWindow: source, showWindow: false), "Existing video enters floating mode")
         let panel = controller.window!
@@ -81,6 +95,13 @@ struct FloatingVideoChecks {
         expect(video.frame == content.bounds, "Video fills the entire floating window with no permanent footer")
         expect(abs(video.bounds.width / video.bounds.height - 16 / 9) < 0.001, "Video keeps its source aspect with overlay controls")
         expect(controls.alphaValue == 0, "Paused video initially has no controls without hover")
+        expect(barWhite(timeline, at: 0.1) > 0.95 && barWhite(timeline, at: 0.55) > 0.72 &&
+               barWhite(timeline, at: 0.7) < 0.45, "PiP paints white played, gray cached and darker uncached regions")
+        expect(barWhite(volume, at: 0.85) < 0.45, "The shared volume slider never inherits timeline cache coverage")
+        controller.setBufferedRanges([], visible: true)
+        expect(barWhite(timeline, at: 0.55) < 0.45 && controls.alphaValue == 0,
+               "Cache eviction updates the hidden PiP timeline without revealing controls")
+        controller.setBufferedRanges([0.2...0.4, 0.5...0.6, 0.8...0.9], visible: true)
         expect(current.stringValue == "6:34" && total.stringValue == "16:54", "Actual playback times match the provided Telegram-style example")
         expect(timeline.doubleValue == 394 && timeline.maxValue == 1014 && timeline.isEnabled, "The real seek control tracks media seconds")
         expect(!timeline.isContinuous && volume.isContinuous, "Seek commits once per completed drag while volume responds continuously")
@@ -136,6 +157,8 @@ struct FloatingVideoChecks {
         volume.endTracking()
         controller.update(isPlaying: false, position: .nan, duration: .infinity, volumePercent: .nan, muted: false)
         expect(!timeline.isEnabled && timeline.doubleValue == 0 && current.stringValue == "0:00" && total.stringValue == "0:00", "Unknown or non-finite media timing disables seeking safely")
+        expect(barWhite(timeline, at: 0.55) < 0.45,
+               "Unknown media timing cannot display stale cached time positions")
         expect(volume.doubleValue == 100, "Non-finite volume falls back to a finite control value")
         timeline.sendAction(timeline.action, to: timeline.target)
         expect(seeks == [615], "A disabled timeline cannot dispatch an invalid seek")

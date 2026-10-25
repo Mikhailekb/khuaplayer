@@ -48,6 +48,13 @@ struct TorrentWorkerStartupCheck {
                 throw SPTorrentServerError.invalidResponse
             }
             print("PASS: actual worker handshake, authenticated metainfo upload, descriptor and status")
+            let cached = try await server.cacheSnapshot(descriptor, file: descriptor.files[0])
+            guard cached.fileID == descriptor.files[0].id, cached.fileOffset == 0,
+                  cached.fileLength == 1, cached.pieceLength == 16384,
+                  cached.residentBytes == 0, cached.ranges.isEmpty else {
+                throw SPTorrentServerError.invalidResponse
+            }
+            print("PASS: authenticated current-file cache snapshot reports no fabricated payload")
             // Exercise the shipped route with its real authentication and
             // revision ordering. This independent consumer has no media reader
             // and cannot allocate or download payload from a swarm.

@@ -46,6 +46,7 @@ struct SPSourcePacketBytePoint {
     int64_t position;
     int64_t durationUs;
     int stream;
+    int64_t sourceUpper;
 };
 
 static NSURL* spMediaURLFromPath(NSString* path) {
@@ -675,6 +676,7 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     BOOL _pubSourceWaiting;
     BOOL _pubSourceStalled;
     BOOL _pubSourcePlaybackWaiting;
+    SPSourcePlaybackWaitReason _pubSourcePlaybackWaitReason;
     spplaywait::Policy _sourcePlaybackWaitPolicy;
     BOOL _sourcePlaybackWaitCheckQueued;
     uint64_t _sourcePlaybackWaitCheckToken;
@@ -1038,6 +1040,7 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     std::deque<SPSourcePacketBytePoint> _sourcePacketBytes;
     int64_t _sourcePacketBytesOpenGeneration;
     int64_t _sourcePacketBytesSeekGeneration;
+    int64_t _sourcePacketPhysicalFrontier;
     std::atomic<int64_t> _sourcePlaybackTimeUs;
     std::atomic<int64_t> _sourcePlaybackTimeSeekGeneration;
 
@@ -2468,6 +2471,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     _sourcePlaybackTimeSeekGeneration.store(-1);
     std::lock_guard<std::mutex> lock(_sourcePacketBytesMtx);
     _sourcePacketBytes.clear();
+    _sourcePacketPhysicalFrontier = -1;
     _sourcePacketBytesOpenGeneration = openGen;
     _sourcePacketBytesSeekGeneration = seekGen;
 }
@@ -2494,10 +2498,19 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
     const int64_t ptsUs = av_rescale_q(packet->pts, timeBase, AV_TIME_BASE_Q);
     const int64_t durationUs = packet->duration > 0
         ? av_rescale_q(packet->duration, timeBase, AV_TIME_BASE_Q) : 0;
+    // Container lacing, compression and packet reconstruction can make size
+    // differ from the source extent. The demux owner's post-read logical
+    // frontier conservatively includes the raw block behind a returned packet.
+    AVFormatContext *context = _demuxer ? _demuxer->ctx() : nullptr;
+    int64_t sourceUpper = context && context->pb ? avio_tell(context->pb) : -1;
     std::lock_guard<std::mutex> lock(_sourcePacketBytesMtx);
     if (_sourcePacketBytesOpenGeneration != openGen ||
         _sourcePacketBytesSeekGeneration != seekGen ||
         openGen != _openGeneration.load() || seekGen != _generation.load()) return;
+    // A later queued lace can retain the same block position after a metadata
+    // cursor rewind. Never shrink its known physical block frontier.
+    _sourcePacketPhysicalFrontier = std::max(_sourcePacketPhysicalFrontier, sourceUpper);
+    sourceUpper = _sourcePacketPhysicalFrontier;
     // Keep two seconds of reordering slack behind the actual 20-second history
     // boundary. B-frames can arrive out of PTS order, so queries scan exact facts.
     const int64_t playedUs = _sourcePlaybackTimeSeekGeneration.load() == seekGen
@@ -2509,7 +2522,7 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         }
     }
     if (_sourcePacketBytes.size() >= 32768) _sourcePacketBytes.pop_front();
-    _sourcePacketBytes.push_back({ptsUs, packet->pos, durationUs, packet->stream_index});
+    _sourcePacketBytes.push_back({ptsUs, packet->pos, durationUs, packet->stream_index, sourceUpper});
 }
 
 - (void)noteSourcePlaybackTimeUs:(int64_t)ptsUs seekGeneration:(int64_t)seekGen {
@@ -8758,9 +8771,10 @@ static void spApplyDecodeQoS() {
 - (BOOL)contentSearching { return _pubContentSearching; }
 
 - (void)resetSourcePlaybackWaiting {
-    const BOOL changed = _pubSourcePlaybackWaiting;
+    const BOOL changed = _pubSourcePlaybackWaiting || _pubSourcePlaybackWaitReason != SPSourcePlaybackWaitReasonNone;
     _sourcePlaybackWaitPolicy.reset();
     _pubSourcePlaybackWaiting = NO;
+    _pubSourcePlaybackWaitReason = SPSourcePlaybackWaitReasonNone;
     _sourcePlaybackWaitCheckToken++;
     _sourcePlaybackWaitCheckQueued = NO;
     if (changed && [_delegate respondsToSelector:@selector(playerCoreDidChangeSourceGrowth:)])
@@ -8829,6 +8843,9 @@ static void spApplyDecodeQoS() {
         [self scheduleSourcePlaybackWaitCheck];
     const BOOL playbackWaitChanged = playbackWait.waiting != bool(_pubSourcePlaybackWaiting);
     _pubSourcePlaybackWaiting = playbackWait.waiting;
+    const auto waitReason = static_cast<SPSourcePlaybackWaitReason>(spplaywait::waitReason(playbackWait.waiting, g.waiting));
+    const BOOL waitReasonChanged = waitReason != _pubSourcePlaybackWaitReason;
+    _pubSourcePlaybackWaitReason = waitReason;
 
 
     BOOL renamed = NO;
@@ -8842,7 +8859,7 @@ static void spApplyDecodeQoS() {
             renamed = YES;
         }
     }
-    if (!renamed && !playbackWaitChanged && growing == _pubSourceGrowing && waiting == _pubSourceWaiting && stalled == _pubSourceStalled) return;
+    if (!renamed && !playbackWaitChanged && !waitReasonChanged && growing == _pubSourceGrowing && waiting == _pubSourceWaiting && stalled == _pubSourceStalled) return;
     _pubSourceGrowing = growing;
     _pubSourceWaiting = waiting;
     _pubSourceStalled = stalled;
@@ -8855,6 +8872,7 @@ static void spApplyDecodeQoS() {
 - (BOOL)sourceGrowing { return _pubSourceGrowing; }
 - (BOOL)sourceWaiting { return _pubSourceWaiting || _indexWaiting; }
 - (BOOL)sourcePlaybackWaiting { return _pubSourcePlaybackWaiting; }
+- (SPSourcePlaybackWaitReason)sourcePlaybackWaitReason { return _pubSourcePlaybackWaitReason; }
 - (BOOL)sourceStalled { return _pubSourceStalled || (_indexWaiting && _indexWaitStalled); }
 - (BOOL)sourceWaitingForIndex { return _indexWaiting; }
 
@@ -10645,6 +10663,106 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
 
 - (int64_t)sourcePlaybackByteOffset { return self.sourcePlaybackWindow.playbackOffset; }
 - (int64_t)sourceHistoryStartOffset { return self.sourcePlaybackWindow.historyStartOffset; }
+
+- (NSDictionary<NSString *, id> *)cachedTimelineForByteRanges:(NSArray<NSArray<NSNumber *> *> *)byteRanges {
+    const int64_t openGen = _openGeneration.load();
+    const int64_t seekGen = _generation.load();
+    auto unavailable = ^NSDictionary *{
+        return @{ @"openGeneration": @(openGen), @"seekGeneration": @(seekGen),
+                  @"duration": @(_duration), @"mappingAvailable": @NO,
+                  @"videoMappingAvailable": @NO, @"audioMappingAvailable": @NO,
+                  @"completeIndex": @NO, @"ranges": @[], @"videoRanges": @[], @"audioRanges": @[] };
+    };
+    if (!_demuxer || !_sourceReadHTTP.load() || !_running.load() || byteRanges.count > 32768) return unavailable();
+    const auto index = _demuxer->sourceTimeMapSnapshot();
+    if (!index || index->sourceSize <= 0 || index->durationUs <= 0) return unavailable();
+    std::vector<spcachetime::ByteRange> raw;
+    raw.reserve(byteRanges.count);
+    for (id value in byteRanges) {
+        if (![value isKindOfClass:[NSArray class]] || [value count] != 2) return unavailable();
+        id lower = value[0], upper = value[1];
+        if (![lower isKindOfClass:[NSNumber class]] || ![upper isKindOfClass:[NSNumber class]] ||
+            CFGetTypeID((__bridge CFTypeRef)lower) == CFBooleanGetTypeID() ||
+            CFGetTypeID((__bridge CFTypeRef)upper) == CFBooleanGetTypeID() ||
+            CFNumberIsFloatType((__bridge CFNumberRef)lower) || CFNumberIsFloatType((__bridge CFNumberRef)upper)) return unavailable();
+        const int64_t lowerValue = [lower longLongValue], upperValue = [upper longLongValue];
+        if (lowerValue < 0 || upperValue <= lowerValue || upperValue > index->sourceSize) return unavailable();
+        raw.push_back({lowerValue, upperValue});
+    }
+    const auto resident = spcachetime::normalizeBytes(std::move(raw), index->sourceSize);
+    const int video = _audioOnlySession.load() ? -1 : _videoStreamIndex;
+    const int audio = _hasAudio ? _currentAudioTrackPub.load() : -1;
+    std::vector<spcachetime::Span> videoIndex, audioIndex, videoObserved, audioObserved;
+    for (const auto &stream : index->streams) {
+        if (stream.stream == video) videoIndex = stream.spans;
+        if (stream.stream == audio) audioIndex = stream.spans;
+    }
+    {
+        std::lock_guard<std::mutex> lock(_sourcePacketBytesMtx);
+        if (_sourcePacketBytesOpenGeneration == openGen && _sourcePacketBytesSeekGeneration == seekGen) {
+            for (const auto &packet : _sourcePacketBytes) {
+                if (packet.position < 0 || packet.sourceUpper <= packet.position || packet.durationUs <= 0 || packet.ptsUs < 0 ||
+                    packet.ptsUs > INT64_MAX - packet.durationUs) continue;
+                spcachetime::Span span{packet.position, packet.sourceUpper,
+                                       packet.ptsUs, packet.ptsUs + packet.durationUs};
+                if (packet.stream == video) videoObserved.push_back(span);
+                if (packet.stream == audio) audioObserved.push_back(span);
+            }
+        }
+    }
+    auto joined = [&](std::vector<spcachetime::TimeRange> a, const std::vector<spcachetime::TimeRange> &b) {
+        a.insert(a.end(), b.begin(), b.end());
+        return spcachetime::normalizeTimes(std::move(a), index->durationUs);
+    };
+    const auto videoRanges = joined(spcachetime::covered(videoIndex, resident, index->durationUs),
+                                    spcachetime::covered(videoObserved, resident, index->durationUs));
+    const auto audioRanges = joined(spcachetime::covered(audioIndex, resident, index->durationUs),
+                                    spcachetime::covered(audioObserved, resident, index->durationUs));
+    // Generic container indices can use decode timestamps. Confirmed A/V ranges
+    // use exact observed PTS; the separate index-based video layer describes
+    // downloaded container regions rather than a decoder-readiness guarantee.
+    const auto exactVideo = spcachetime::covered(videoObserved, resident, index->durationUs);
+    const auto exactAudio = spcachetime::covered(audioObserved, resident, index->durationUs);
+    const auto confirmed = video < 0 ? exactAudio : audio < 0 ? exactVideo : spcachetime::intersect(exactVideo, exactAudio);
+    int64_t residentBytes = 0;
+    for (const auto &r : resident) residentBytes += r.upper - r.lower;
+    std::vector<spcachetime::ByteRange> mappedBytes;
+    auto appendMapped = [&](const std::vector<spcachetime::Span> &spans) {
+        for (const auto &s : spans)
+            if (s.timeLower >= 0 && s.timeUpper > s.timeLower &&
+                spcachetime::covers(resident, s.byteLower, s.byteUpper)) mappedBytes.push_back({s.byteLower, s.byteUpper});
+    };
+    appendMapped(video < 0 ? audioIndex : videoIndex);
+    appendMapped(video < 0 ? audioObserved : videoObserved);
+    int64_t mappedResidentBytes = 0;
+    for (const auto &r : spcachetime::normalizeBytes(std::move(mappedBytes), index->sourceSize)) mappedResidentBytes += r.upper - r.lower;
+    auto array = [](const std::vector<spcachetime::TimeRange> &ranges) -> NSArray * {
+        NSMutableArray *result = [NSMutableArray arrayWithCapacity:ranges.size()];
+        for (const auto &r : ranges) [result addObject:@[@(r.lower / 1e6), @(r.upper / 1e6)]];
+        return result;
+    };
+    if (openGen != _openGeneration.load() || seekGen != _generation.load()) return unavailable();
+    const bool videoKnown = video < 0 || !videoIndex.empty() || !videoObserved.empty();
+    const bool audioKnown = audio < 0 || !audioIndex.empty() || !audioObserved.empty();
+    // FFmpeg does not publish an index-completeness guarantee for all demuxers.
+    // Existing entries are usable facts, but absence remains unknown.
+    const bool completeIndex = false;
+    const auto window = self.sourcePlaybackWindow;
+    const int64_t readOffset = self.sourceReadOffset;
+    return @{ @"openGeneration": @(openGen), @"seekGeneration": @(seekGen),
+              @"duration": @(index->durationUs / 1e6), @"sourceSize": @(index->sourceSize),
+              @"videoStream": @(video), @"audioStream": @(audio),
+              @"residentBytes": @(residentBytes), @"mappedResidentBytes": @(mappedResidentBytes),
+              @"unmappedResidentBytes": @(residentBytes - mappedResidentBytes),
+              @"mappingPartial": @(mappedResidentBytes < residentBytes),
+              @"mappingAvailable": @(videoKnown && audioKnown), @"videoMappingAvailable": @(videoKnown),
+              @"audioMappingAvailable": @(audioKnown), @"completeIndex": @(completeIndex),
+              @"ranges": array(confirmed), @"videoRanges": array(videoRanges), @"audioRanges": array(audioRanges),
+              @"playheadByte": @(window.playbackOffset), @"readerByte": @(readOffset),
+              @"playheadByteResident": @(window.playbackOffset >= 0 && window.playbackOffset < INT64_MAX && spcachetime::covers(resident, window.playbackOffset, window.playbackOffset + 1)),
+              @"readerByteResident": @(readOffset >= 0 && readOffset < INT64_MAX && spcachetime::covers(resident, readOffset, readOffset + 1)),
+              @"waitReason": @(_pubSourcePlaybackWaitReason) };
+}
 
 - (SPPlayerState)state { return _state; }
 

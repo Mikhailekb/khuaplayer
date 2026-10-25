@@ -39,6 +39,13 @@ typedef struct SPSourcePlaybackWindow {
     double historyStartTime;
 } SPSourcePlaybackWindow;
 
+// A visible hold can come from source I/O or from queued decode/presentation.
+typedef NS_ENUM(NSInteger, SPSourcePlaybackWaitReason) {
+    SPSourcePlaybackWaitReasonNone = 0,
+    SPSourcePlaybackWaitReasonSourceIO = 1,
+    SPSourcePlaybackWaitReasonPipeline = 2,
+};
+
 // Budget-based Apple frame interpolation, exposed on the macOS 26+ feature tier.
 // The requested mode doubles source cadence when resources permit; uncovered
 // frame pairs retain the original source cadence.
@@ -179,6 +186,10 @@ NS_SWIFT_UI_ACTOR
 // Unknown history after a seek is omitted rather than guessed; packet/container
 // and downstream torrent-piece granularity determine the final cache boundary.
 @property (nonatomic, readonly) SPSourcePlaybackWindow sourcePlaybackWindow;
+// Complete file-relative byte ranges are mapped through observed/indexed media timestamps.
+// The snapshot performs no source I/O and returns unknown coverage conservatively.
+- (NSDictionary<NSString *, id> *)cachedTimelineForByteRanges:(NSArray<NSArray<NSNumber *> *> *)byteRanges;
+@property (nonatomic, readonly) SPSourcePlaybackWaitReason sourcePlaybackWaitReason;
 @property (nonatomic, readonly) int64_t sourcePlaybackByteOffset;
 @property (nonatomic, readonly) int64_t sourceHistoryStartOffset;
 // Verified coarse-seek landing for the current generation, in zero-based

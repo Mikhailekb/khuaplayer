@@ -2422,6 +2422,12 @@ final class SPProgressView: NSView {
     private let remainLayer = CAShapeLayer()
     private let fillLayer = CAShapeLayer()
     private let knobLayer = CALayer()
+    private let bufferedBaseLayer = CAShapeLayer()
+    private let bufferedLayer = CAShapeLayer()
+    private let bufferedMask = CAShapeLayer()
+    private let bufferedPlayedLayer = CAShapeLayer()
+    private var bufferedRanges: [ClosedRange<Double>] = []
+    private var showsBufferedRanges = false
 
     private let damagePartialLayer = CAShapeLayer()
     private let damageNoneLayer = CAShapeLayer()
@@ -2438,6 +2444,14 @@ final class SPProgressView: NSView {
 
     private var dust: SPDustHost?
     private var bulgeEnabled = true
+    func setBufferedRanges(_ ranges: [ClosedRange<Double>], visible: Bool) {
+        let normalized = visible ? SPBufferedTimeline.normalized(ranges) : []
+        guard bufferedRanges != normalized || showsBufferedRanges != visible else { return }
+        bufferedRanges = normalized
+        showsBufferedRanges = visible
+        updateTrackVisibility()
+        relayout()
+    }
     func setDust(snapshot: SPThumbDustSnapshot?, duration: Double) {
         dust?.setSnapshot(snapshot, duration: duration)
     }
@@ -2447,7 +2461,7 @@ final class SPProgressView: NSView {
         damageBands = bands
         damageDuration = duration
         dust?.setDamage(bands: bands, duration: duration)
-        if dust == nil { relayout() }
+        if dust == nil || showsBufferedRanges { relayout() }
     }
 
     func applyStyle(_ style: SPTimelineStyleSettings.Style) {
@@ -2471,12 +2485,26 @@ final class SPProgressView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        for l: CALayer in [remainLayer, fillLayer, knobLayer, damagePartialLayer, damageNoneLayer, damagePendingLayer] {
+        for l: CALayer in [remainLayer, fillLayer, knobLayer, damagePartialLayer, damageNoneLayer, damagePendingLayer,
+                          bufferedBaseLayer, bufferedLayer, bufferedMask, bufferedPlayedLayer] {
             l.actions = ["bounds": NSNull(), "position": NSNull(), "transform": NSNull(),
                          "hidden": NSNull(), "backgroundColor": NSNull(), "path": NSNull()]
         }
         remainLayer.fillColor = SPT.trackRemain.cgColor
         fillLayer.fillColor = NSColor.white.cgColor
+        bufferedBaseLayer.fillColor = NSColor(white: 0.18, alpha: 1).cgColor
+        bufferedLayer.fillColor = NSColor(white: 0.64, alpha: 1).cgColor
+        bufferedPlayedLayer.fillColor = NSColor.white.cgColor
+        bufferedMask.fillColor = NSColor.white.cgColor
+        bufferedLayer.mask = bufferedMask
+        bufferedBaseLayer.name = "sp.timeline.buffered.base"
+        bufferedLayer.name = "sp.timeline.buffered.ranges"
+        bufferedPlayedLayer.name = "sp.timeline.buffered.played"
+        bufferedBaseLayer.zPosition = 10
+        bufferedLayer.zPosition = 11
+        bufferedPlayedLayer.zPosition = 12
+        for l in [damagePendingLayer, damagePartialLayer, damageNoneLayer] { l.zPosition = 15 }
+        knobLayer.zPosition = 20
         damagePartialLayer.fillColor = SPDamage.partialColor.cgColor
         damageNoneLayer.fillColor = SPDamage.noneColor.cgColor
         damagePendingLayer.fillColor = SPDamage.pendingColor.cgColor
@@ -2490,6 +2518,8 @@ final class SPProgressView: NSView {
         layer?.addSublayer(damagePartialLayer)
         layer?.addSublayer(damageNoneLayer)
         layer?.addSublayer(knobLayer)
+        for l in [bufferedBaseLayer, bufferedLayer, bufferedPlayedLayer] { layer?.addSublayer(l) }
+        updateTrackVisibility()
         applyStyle(SPTimelineStyleSettings.style)
     }
 
@@ -2500,8 +2530,6 @@ final class SPProgressView: NSView {
             dust = d
             d.attach(to: self)
             layer?.addSublayer(d.layer)
-            remainLayer.isHidden = true
-            fillLayer.isHidden = true
             knobLayer.isHidden = true
             damagePartialLayer.isHidden = true
             damageNoneLayer.isHidden = true
@@ -2517,13 +2545,22 @@ final class SPProgressView: NSView {
             d.detach()
             d.layer.removeFromSuperlayer()
             dust = nil
-            remainLayer.isHidden = false
-            fillLayer.isHidden = false
             knobLayer.isHidden = false
             damagePartialLayer.isHidden = false
             damageNoneLayer.isHidden = false
             damagePendingLayer.isHidden = false
-            relayout()
+        }
+        updateTrackVisibility()
+        relayout()
+    }
+
+    private func updateTrackVisibility() {
+        remainLayer.isHidden = dust != nil || showsBufferedRanges
+        fillLayer.isHidden = dust != nil || showsBufferedRanges
+        for l in [bufferedBaseLayer, bufferedLayer, bufferedPlayedLayer] { l.isHidden = !showsBufferedRanges }
+        knobLayer.isHidden = dust != nil && !showsBufferedRanges
+        for l in [damagePendingLayer, damagePartialLayer, damageNoneLayer] {
+            l.isHidden = dust != nil && !showsBufferedRanges
         }
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -2541,6 +2578,7 @@ final class SPProgressView: NSView {
         damagePartialLayer.contentsScale = s
         damageNoneLayer.contentsScale = s
         damagePendingLayer.contentsScale = s
+        for l in [bufferedBaseLayer, bufferedLayer, bufferedMask, bufferedPlayedLayer] { l.contentsScale = s }
         dust?.setGeometry(bounds: bounds, scale: s)
     }
 
@@ -2612,8 +2650,9 @@ final class SPProgressView: NSView {
     // presentation path; direct dragging may cancel an in-flight path animation.
     private func retargetTrack(duration: CFTimeInterval, cancelInFlight: Bool = false) {
         guard bounds.width > 0 else { return }
-        if let dust { dust.setSplit(bounds.width * CGFloat(value)); return }
         let halfBase = ((hovering || dragging) ? SPM.trackHover : SPM.trackIdle) / 2
+        updateBufferedTrack(halfBase: halfBase, duration: duration, cancelInFlight: cancelInFlight)
+        if let dust { dust.setSplit(bounds.width * CGFloat(value)); return }
         let split = bounds.width * CGFloat(value)
         let rp = trackPath(from: split, to: bounds.width, halfBase: halfBase)
         let fp = trackPath(from: 0, to: split, halfBase: halfBase)
@@ -2656,6 +2695,41 @@ final class SPProgressView: NSView {
         }
     }
 
+    private func updateBufferedTrack(halfBase: CGFloat, duration: CFTimeInterval, cancelInFlight: Bool) {
+        guard showsBufferedRanges else { return }
+        let full = trackPath(from: 0, to: bounds.width, halfBase: halfBase)
+        let played = trackPath(from: 0, to: bounds.width * CGFloat(value), halfBase: halfBase)
+        let mask = CGMutablePath()
+        for range in bufferedRanges {
+            mask.addRect(CGRect(x: bounds.width * range.lowerBound, y: bounds.minY,
+                width: bounds.width * (range.upperBound - range.lowerBound), height: bounds.height))
+        }
+        let layers = [bufferedBaseLayer, bufferedLayer, bufferedPlayedLayer]
+        let previous = layers.map { $0.presentation()?.path ?? $0.path }
+        noAnim {
+            for layer in layers { layer.frame = bounds }
+            bufferedBaseLayer.path = full
+            bufferedLayer.path = full
+            bufferedPlayedLayer.path = played
+            knobLayer.position = CGPoint(x: bounds.width * CGFloat(value), y: bounds.midY)
+            bufferedMask.frame = bounds
+            bufferedMask.path = mask
+            damagePartialLayer.path = damagePath(cls: SPDamageBand.partial, halfBase: halfBase)
+            damageNoneLayer.path = damagePath(cls: SPDamageBand.none, halfBase: halfBase)
+            damagePendingLayer.path = damagePath(cls: SPDamageBand.pending, halfBase: halfBase)
+        }
+        for (index, layer) in layers.enumerated() {
+            if duration > 0, let from = previous[index] {
+                let animation = CABasicAnimation(keyPath: "path")
+                animation.fromValue = from
+                animation.toValue = layer.path
+                animation.duration = duration
+                animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(animation, forKey: "liquid")
+            } else if cancelInFlight { layer.removeAnimation(forKey: "liquid") }
+        }
+    }
+
     func setValue(_ v: Double) {
         guard !dragging else { return }
         let nv = max(0, min(1, v))
@@ -2687,15 +2761,21 @@ final class SPProgressView: NSView {
         }
         let halfBase = SPM.trackHover / 2 // Release remains hovered.
         let split = bounds.width * CGFloat(value)
-        func paths(_ s: CGFloat) -> (CGPath, CGPath) {
+        func paths(_ s: CGFloat) -> (CGPath, CGPath, CGPath) {
             ampScale = s
             return (trackPath(from: split, to: bounds.width, halfBase: halfBase),
-                    trackPath(from: 0, to: split, halfBase: halfBase))
+                    trackPath(from: 0, to: split, halfBase: halfBase),
+                    trackPath(from: 0, to: bounds.width, halfBase: halfBase))
         }
-        let (r0, f0) = paths(0.5)
-        let (rO, fO) = paths(1.06)
-        let (r1, f1) = paths(1) // Restore the model amplitude.
-        for (l, vals) in [(remainLayer, [r0, rO, r1]), (fillLayer, [f0, fO, f1])] {
+        let (r0, f0, c0) = paths(0.5)
+        let (rO, fO, cO) = paths(1.06)
+        let (r1, f1, c1) = paths(1) // Restore the model amplitude.
+        var tracks = [(remainLayer, [r0, rO, r1]), (fillLayer, [f0, fO, f1])]
+        if showsBufferedRanges {
+            tracks += [(bufferedBaseLayer, [c0, cO, c1]), (bufferedLayer, [c0, cO, c1]),
+                       (bufferedPlayedLayer, [f0, fO, f1])]
+        }
+        for (l, vals) in tracks {
             // Continue from an in-flight presentation path.
             let start = l.presentation()?.path ?? vals[0]
             noAnim { l.path = vals[2] }
@@ -3941,6 +4021,13 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         latestPlaying = playing
         guard !isHidden else { return }
         renderLatestPlaying()
+    }
+
+    /// The owner supplies actual cached media-time intervals normalized to the
+    /// current duration. An empty visible cache is distinct from local media.
+    func setBufferedRanges(_ ranges: [ClosedRange<Double>], visible: Bool) {
+        track.setBufferedRanges(ranges, visible: visible)
+        track.toolTip = visible ? L("timeline.cachedTooltip") : nil
     }
 
     func setVolume(pct: Double, muted: Bool) {

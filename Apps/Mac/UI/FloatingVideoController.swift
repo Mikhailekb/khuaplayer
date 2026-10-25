@@ -1,6 +1,25 @@
 import AppKit
 import QuartzCore
 
+/// Cache coverage is already mapped to media time by the owner. These helpers
+/// only sanitize display geometry; they never estimate time from file size.
+enum SPBufferedTimeline {
+    static func normalized(_ ranges: [ClosedRange<Double>]) -> [ClosedRange<Double>] {
+        let clipped = ranges.compactMap { range -> ClosedRange<Double>? in
+            guard range.lowerBound.isFinite, range.upperBound.isFinite else { return nil }
+            let lower = max(0, range.lowerBound), upper = min(1, range.upperBound)
+            return upper > lower ? lower...upper : nil
+        }.sorted { $0.lowerBound < $1.lowerBound }
+        var merged: [ClosedRange<Double>] = []
+        for range in clipped {
+            if let previous = merged.last, range.lowerBound <= previous.upperBound {
+                merged[merged.count - 1] = previous.lowerBound...max(previous.upperBound, range.upperBound)
+            } else { merged.append(range) }
+        }
+        return merged
+    }
+}
+
 /// The floating window keeps the existing Metal view and decoder. Its controls
 /// send ordinary playback commands back to the owning player.
 @MainActor
@@ -27,6 +46,8 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
     private var aspectRatio: CGFloat = 16 / 9
     private var presentsWindow = true
     private var playback = SPFloatingVideoPlayback()
+    private var bufferedRanges: [ClosedRange<Double>] = []
+    private var showsBufferedRanges = false
     private var closingPanel = false
 
     @discardableResult
@@ -84,6 +105,7 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
         content.attach(videoView)
         panel.contentView = content
         content.update(playback)
+        content.setBufferedRanges(bufferedRanges, visible: showsBufferedRanges)
         content.layoutSubtreeIfNeeded()
         if showWindow { panel.orderFront(nil) }
         onLayoutChange?()
@@ -123,6 +145,13 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
     func update(isPlaying: Bool) {
         playback.isPlaying = isPlaying
         content?.update(playback)
+        content?.setBufferedRanges(bufferedRanges, visible: showsBufferedRanges)
+    }
+
+    func setBufferedRanges(_ ranges: [ClosedRange<Double>], visible: Bool) {
+        bufferedRanges = visible ? SPBufferedTimeline.normalized(ranges) : []
+        showsBufferedRanges = visible
+        content?.setBufferedRanges(bufferedRanges, visible: visible)
     }
 
     func update(isPlaying: Bool, position: Double, duration: Double,
@@ -130,6 +159,7 @@ final class SPFloatingVideoController: NSObject, NSWindowDelegate {
         playback = SPFloatingVideoPlayback(isPlaying: isPlaying, position: position,
             duration: duration, volumePercent: volumePercent, muted: muted)
         content?.update(playback)
+        content?.setBufferedRanges(bufferedRanges, visible: showsBufferedRanges)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -294,6 +324,12 @@ private final class SPFloatingVideoContent: NSView {
         updateControlsVisibility()
     }
 
+    func setBufferedRanges(_ ranges: [ClosedRange<Double>], visible: Bool) {
+        let show = visible && playback.duration.isFinite && playback.duration > 0
+        timeline.setBufferedRanges(ranges, visible: show)
+        timeline.toolTip = show ? L("timeline.cachedTooltip") : nil
+    }
+
     override func layout() {
         super.layout()
         video?.frame = bounds
@@ -394,6 +430,15 @@ final class SPFloatingVideoSlider: NSSlider {
     var isTracking = false
     var onTrackingChange: ((Bool) -> Void)?
 
+    func setBufferedRanges(_ ranges: [ClosedRange<Double>], visible: Bool) {
+        guard let cell = cell as? SPFloatingVideoSliderCell else { return }
+        let normalized = visible ? SPBufferedTimeline.normalized(ranges) : []
+        guard cell.bufferedRanges != normalized || cell.showsBufferedRanges != visible else { return }
+        cell.bufferedRanges = normalized
+        cell.showsBufferedRanges = visible
+        needsDisplay = true
+    }
+
     override init(frame: NSRect) { super.init(frame: frame); cell = SPFloatingVideoSliderCell() }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var mouseDownCanMoveWindow: Bool { false }
@@ -408,10 +453,22 @@ final class SPFloatingVideoSlider: NSSlider {
 
 @MainActor
 private final class SPFloatingVideoSliderCell: NSSliderCell {
+    var bufferedRanges: [ClosedRange<Double>] = []
+    var showsBufferedRanges = false
     override func drawBar(inside rect: NSRect, flipped: Bool) {
         let track = NSRect(x: rect.minX, y: rect.midY - 1.5, width: rect.width, height: 3)
         NSColor.white.withAlphaComponent(0.35).setFill()
         NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
+        if showsBufferedRanges {
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).addClip()
+            NSColor.white.withAlphaComponent(0.66).setFill()
+            for range in bufferedRanges {
+                NSRect(x: track.minX + track.width * range.lowerBound, y: track.minY,
+                       width: track.width * (range.upperBound - range.lowerBound), height: track.height).fill()
+            }
+            NSGraphicsContext.restoreGraphicsState()
+        }
         let fraction = maxValue > minValue ? min(1, max(0, (doubleValue - minValue) / (maxValue - minValue))) : 0
         NSColor.white.setFill()
         NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY,

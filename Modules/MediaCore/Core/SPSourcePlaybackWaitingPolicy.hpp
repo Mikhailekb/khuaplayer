@@ -6,6 +6,15 @@
 // playback hold or a seek that is actually blocked on source I/O.
 namespace spplaywait {
 inline constexpr int64_t kNoticeDelayUs = 750000;
+enum class WaitReason : uint8_t { none = 0, sourceIO = 1, pipelineHold = 2 };
+
+// A visible hold can wait for decoded/queued media even when no source read is
+// pending. Classification changes the explanation only, not the hold policy.
+inline WaitReason waitReason(bool visibleWaiting, bool rawWaiting) {
+    if (!visibleWaiting) return WaitReason::none;
+    return rawWaiting ? WaitReason::sourceIO : WaitReason::pipelineHold;
+}
+
 struct Input {
     int64_t nowUs = 0;
     uint64_t openGeneration = 0;

@@ -117,7 +117,47 @@ struct TorrentModelChecks {
         check(invalidNumbers.name == "Fallback" && invalidNumbers.loadedBytes == 0 && invalidNumbers.totalBytes == 0 &&
               invalidNumbers.downloadBytesPerSecond == 0 && invalidNumbers.uploadBytesPerSecond == 0 && invalidNumbers.activePeers == 0,
               "malformed or nonfinite numeric fields cannot overflow or contaminate status")
+        cacheSnapshotChecks()
         print("Torrent model checks passed (\(checks) checks)")
+    }
+
+    static func cacheSnapshotChecks() {
+        let hash = String(repeating: "a", count: 40)
+        let file = SPTorrentFile(id: 4, path: "Show/A.mkv", length: 72)
+        let good: [String: Any] = ["hash": hash, "file_index": 4, "file_offset": 11,
+            "file_length": 72, "piece_length": 16, "resident_bytes": 40,
+            "ranges": [[0, 5], [21, 37], [53, 72]]]
+        let snapshot = SPTorrentCacheSnapshot(json: good, expectedHash: hash, file: file)
+        check(snapshot?.fileOffset == 11 && snapshot?.residentBytes == 40 && snapshot?.ranges.count == 3,
+              "cache snapshot preserves actual file offset, clipped pieces and separate resident holes")
+        var empty = good; empty["ranges"] = [[Int]](); empty["resident_bytes"] = 0
+        check(SPTorrentCacheSnapshot(json: empty, expectedHash: hash, file: file)?.ranges.isEmpty == true,
+              "empty current-file cache is valid even when other torrent files contain data")
+        let invalid: [(String, Any)] = [
+            ("hash", String(repeating: "b", count: 40)), ("file_index", 5), ("file_index", true),
+            ("file_offset", -1), ("file_offset", Int64.max), ("file_length", 71),
+            ("piece_length", 0), ("piece_length", true), ("resident_bytes", 41),
+            ("resident_bytes", -1), ("resident_bytes", 1.5), ("resident_bytes", "40"),
+            ("ranges", [[0, 5], [4, 21]]), ("ranges", [[21, 37], [0, 5]]),
+            ("ranges", [[0, 5], [5, 21]]), ("ranges", [[-1, 5]]),
+            ("ranges", [[0, 0]]), ("ranges", [[0, 73]]), ("ranges", [[1, 5]]),
+            ("ranges", [[0, 6]]), ("ranges", [[false, 5]]), ("ranges", [[0, 5, 16]]),
+            ("ranges", Array(repeating: [0, 1], count: 32_769))
+        ]
+        for (key, value) in invalid {
+            var object = good; object[key] = value
+            if key == "ranges", let ranges = value as? [[Int]], ranges.allSatisfy({ $0.count == 2 && $0[0] >= 0 && $0[1] > $0[0] }) {
+                let sum = ranges.reduce(0) { $0 + $1[1] - $1[0] }
+                if sum <= Int(file.length) { object["resident_bytes"] = sum }
+            }
+            check(SPTorrentCacheSnapshot(json: object, expectedHash: hash, file: file) == nil,
+                  "malformed or mismatched cache field \(key) cannot claim buffered data")
+        }
+        let hugeFile = SPTorrentFile(id: 4, path: "Huge.mkv", length: 99)
+        let huge: [String: Any] = ["hash": hash, "file_index": 4, "file_offset": Int64(9_007_199_254_740_993),
+            "file_length": 99, "piece_length": 1, "resident_bytes": 99, "ranges": [[0, 99]]]
+        check(SPTorrentCacheSnapshot(json: huge, expectedHash: hash, file: hugeFile)?.fileOffset == 9_007_199_254_740_993,
+              "cache byte offsets retain Int64 precision above the Double exact-integer range")
     }
 
     static func torrent(_ info: Data) -> Data {

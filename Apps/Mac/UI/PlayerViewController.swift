@@ -248,6 +248,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var torrentResolving = false
     private var torrentDownloadProgress: Double?
     private var torrentLastStatus: SPTorrentStatus?
+    private var torrentLastCacheSnapshot: SPTorrentCacheSnapshot?
+    private var torrentTimelinePresentation: SPTorrentTimelinePresentation?
     private var torrentLoadingView: SPTorrentLoadingView?
     private var torrentMagnetSheet: SPTorrentMagnetSheet?
     private var torrentCacheRestartToken: UUID?
@@ -2085,6 +2087,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let incomingTorrentContext = url.isFileURL ? nil :
             (torrentOpenCandidate ?? (torrentContext?.streamURL == url ? torrentContext : nil))
         torrentContext = incomingTorrentContext
+        clearTorrentCacheTimeline(visible: incomingTorrentContext != nil)
         let previousHasMediaSession = hasMediaSession
         let previousGeometry = (currentForcedAspectTag, currentCropTag, currentRotation, currentMirror)
         let previousProfileRestorePending = playlistProfileRestorePending
@@ -2730,6 +2733,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         torrentSaveTask = nil
         torrentStatusTask?.cancel()
         torrentStatusTask = nil
+        clearTorrentCacheTimeline(visible: false)
         torrentMagnetSheet?.dismiss()
         torrentLoadingView?.isHidden = true
         let closingTorrent = torrentContext
@@ -3371,6 +3375,14 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                     buffered, capacity)
             }
         }
+        if let cached = torrentLastCacheSnapshot {
+            details += " · " + String(format: L("torrent.currentFileCacheFormat"),
+                ByteCountFormatter.string(fromByteCount: cached.residentBytes, countStyle: .memory))
+            if torrentTimelinePresentation?.mappingAvailable != true ||
+                (torrentTimelinePresentation?.unmappedResidentBytes ?? 0) >= max(1_048_576, cached.pieceLength) {
+                details += " · " + L("torrent.cacheTimelinePending")
+            }
+        }
         if (paused || core?.state == .playing) && !torrentResolving && torrentCacheRestartToken == nil {
             switch pauseSnapshot.state {
             case .filling:
@@ -3401,7 +3413,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 pauseEnabled = torrentPauseWindowReady
             }
         }
-        let statusText = saving ? L("torrent.saving") : (waiting ? L("torrent.buffering") : (paused ? L("torrent.paused") : L("torrent.streaming")))
+        let waitText = core?.sourcePlaybackWaitReason == .pipeline
+            ? L("playback.notice.preparingPlayback") : L("torrent.buffering")
+        let statusText = saving ? L("torrent.saving") : (waiting ? waitText : (paused ? L("torrent.paused") : L("torrent.streaming")))
         return SPTorrentPlaylistPresentation(status: statusText,
             details: details, downloadProgress: saving ? torrentDownloadProgress : nil,
             isSaving: saving, canSave: !saving && hasMediaSession,
@@ -3411,22 +3425,74 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func startTorrentStatusUpdates() {
         torrentStatusTask?.cancel()
         guard let context = torrentContext else { return }
+        clearTorrentCacheTimeline(visible: true)
         startTorrentPlaybackWindowPolicyIfNeeded()
         torrentStatusTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 do {
                     let status = try await SPTorrentServer.shared.status(hash: context.descriptor.hash)
-                    guard let self, self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID else { return }
+                    guard !Task.isCancelled, let self,
+                          self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
+                              self.torrentContext?.file.id == context.file.id else { return }
                     self.startTorrentPlaybackWindowPolicyIfNeeded()
                     self.torrentLastStatus = status
                     self.updateTorrentPauseBuffer()
                     self.refreshPlaylistView()
                     self.updateTorrentLoadingForCoreState(self.core?.state ?? .idle)
+                    do {
+                        let cached = try await SPTorrentServer.shared.cacheSnapshot(context.descriptor, file: context.file)
+                        guard !Task.isCancelled,
+                              self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
+                              self.torrentContext?.file.id == context.file.id else { return }
+                        self.applyTorrentCacheSnapshot(cached, context: context)
+                        self.refreshPlaylistView()
+                    } catch is CancellationError { return }
+                    catch {
+                        guard !Task.isCancelled,
+                              self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
+                              self.torrentContext?.file.id == context.file.id else { return }
+                        // A failed snapshot must not leave evicted bytes painted
+                        // as resident. It never changes playback or download policy.
+                        self.clearTorrentCacheTimeline(visible: true)
+                        self.refreshPlaylistView()
+                    }
                 } catch is CancellationError { return }
-                catch { /* Playback requests report failures through Core. */ }
+                catch {
+                    guard !Task.isCancelled, let self,
+                          self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
+                              self.torrentContext?.file.id == context.file.id else { return }
+                    self.clearTorrentCacheTimeline(visible: true)
+                    self.refreshPlaylistView()
+                }
                 do { try await Task.sleep(for: .seconds(1)) } catch { return }
             }
         }
+    }
+
+    private func clearTorrentCacheTimeline(visible: Bool) {
+        torrentLastCacheSnapshot = nil
+        torrentTimelinePresentation = nil
+        chrome?.setBufferedRanges([], visible: visible)
+        floatingVideo.setBufferedRanges([], visible: visible)
+    }
+
+    private func applyTorrentCacheSnapshot(_ snapshot: SPTorrentCacheSnapshot,
+                                           context: SPTorrentPlaybackContext) {
+        guard torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
+              torrentContext?.file.id == context.file.id,
+              snapshot.fileID == context.file.id, snapshot.fileLength == context.file.length,
+              let core, hasMediaSession else { return }
+        torrentLastCacheSnapshot = snapshot
+        let bytes = snapshot.ranges.map {
+            [NSNumber(value: $0.lowerBound), NSNumber(value: $0.upperBound)]
+        }
+        let mapped = SPTorrentTimelinePresentation(
+            payload: core.cachedTimeline(forByteRanges: bytes), expectedDuration: core.duration,
+            expectedSourceSize: context.file.length)
+        torrentTimelinePresentation = mapped
+        let ranges = mapped?.normalizedRanges ?? []
+        chrome?.setBufferedRanges(ranges, visible: true)
+        floatingVideo.setBufferedRanges(ranges, visible: true)
     }
 
     private func showTorrentLoading(_ text: String, detail: String?) {
@@ -4338,8 +4404,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         // Its on-video notice describes a playback interruption, not background I/O.
         let waiting = torrentContext == nil ? core.sourceWaiting : core.sourcePlaybackWaiting
         if waiting {
-            playbackNoticeView().setSticky(core.sourceStalled ? L("playback.notice.downloadStalled")
-                                                               : L("playback.notice.waitingForDownload"))
+            let notice = core.sourcePlaybackWaitReason == .pipeline
+                ? L("playback.notice.preparingPlayback")
+                : (core.sourceStalled ? L("playback.notice.downloadStalled")
+                                     : L("playback.notice.waitingForDownload"))
+            playbackNoticeView().setSticky(notice)
         } else if core.contentSearching {
 
             playbackNoticeView().setSticky(L("playback.notice.searchingContent"))
@@ -4554,6 +4623,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         floatingVideo.update(isPlaying: core.state == .playing, position: core.position,
                              duration: core.duration, volumePercent: Double(core.volume) * 100,
                              muted: core.isMuted)
+        floatingVideo.setBufferedRanges(torrentTimelinePresentation?.normalizedRanges ?? [],
+                                         visible: torrentContext != nil)
     }
 
     private var currentVolumeBoostPresentation: VolumeBoostPresentation {

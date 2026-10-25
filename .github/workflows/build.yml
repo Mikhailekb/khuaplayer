@@ -96,6 +96,11 @@ jobs:
           ./Scripts/test_video_context_menu.sh
           ./Scripts/test_video_context_policy.sh
           ./Scripts/test_floating_video.sh
+          ./Scripts/test_buffered_timeline.sh
+          ./Scripts/test_cached_timeline.sh
+          ./Scripts/test_source_playback_waiting.sh
+          ./Scripts/test_torrent_cache_timeline.sh
+          ./Scripts/test_torrent_cache_polling.sh
           ./Scripts/test_playlist_filesystem.sh
           ./Scripts/test_playlist_keyboard.sh
           ./Scripts/test_torrent_models.sh

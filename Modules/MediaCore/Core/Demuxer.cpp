@@ -1571,6 +1571,50 @@ void Demuxer::captureByteTimeMap() {
     job->map = std::move(m);
 }
 
+std::shared_ptr<const spcachetime::SourceMap> Demuxer::sourceTimeMapSnapshot() const {
+    std::lock_guard<std::mutex> lock(sourceTimeMapMutex_);
+    return sourceTimeMap_;
+}
+
+void Demuxer::captureSourceTimeMap(bool force) {
+    if (!httpIO_ || !fmtCtx_) return;
+    const int64_t now = spNowUs();
+    if (!force && now - sourceTimeMapCaptureUs_ < 1000000) return;
+    sourceTimeMapCaptureUs_ = now;
+    auto map = std::make_shared<spcachetime::SourceMap>();
+    map->sourceSize = httpIO_->size();
+    const int primary = videoStream_ >= 0 ? videoStream_ : audioStream_;
+    const int64_t streamDuration = primary >= 0 && primary < (int)streams_.size() ? streams_[primary].durationUs : 0;
+    map->durationUs = spcachetime::metadataDuration(durationUs_.load(std::memory_order_relaxed), streamDuration);
+    // A finite HTTP source has immutable file-relative positions. Sampling
+    // index anchors coarsens an interval but cannot manufacture byte coverage.
+    constexpr int maxStreams = 32, maxPoints = 4096;
+    for (unsigned si = 0; si < fmtCtx_->nb_streams && map->streams.size() < maxStreams; ++si) {
+        AVStream *stream = fmtCtx_->streams[si];
+        const auto type = stream->codecpar->codec_type;
+        if ((type != AVMEDIA_TYPE_VIDEO && type != AVMEDIA_TYPE_AUDIO) ||
+            (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) ||
+            stream->time_base.num <= 0 || stream->time_base.den <= 0) continue;
+        const int count = avformat_index_get_entries_count(stream);
+        const int step = std::max(1, (count + maxPoints - 1) / maxPoints);
+        std::vector<spcachetime::Point> points;
+        points.reserve(std::min(count, maxPoints) + 1);
+        auto append = [&](int i) {
+            const AVIndexEntry *entry = avformat_index_get_entry(stream, i);
+            if (!entry || entry->pos < 0 || entry->timestamp == AV_NOPTS_VALUE) return;
+            const int64_t absolute = av_rescale_q(entry->timestamp, stream->time_base, AV_TIME_BASE_Q);
+            if ((timelineOriginUs_ > 0 && absolute < INT64_MIN + timelineOriginUs_) ||
+                (timelineOriginUs_ < 0 && absolute > INT64_MAX + timelineOriginUs_)) return;
+            points.push_back({entry->pos, absolute - timelineOriginUs_});
+        };
+        for (int i = 0; i < count; i += step) append(i);
+        if (count > 0 && (count - 1) % step != 0) append(count - 1);
+        map->streams.push_back({(int)si, spcachetime::indexSpans(std::move(points), map->sourceSize, map->durationUs)});
+    }
+    std::lock_guard<std::mutex> lock(sourceTimeMapMutex_);
+    sourceTimeMap_ = std::move(map);
+}
+
 std::shared_ptr<PendingScanJob> Demuxer::pendingScanJob() {
     const std::string cur = sourceCurrentPath();
     std::lock_guard<std::mutex> jlk(pendingJobMtx_);
@@ -2692,6 +2736,11 @@ void Demuxer::close() {
     audioStream_ = -1;
     subtitleStream_ = -1;
     timelineOriginUs_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(sourceTimeMapMutex_);
+        sourceTimeMap_.reset();
+    }
+    sourceTimeMapCaptureUs_ = 0;
     originOffsetCache_.clear();
     eof_ = false;
     durationUs_ = 0;
@@ -3351,6 +3400,7 @@ void Demuxer::rebuildStreamTable() {
 
     publishAltVideoCandidates();
     publishTsPcrIdentities(true);
+    captureSourceTimeMap(true);
 }
 
 void Demuxer::computeTimelineOrigin() {
@@ -4889,6 +4939,7 @@ int Demuxer::readPacket(AVPacket* pkt, bool allowHTTPYield) {
     const bool programsChanged = tsMpegTs_ && publishTsPcrIdentities(false);
     if (programsChanged || fmtCtx_->nb_streams != altVideoStreamsSeen_ ||
         ((tsMpegTs_ || psLike_) && streamCodecSig() != altVideoCodecSig_)) publishAltVideoCandidates();
+    captureSourceTimeMap();
     return 1;
 }
 
@@ -6519,6 +6570,12 @@ int Demuxer::seekToUs(int64_t us, bool forwardKeyframe,
                       const std::function<bool()>* abortFn,
                       int64_t alignToleranceUs) {
     if (!fmtCtx_) return AVERROR(EINVAL);
+    // A real seek may load deferred Matroska Cues even when all packet reads
+    // fit inside the regular one-second publication throttle.
+    struct RefreshSourceTimeMap {
+        Demuxer &owner;
+        ~RefreshSourceTimeMap() { owner.captureSourceTimeMap(true); }
+    } refreshSourceTimeMap{*this};
     growthResyncPending_ = false;
     psLastCheckedPos_ = -1;
     tsScanHoldUntilUs_ = spNowUs() + 300000;

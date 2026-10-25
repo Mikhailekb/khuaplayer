@@ -16,7 +16,7 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 from pathlib import Path
 
-WORKER_VERSION = 'MatriX.147-khua.6'
+WORKER_VERSION = 'MatriX.147-khua.7'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--ip', default='127.0.0.1')
@@ -70,6 +70,32 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
         if self.headers.get('Authorization') != authorization:
             self.answer(401)
+            return
+        if self.path == '/playback/cache':
+            try:
+                command = json.loads(body)
+                hash_value, file_id = command['hash'], command['file_index']
+                if hash_value not in records:
+                    self.answer(404)
+                    return
+                if file_id != 7:
+                    self.answer(404)
+                    return
+                result = dict(hash=hash_value, file_index=7, file_offset=13,
+                    file_length=len(payload), piece_length=65536,
+                    resident_bytes=65523, ranges=[[0, 65523]])
+                audit('cache-snapshot', **command)
+                gate = args.path.parent / ('hold-cache-reply-' + hash_value)
+                if gate.exists():
+                    gate.with_name('cache-reply-started-' + hash_value).touch()
+                    while gate.exists():
+                        time.sleep(0.01)
+                override = args.path.parent / ('cache-reply-override-' + hash_value + '.json')
+                if override.exists():
+                    result = dict(result, **json.loads(override.read_text()))
+                self.answer(200, json.dumps(result).encode())
+            except (ValueError, KeyError, TypeError):
+                self.answer(400)
             return
         if self.path == '/playback/window':
             try:
