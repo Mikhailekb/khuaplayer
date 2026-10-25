@@ -278,6 +278,32 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var torrentAppliedPlaybackWindow: AppliedTorrentPlaybackWindow?
     private var torrentPlaybackWindowTask: Task<Void, Never>?
     private var torrentPlaybackWindowEpoch = UUID()
+    private final class TorrentBackgroundSession {
+        let epoch = UUID()
+        weak var core: SPPlayerCore?
+        let context: SPTorrentPlaybackContext
+        let openGeneration: Int64
+        let previewConsumer = UUID()
+        var previewURL: URL?
+        var previewAttempted = false
+        var previewConfigured = false
+        var subtitleConsumer: UUID?
+        var subtitleURL: URL?
+        var subtitleTrack: Int?
+        var subtitleLaneRetired = false
+        init(core: SPPlayerCore, context: SPTorrentPlaybackContext, openGeneration: Int64) {
+            self.core = core; self.context = context; self.openGeneration = openGeneration
+        }
+    }
+    private let torrentBackgroundOwner = UUID()
+    private let torrentSubtitleGate = SPTorrentBackgroundGate()
+    private var torrentBackgroundSession: TorrentBackgroundSession?
+    private var torrentPreviewSetupTask: Task<Void, Never>?
+    private var torrentSubtitleCache: SPTorrentSubtitleCache?
+    private var torrentBackgroundMutationInProgress = false
+    private var torrentSubtitleBackgroundSuppressed = false
+    private var torrentExternalSubtitleSelectionPending = false
+    private var torrentExternalSubtitleSelectionEpoch = UUID()
     private lazy var torrentPauseBuffer: SPTorrentPauseBuffer = {
         let buffer = SPTorrentPauseBuffer()
         buffer.onChange = { [weak self] _ in self?.refreshPlaylistView() }
@@ -288,6 +314,192 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         torrentContext?.identityURL ?? openMediaPath.map { URL(fileURLWithPath: $0, isDirectory: false) }
     }
     private var resumeIdentityPath: String? { playbackIdentityURL?.path }
+
+    private func torrentBackgroundSessionIsCurrent(_ session: TorrentBackgroundSession) -> Bool {
+        guard torrentBackgroundSession === session, let core, core === session.core,
+              hasMediaSession, torrentCacheRestartToken == nil, !torrentResolving,
+              let context = torrentContext,
+              context.descriptor.leaseID == session.context.descriptor.leaseID,
+              context.file.id == session.context.file.id, context.file.length == session.context.file.length,
+              context.streamURL == session.context.streamURL,
+              core.currentFilePath == context.streamURL.absoluteString else { return false }
+        let generation = core.sourcePlaybackWindow.openGeneration
+        // A seek temporarily removes the packet window. Whole-file subtitle
+        // work belongs to the open epoch and survives those seek generations.
+        return generation < 0 || generation == session.openGeneration
+    }
+
+    private func cancelTorrentSubtitleBackgroundJob() {
+        torrentSubtitleGate.setPaused(true)
+        if let session = torrentBackgroundSession {
+            let consumer = session.subtitleConsumer
+            let retired = session.subtitleLaneRetired
+            session.subtitleConsumer = nil
+            session.subtitleURL = nil
+            session.subtitleTrack = nil
+            session.subtitleLaneRetired = false
+            if let consumer, !retired {
+                SPTorrentServer.shared.endBackgroundStream(session.context.descriptor, consumer: consumer)
+            }
+        }
+        torrentSubtitleCache?.cancel()
+    }
+
+    private func cancelTorrentBackgroundJobs() {
+        let wasMutating = torrentBackgroundMutationInProgress
+        torrentBackgroundMutationInProgress = true
+        defer { torrentBackgroundMutationInProgress = wasMutating }
+        torrentSubtitleGate.setPaused(true)
+        SPTorrentBackgroundAdmission.shared.remove(owner: torrentBackgroundOwner)
+        torrentPreviewSetupTask?.cancel()
+        torrentPreviewSetupTask = nil
+        cancelTorrentSubtitleBackgroundJob()
+        if let session = torrentBackgroundSession {
+            session.core?.setTorrentPreviewPreparationPaused(true)
+            _ = session.core?.configureTorrentPreviewSourceURL(nil, cacheDirectoryURL: nil,
+                                                               forMediaURL: session.context.streamURL)
+            SPTorrentServer.shared.endBackgroundStream(session.context.descriptor,
+                                                       consumer: session.previewConsumer)
+        }
+        torrentBackgroundSession = nil
+        torrentSubtitleBackgroundSuppressed = false
+        torrentExternalSubtitleSelectionPending = false
+        torrentExternalSubtitleSelectionEpoch = UUID()
+    }
+
+    private func pauseTorrentBackgroundJobsForSeek() {
+        torrentSubtitleGate.setPaused(true)
+        core?.setTorrentPreviewPreparationPaused(true)
+        SPTorrentBackgroundAdmission.shared.remove(owner: torrentBackgroundOwner)
+    }
+
+    private func refreshTorrentBackgroundAdmission() {
+        guard !torrentBackgroundMutationInProgress else { return }
+        guard let session = torrentBackgroundSession, torrentBackgroundSessionIsCurrent(session),
+              let core, core.state == .playing || core.state == .paused else {
+            pauseTorrentBackgroundJobsForSeek()
+            return
+        }
+        let eligible = torrentPauseWindowReady && !core.sourcePlaybackWaiting &&
+            !torrentPauseBufferManuallyStopped && !torrentExternalSubtitleSelectionPending && CaptionProbeRegistry.idle()
+        let subtitlesPreparing = torrentSubtitleCache?.isPreparing == true
+        if !subtitlesPreparing, let cache = torrentSubtitleCache,
+           cache.snapshot.state == .ready || cache.snapshot.state == .failed,
+           let consumer = session.subtitleConsumer, !session.subtitleLaneRetired {
+            session.subtitleLaneRetired = true
+            SPTorrentServer.shared.endBackgroundStream(session.context.descriptor, consumer: consumer)
+        }
+        SPTorrentBackgroundAdmission.shared.update(owner: torrentBackgroundOwner, lifetime: self,
+            wantsSubtitles: eligible && subtitlesPreparing,
+            wantsPreviews: eligible && session.previewConfigured && core.torrentPreviewPreparationPending) {
+                [weak self, weak session] subtitles, previews in
+                guard let self, let session, self.torrentBackgroundSession === session else { return }
+                self.torrentSubtitleGate.setPaused(!subtitles)
+                session.core?.setTorrentPreviewPreparationPaused(!previews)
+            }
+    }
+
+    private func updateTorrentBackgroundJobs() {
+        guard !torrentBackgroundMutationInProgress else { return }
+        torrentBackgroundMutationInProgress = true
+        defer {
+            torrentBackgroundMutationInProgress = false
+            refreshTorrentBackgroundAdmission()
+        }
+        guard let core, let context = torrentContext, hasMediaSession,
+              torrentCacheRestartToken == nil, !torrentResolving,
+              core.state != .opening, core.state != .idle, core.state != .failed else {
+            cancelTorrentBackgroundJobs()
+            return
+        }
+        if let session = torrentBackgroundSession, !torrentBackgroundSessionIsCurrent(session) {
+            cancelTorrentBackgroundJobs()
+        }
+        guard core.state == .playing || core.state == .paused else { return }
+        if torrentBackgroundSession == nil {
+            // Worker background requests are rejected before this exact parent
+            // source/file/seek window has been acknowledged.
+            guard torrentPauseWindowReady else { return }
+            torrentBackgroundSession = TorrentBackgroundSession(core: core, context: context,
+                openGeneration: core.sourcePlaybackWindow.openGeneration)
+        }
+        guard let session = torrentBackgroundSession else { return }
+        let selected = core.currentSubtitleTrackIndex
+        let wantsEmbedded = selected >= 0 && !torrentSubtitleBackgroundSuppressed &&
+            !torrentExternalSubtitleSelectionPending && activeExternalSubtitleURL == nil && !captionsDisplayActive
+        if !wantsEmbedded {
+            if session.subtitleTrack != nil { cancelTorrentSubtitleBackgroundJob() }
+        } else if session.subtitleTrack != selected {
+            cancelTorrentSubtitleBackgroundJob()
+            let consumer = UUID()
+            if let url = try? SPTorrentServer.shared.backgroundStreamURL(context.descriptor,
+                                                                         file: context.file, consumer: consumer) {
+                session.subtitleConsumer = consumer
+                session.subtitleURL = url
+                session.subtitleTrack = selected
+                let cache: SPTorrentSubtitleCache
+                if let existing = torrentSubtitleCache { cache = existing }
+                else {
+                    cache = SPTorrentSubtitleCache()
+                    cache.onChange = { [weak self] _ in self?.refreshTorrentBackgroundAdmission() }
+                    torrentSubtitleCache = cache
+                }
+                let gate = torrentSubtitleGate
+                let timelineOrigin = core.timelineOriginUs
+                let plan = SPTorrentSubtitleCache.Plan(identity: .init(hash: context.descriptor.hash,
+                    fileID: context.file.id, length: context.file.length, trackID: selected),
+                    sessionID: session.epoch, backgroundURL: url, expectedMediaURL: context.streamURL,
+                    timelineOriginUs: timelineOrigin)
+                cache.start(plan: plan, shouldPause: { gate.shouldPause() || !CaptionProbeRegistry.idle() },
+                    isCurrent: { [weak self, weak session] in
+                        guard let self, let session else { return false }
+                        return self.torrentBackgroundSessionIsCurrent(session) &&
+                            self.core?.currentSubtitleTrackIndex == selected &&
+                            self.core?.timelineOriginUs == timelineOrigin &&
+                            !self.torrentSubtitleBackgroundSuppressed && !self.torrentExternalSubtitleSelectionPending &&
+                            self.activeExternalSubtitleURL == nil && !self.captionsDisplayActive
+                    }, adopt: { [weak self, weak session] url, track in
+                        guard let self, let session, self.torrentBackgroundSessionIsCurrent(session),
+                              let core = self.core, core.currentSubtitleTrackIndex == track,
+                              core.timelineOriginUs == timelineOrigin,
+                              !self.torrentSubtitleBackgroundSuppressed && !self.torrentExternalSubtitleSelectionPending,
+                              self.activeExternalSubtitleURL == nil && !self.captionsDisplayActive else { return false }
+                        return await self.adoptTorrentSubtitleCache(url, track: track, core: core)
+                    })
+            }
+        }
+        guard !session.previewAttempted else { return }
+        session.previewAttempted = true
+        guard let identity = SPTorrentPreviewCacheStore.Identity(infoHash: context.descriptor.hash,
+                  fileID: context.file.id, fileLength: context.file.length),
+              let sourceURL = try? SPTorrentServer.shared.backgroundStreamURL(context.descriptor,
+                  file: context.file, consumer: session.previewConsumer) else { return }
+        session.previewURL = sourceURL
+        torrentPreviewSetupTask = Task { @MainActor [weak self, weak session] in
+            do {
+                let directory = try await SPTorrentPreviewCacheStore.prepareDirectory(for: identity)
+                guard !Task.isCancelled, let self, let session,
+                      self.torrentBackgroundSessionIsCurrent(session), let core = self.core else { return }
+                core.setTorrentPreviewPreparationPaused(true)
+                session.previewConfigured = core.configureTorrentPreviewSourceURL(sourceURL,
+                    cacheDirectoryURL: directory, forMediaURL: context.streamURL)
+                self.torrentPreviewSetupTask = nil
+                self.refreshTorrentBackgroundAdmission()
+            } catch {
+                guard let self, let session, self.torrentBackgroundSession === session else { return }
+                self.torrentPreviewSetupTask = nil
+            }
+        }
+    }
+
+    private func adoptTorrentSubtitleCache(_ url: URL, track: Int, core: SPPlayerCore) async -> Bool {
+        await withCheckedContinuation { continuation in
+            // Rejection also completes asynchronously on the main thread.
+            _ = core.adoptCachedEmbeddedSubtitleFile(url.path, streamIndex: track) { accepted in
+                continuation.resume(returning: accepted)
+            }
+        }
+    }
 
     private func updatePlaybackDiagnosticTimer(for state: SPPlayerState) {
         if state == .idle || state == .failed {
@@ -377,6 +589,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             .capacityBytes: torrentLastStatus?.bufferCapacityBytes ?? -1,
             .interactionFlags: interactions,
             .selectedFileID: torrentContext.map { Int64($0.file.id) } ?? -1,
+            .selectedAudioTrackIndex: Int64(core.currentAudioTrackIndex),
+            .selectedSubtitleTrackIndex: Int64(core.currentSubtitleTrackIndex),
             .fileOffsetByte: cached?.fileOffset ?? -1,
             .rangesKnown: cached == nil ? 0 : 1
         ]
@@ -2195,6 +2409,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         savePlaylistProfile()
         yieldDirectoryScanToForegroundIO()
         let shouldResumePreviousPlayback = cancelTransientInteractions()
+        cancelTorrentBackgroundJobs()
 
         flushResumePositionNow(forceDiskSync: false)
 
@@ -2665,6 +2880,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                                      forward: Bool = false) {
         recordPlaybackDiagnostic(.seek, control: .seek, seekTarget: target,
                                  commandValue: precise ? 1 : (forward ? 2 : 0))
+        pauseTorrentBackgroundJobsForSeek()
         yieldDirectoryScanToForegroundIO()
         cancelTorrentPauseBuffer()
         cancelTorrentPlaybackWindowPolicy()
@@ -2779,6 +2995,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             spReleaseSecurityScopedGrant(url)
             return
         }
+        let backgroundSelection = UUID()
+        torrentExternalSubtitleSelectionEpoch = backgroundSelection
+        torrentExternalSubtitleSelectionPending = true
+        torrentSubtitleBackgroundSuppressed = true
+        cancelTorrentSubtitleBackgroundJob()
+        refreshTorrentBackgroundAdmission()
         let captionSelection: Int?
         if #available(macOS 26.0, *) {
             captionSelection = captions?.beginExternalSubtitleSelection()
@@ -2797,6 +3019,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             guard self.playlistScanGeneration == gen else {
                 spReleaseSecurityScopedGrant(url)
                 return
+            }
+            if self.torrentExternalSubtitleSelectionEpoch == backgroundSelection {
+                self.torrentExternalSubtitleSelectionPending = false
+                if !ok { self.torrentSubtitleBackgroundSuppressed = false }
+                self.updateTorrentBackgroundJobs()
             }
             if #available(macOS 26.0, *), let captionSelection {
                 self.captions?.completeExternalSubtitleSelection(captionSelection, succeeded: ok)
@@ -2821,6 +3048,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             self.refreshPlaybackSettings()
         }
         if !accepted {
+            if torrentExternalSubtitleSelectionEpoch == backgroundSelection {
+                torrentExternalSubtitleSelectionPending = false
+                torrentSubtitleBackgroundSuppressed = false
+                updateTorrentBackgroundJobs()
+            }
             if #available(macOS 26.0, *), let captionSelection {
                 captions?.completeExternalSubtitleSelection(captionSelection, succeeded: false)
             }
@@ -2841,6 +3073,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     func handleWindowClose(destroyingWindow: Bool = false) {
         recordPlaybackDiagnostic(.close)
+        cancelTorrentBackgroundJobs()
         playbackDiagnosticTimer?.invalidate()
         playbackDiagnosticTimer = nil
         floatingVideo.restore()
@@ -3332,6 +3565,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func updateTorrentPauseBuffer() {
+        defer { updateTorrentBackgroundJobs() }
         guard let context = torrentContext, let core,
               core.state == .paused || core.state == .playing,
               hasMediaSession, torrentCacheRestartToken == nil,
@@ -3386,11 +3620,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             if torrentPauseBuffer.snapshot.state == .failed { torrentPauseBuffer.stop() }
             updateTorrentPauseBuffer()
         }
+        updateTorrentBackgroundJobs()
         refreshPlaylistView()
     }
 
     func beginTorrentOpen(magnet: String? = nil, file: URL? = nil,
                           resume reference: SPTorrentResumeReference? = nil) {
+        cancelTorrentBackgroundJobs()
         invalidateTorrentCacheRestart()
         cancelTorrentPauseBuffer(resetManualStop: true)
         torrentOpenGeneration &+= 1
@@ -4065,6 +4301,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 #endif
 
     func playerCore(_ core: SPPlayerCore, didChange state: SPPlayerState) {
+        defer { updateTorrentBackgroundJobs() }
         recordPlaybackDiagnostic(.state)
         updatePlaybackDiagnosticTimer(for: state)
         if state == .playing || state == .paused { startTorrentPlaybackWindowPolicyIfNeeded() }
@@ -4597,6 +4834,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     func playerCoreDidUpdateTimelinePreview(_ core: SPPlayerCore) {
+        guard core === self.core else { return }
+        refreshTorrentBackgroundAdmission()
         chrome?.refreshHoverPreview()
         chrome?.refreshDust()
         chrome?.refreshDamage()
@@ -4707,6 +4946,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         case .showMediaInfo:
             presentMediaInfo()
         case .selectSubtitleTrack(let index):
+            cancelTorrentSubtitleBackgroundJob()
+            torrentSubtitleBackgroundSuppressed = index < 0
             recordPlaybackDiagnostic(.control, control: .setSubtitleTrack, commandValue: Double(index))
             cancelTorrentPauseBuffer()
             cancelTorrentPlaybackWindowPolicy()
@@ -4718,6 +4959,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             core?.selectSubtitleTrack(at: index)
             startTorrentPlaybackWindowPolicyIfNeeded()
         case .selectAudioTrack(let index):
+            pauseTorrentBackgroundJobsForSeek()
             recordPlaybackDiagnostic(.control, control: .setAudioTrack, commandValue: Double(index))
             cancelTorrentPauseBuffer()
             cancelTorrentPlaybackWindowPolicy()
@@ -4756,6 +4998,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         savePlaylistProfile()
         refreshPlaybackSettings()
+        updateTorrentBackgroundJobs()
     }
 
     private func publishVolumePresentation() {
@@ -6127,6 +6370,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         case .subtitleTrack(let id):
             let item = NSMenuItem()
             if id == "generated", let generated = captionsTrackMenuItem(), let action = generated.action {
+                torrentSubtitleBackgroundSuppressed = true
+                cancelTorrentSubtitleBackgroundJob()
+                refreshTorrentBackgroundAdmission()
                 NSApp.sendAction(action, to: generated.target, from: generated)
             } else if id.hasPrefix("external:"), let url = URL(string: String(id.dropFirst(9))) {
                 item.representedObject = url

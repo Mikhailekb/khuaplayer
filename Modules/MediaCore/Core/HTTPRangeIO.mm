@@ -68,7 +68,8 @@ NSURLComponents* urlComponents(const std::string& text) {
 @public
     int64_t first, last, knownTotal, total, expectedLength;
     int result;
-    BOOL headersValidated, acceptedEmpty, retryable;
+    NSInteger httpStatus;
+    BOOL headersValidated, acceptedEmpty, retryable, cancelledResult;
     NSString* expectedValidator;
     NSString* validator;
     NSMutableData* body;
@@ -114,6 +115,7 @@ NSURLComponents* urlComponents(const std::string& text) {
     SPHTTPRangeRequest* state = [self requestForTask:task remove:NO];
     if (!state) { completionHandler(NSURLSessionResponseCancel); return; }
     NSHTTPURLResponse* http = [response isKindOfClass:NSHTTPURLResponse.class] ? (id)response : nil;
+    state->httpStatus = http.statusCode;
     ContentRange range;
     const BOOL validRange = parseContentRange([http valueForHTTPHeaderField:@"Content-Range"], range);
     if (http.statusCode == 416 && validRange && range.empty && state->knownTotal < 0) {
@@ -174,6 +176,7 @@ NSURLComponents* urlComponents(const std::string& text) {
     else if (state->result >= 0) {
         if (error) {
             state->result = AVERROR(error.code == NSURLErrorTimedOut ? ETIMEDOUT : EIO);
+            state->cancelledResult = [error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled;
             state->retryable = [error.domain isEqualToString:NSURLErrorDomain] &&
                 (error.code == NSURLErrorNetworkConnectionLost || error.code == NSURLErrorTimedOut ||
                  error.code == NSURLErrorCannotConnectToHost || error.code == NSURLErrorNotConnectedToInternet);
@@ -188,6 +191,7 @@ namespace sp {
 struct HTTPRangeIO::Impl {
     std::function<bool()> interrupted;
     std::function<void(bool)> waitingChanged;
+    std::function<bool()> readAdmission;
     double timeout;
     NSURL* url = nil;
     NSString* authorization = nil;
@@ -195,6 +199,7 @@ struct HTTPRangeIO::Impl {
     SPHTTPRangeTransport* transport = nil;
     NSURLSession* session = nil;
     int64_t length = -1, position = 0;
+    int64_t readBlockBytes = kRangeBytes;
     struct CacheWindow {
         int64_t first;
         uint64_t access;
@@ -302,12 +307,42 @@ struct HTTPRangeIO::Impl {
                 void announce() {
                     if (!announced && changed) { announced = true; changed(true); }
                 }
-                ~WaitingScope() { if (announced) changed(false); }
+                void suspend() { if (announced) { announced = false; changed(false); } }
+                ~WaitingScope() { suspend(); }
             } waiting(waitingChanged);
-            const auto deadline = started + std::chrono::duration<double>(timeout);
+            auto deadline = started + std::chrono::duration<double>(timeout);
+            std::chrono::steady_clock::duration deniedTime{};
+            std::chrono::steady_clock::time_point deniedSince{};
+            bool admissionDenied = false;
+            uint64_t deniedSequence = 0;
+            auto noteAdmission = [&](bool admitted) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!admitted && !admissionDenied) {
+                    admissionDenied = true;
+                    ++deniedSequence;
+                    deniedSince = now;
+                    waiting.suspend();
+                } else if (admitted && admissionDenied) {
+                    const auto paused = now - deniedSince;
+                    deniedTime += paused;
+                    deadline += paused;
+                    admissionDenied = false;
+                }
+            };
+            auto admitted = [&] { return !readAdmission || readAdmission(); };
+            auto awaitAdmission = [&] {
+                if (!readAdmission) return !cancelled();
+                while (true) {
+                    const bool allowed = admitted();
+                    noteAdmission(allowed);
+                    if (cancelled()) { noteAdmission(true); return false; }
+                    if (allowed) return true;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                }
+            };
             bool slowAnnounced = false;
             auto announceWaiting = [&] {
-                const auto elapsed = std::chrono::steady_clock::now() - started;
+                const auto elapsed = std::chrono::steady_clock::now() - started - deniedTime;
                 if (!slowAnnounced && elapsed >= std::chrono::milliseconds(500)) {
                     slowAnnounced = true;
                     diagnose(start, count, elapsedMs(), 1, 0, currentAttempt);
@@ -319,62 +354,104 @@ struct HTTPRangeIO::Impl {
             // A transient transport error must not reach AVIO: some demuxers
             // retain it as terminal EOF, while others discard an incomplete packet.
             // Retry the exact bounded request, never exposing a partial body.
-            for (int attempt = 0; attempt < 3; ++attempt) {
+            int attempt = 0;
+            int conflictReplays = 0;
+            while (attempt < 3) {
                 currentAttempt = attempt + 1;
-                if (cancelled()) return finish(AVERROR_EXIT);
+                if (!awaitAdmission()) return finish(AVERROR_EXIT);
                 const double remaining = std::chrono::duration<double>(
                     deadline - std::chrono::steady_clock::now()).count();
                 if (remaining <= 0) return finish(AVERROR(ETIMEDOUT));
-                NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url
-                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:remaining];
-                [request setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", (long long)start,
-                    (long long)(start + count - 1)] forHTTPHeaderField:@"Range"];
-                [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
-                if (authorization) [request setValue:authorization forHTTPHeaderField:@"Authorization"];
-                if (expectedValidator) [request setValue:expectedValidator forHTTPHeaderField:@"If-Range"];
-                SPHTTPRangeRequest* state = [SPHTTPRangeRequest new];
-                state->first = start; state->last = start + count - 1;
-                state->knownTotal = expectedTotal; state->expectedValidator = expectedValidator;
-                NSURLSessionDataTask* task = [session dataTaskWithRequest:request];
-                [transport addRequest:state task:task];
-                [task resume];
-                while (dispatch_semaphore_wait(state->completed,
-                       dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC))) {
-                    if (cancelled()) { [task cancel]; return finish(AVERROR_EXIT); }
-                    if (std::chrono::steady_clock::now() >= deadline) {
-                        [task cancel]; return finish(AVERROR(ETIMEDOUT));
+                // Admission can revoke repeatedly. Release every cancelled task
+                // and partial body before creating its same-range replacement.
+                @autoreleasepool {
+                    NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url
+                        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:remaining];
+                    [request setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", (long long)start,
+                        (long long)(start + count - 1)] forHTTPHeaderField:@"Range"];
+                    [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
+                    if (authorization) [request setValue:authorization forHTTPHeaderField:@"Authorization"];
+                    if (expectedValidator) [request setValue:expectedValidator forHTTPHeaderField:@"If-Range"];
+                    // No suspended task exists while waiting for admission.
+                    if (!awaitAdmission()) return finish(AVERROR_EXIT);
+                    request.timeoutInterval = std::chrono::duration<double>(
+                        deadline - std::chrono::steady_clock::now()).count();
+                    if (request.timeoutInterval <= 0) return finish(AVERROR(ETIMEDOUT));
+                    const uint64_t requestDeniedSequence = deniedSequence;
+                    SPHTTPRangeRequest* state = [SPHTTPRangeRequest new];
+                    state->first = start; state->last = start + count - 1;
+                    state->knownTotal = expectedTotal; state->expectedValidator = expectedValidator;
+                    NSURLSessionDataTask* task = [session dataTaskWithRequest:request];
+                    [transport addRequest:state task:task];
+                    [task resume];
+                    bool preempted = false;
+                    const int pollMs = readAdmission ? 25 : 50;
+                    while (dispatch_semaphore_wait(state->completed,
+                           dispatch_time(DISPATCH_TIME_NOW, pollMs * NSEC_PER_MSEC))) {
+                        if (cancelled()) { [task cancel]; return finish(AVERROR_EXIT); }
+                        if (!admitted()) {
+                            noteAdmission(false);
+                            [task cancel];
+                            preempted = true;
+                            // Completion is the handoff barrier: no replacement
+                            // task overlaps a reader that has not been cancelled.
+                            while (dispatch_semaphore_wait(state->completed,
+                                   dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_MSEC))) {
+                                if (cancelled()) { noteAdmission(true); return finish(AVERROR_EXIT); }
+                                noteAdmission(admitted());
+                                if (!admissionDenied && std::chrono::steady_clock::now() >= deadline)
+                                    return finish(AVERROR(ETIMEDOUT));
+                            }
+                            break;
+                        }
+                        if (std::chrono::steady_clock::now() >= deadline) {
+                            [task cancel]; return finish(AVERROR(ETIMEDOUT));
+                        }
+                        announceWaiting();
                     }
-                    announceWaiting();
-                }
-                if (cancelled()) return finish(AVERROR_EXIT);
-                if (std::chrono::steady_clock::now() >= deadline) return finish(AVERROR(ETIMEDOUT));
-                if (state->result >= 0) {
-                    receivedTotal = state->total;
-                    if (state->validator.length) validator = state->validator;
-                    output.resize(state->body.length);
-                    if (!output.empty()) memcpy(output.data(), state->body.bytes, output.size());
-                    return finish(0);
-                }
-                if (!state->retryable || attempt == 2) return finish(state->result);
-                retryAnnounced = true;
-                diagnose(start, count, elapsedMs(), 3, state->result, currentAttempt);
-                // Even an incomplete body can have established the entity and
-                // length. A retry must not silently switch to another resource.
-                if (state->headersValidated) {
-                    expectedTotal = state->total;
-                    if (state->validator.length) expectedValidator = state->validator;
-                }
-                // The deadline and waiting interval span all attempts. Poll the
-                // interrupt during backoff too, so seek/stop never waits on retry.
-                const auto retryAt = std::min(deadline, std::chrono::steady_clock::now() +
-                    std::chrono::duration<double>(attempt == 0 ? 0.05 : 0.15));
-                while (std::chrono::steady_clock::now() < retryAt) {
-                    if (cancelled()) return finish(AVERROR_EXIT);
-                    const auto now = std::chrono::steady_clock::now();
-                    if (now >= deadline) return finish(AVERROR(ETIMEDOUT));
-                    announceWaiting();
-                    std::this_thread::sleep_for(std::min(std::chrono::duration<double>(retryAt - now),
-                                                        std::chrono::duration<double>(0.025)));
+                    if (cancelled()) { noteAdmission(true); return finish(AVERROR_EXIT); }
+                    if (!awaitAdmission()) return finish(AVERROR_EXIT);
+                    if (state->headersValidated) {
+                        // A cancelled body still establishes immutable identity.
+                        expectedTotal = state->total;
+                        if (state->validator.length) expectedValidator = state->validator;
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline) return finish(AVERROR(ETIMEDOUT));
+                    if (preempted && state->cancelledResult) continue;
+                    // A worker can reject a racing background request while its
+                    // parent seek is awaiting acknowledgment. Only an observed
+                    // admission revocation makes that409 a soft lane conflict.
+                    // Invalid ranges/entities/bodies and permanent statuses keep
+                    // their existing terminal behavior, even after revocation.
+                    if (readAdmission && state->httpStatus == 409 &&
+                        deniedSequence != requestDeniedSequence && conflictReplays < 2) {
+                        ++conflictReplays;
+                        retryAnnounced = true;
+                        diagnose(start, count, elapsedMs(), 3, AVERROR(EAGAIN), currentAttempt);
+                        continue;
+                    }
+                    if (state->result >= 0) {
+                        receivedTotal = state->total;
+                        if (state->validator.length) validator = state->validator;
+                        output.resize(state->body.length);
+                        if (!output.empty()) memcpy(output.data(), state->body.bytes, output.size());
+                        return finish(0);
+                    }
+                    if (!state->retryable || attempt == 2) return finish(state->result);
+                    retryAnnounced = true;
+                    diagnose(start, count, elapsedMs(), 3, state->result, currentAttempt);
+                    const auto retryAt = std::chrono::steady_clock::now() +
+                        std::chrono::duration<double>(attempt == 0 ? 0.05 : 0.15);
+                    ++attempt;
+                    while (std::chrono::steady_clock::now() < retryAt) {
+                        if (!awaitAdmission()) return finish(AVERROR_EXIT);
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now >= deadline) return finish(AVERROR(ETIMEDOUT));
+                        if (now >= retryAt) break;
+                        announceWaiting();
+                        std::this_thread::sleep_for(std::min(std::chrono::duration<double>(retryAt - now),
+                                                            std::chrono::duration<double>(0.025)));
+                    }
                 }
             }
             return finish(AVERROR(EIO));
@@ -400,6 +477,17 @@ int HTTPRangeIO::open() {
     return 0;
 }
 int64_t HTTPRangeIO::size() const { return impl_->length; }
+bool HTTPRangeIO::setReadBlockSize(int64_t bytes) {
+    if (bytes < 16 * 1024 || bytes > kRangeBytes) return false;
+    if (bytes != impl_->readBlockBytes) {
+        impl_->readBlockBytes = bytes;
+        impl_->cache.clear();
+    }
+    return true;
+}
+void HTTPRangeIO::setReadAdmission(std::function<bool()> admitted) {
+    impl_->readAdmission = std::move(admitted);
+}
 int HTTPRangeIO::read(uint8_t* destination, int requested) {
     if (impl_->cancelled()) return AVERROR_EXIT;
     if (requested < 0 || (!destination && requested) || impl_->length < 0) return AVERROR(EINVAL);
@@ -407,7 +495,7 @@ int HTTPRangeIO::read(uint8_t* destination, int requested) {
     if (impl_->position >= impl_->length) return AVERROR_EOF;
     auto* cached = impl_->cachedAt(impl_->position);
     if (!cached) {
-        const int64_t count = std::min(kRangeBytes, impl_->length - impl_->position);
+        const int64_t count = std::min(impl_->readBlockBytes, impl_->length - impl_->position);
         int64_t total = -1;
         std::vector<uint8_t> bytes;
         const int result = impl_->fetch(impl_->position, count, bytes, total);

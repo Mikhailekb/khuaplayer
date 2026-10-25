@@ -96,6 +96,12 @@ jobs:
           ./Scripts/test_playback_control_intent.sh
           ./Scripts/test_playback_diagnostics.sh
           ./Scripts/test_playback_diagnostic_projection.sh
+          ./Scripts/test_torrent_background_admission.sh
+          ./Scripts/test_torrent_background_urls.sh
+          ./Scripts/test_torrent_background_lifecycle.sh
+          ./Scripts/test_torrent_subtitle_cache.sh
+          ./Scripts/test_torrent_preview_cache.sh
+          ./Scripts/test_persistent_thumbnail_store.sh
           ./Scripts/test_video_context_menu.sh
           ./Scripts/test_video_context_policy.sh
           ./Scripts/test_floating_video.sh

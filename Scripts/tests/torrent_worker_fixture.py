@@ -16,7 +16,7 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 from pathlib import Path
 
-WORKER_VERSION = 'MatriX.147-khua.7'
+WORKER_VERSION = 'MatriX.147-khua.8'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--ip', default='127.0.0.1')

@@ -305,6 +305,198 @@ void transientRetryChecks(const std::string& base) {
            "slow logical fetch emits one waiting, one completion, and two bounded retry diagnostics");
 }
 
+NSDictionary* loopbackStats(const std::string& base) {
+    NSData* data = [NSData dataWithContentsOfURL:[NSURL URLWithString:
+        [NSString stringWithUTF8String:(base + "/stats").c_str()]]];
+    return data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : @{};
+}
+int loopbackMetric(const std::string& base, const std::string& path, NSString* key) {
+    return [loopbackStats(base)[[NSString stringWithUTF8String:path.c_str()]][key] intValue];
+}
+bool waitFor(const std::function<bool()>& ready, int milliseconds = 1000) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+    while (std::chrono::steady_clock::now() < until) {
+        if (ready()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return ready();
+}
+
+void readBlockSizeChecks(const std::string& base) {
+    sp::HTTPRangeIO io(base + "/cache-small-block", [] { return false; });
+    expect(io.setReadBlockSize(16 * 1024), "minimum16KiB read window is accepted");
+    expect(io.setReadBlockSize(maximumRead), "maximum256KiB read window is accepted");
+    expect(io.setReadBlockSize(32 * 1024), "background reader can select32KiB windows");
+    expect(io.open() >= 0, "open small-window resource");
+    auto readAt = [&](int64_t offset, int requested, int expected) {
+        expect(io.seek(offset, SEEK_SET) == offset, "select a small-window byte position");
+        std::vector<uint8_t> bytes(requested);
+        const int received = io.read(bytes.data(), requested);
+        expect(received == expected, "small-window read respects selected window and caller count");
+        bool valid = true;
+        for (int i = 0; valid && i < received; ++i) {
+            const int64_t p = offset + i;
+            valid = bytes[i] == uint8_t(((p * 37 + 11) ^ (p >> 8) ^ ((p >> 16) * 13)) & 255);
+        }
+        expect(valid, "small-window bytes match their complete physical offset");
+    };
+    readAt(64, 64 * 1024, 32 * 1024);
+    readAt(65, 1024, 1024);
+    expect(io.setReadBlockSize(32 * 1024), "reapplying same read size preserves resident windows");
+    for (int64_t invalid : {-1LL, 0LL, 16383LL, 262145LL, INT64_MAX})
+        expect(!io.setReadBlockSize(invalid), "invalid read window size is rejected without changing cache");
+    readAt(64, 1024, 1024);
+    readAt(1024 * 1024 + 64, 64 * 1024, 32 * 1024);
+    expect(io.setReadBlockSize(64 * 1024), "changing read size clears only the local cache");
+    readAt(64, 128 * 1024, 64 * 1024);
+    expect(io.setReadBlockSize(32 * 1024), "return to background32KiB window size");
+    for (int i = 0; i < 8; ++i) readAt(int64_t(i) * 64 * 1024 + 64, 1024, 1024);
+    readAt(64, 1024, 1024);
+    readAt(8 * 64 * 1024 + 64, 1024, 1024);
+    readAt(64, 1024, 1024);
+    readAt(64 * 1024 + 64, 1024, 1024);
+}
+
+void admissionChecks(const std::string& base) {
+    {
+        std::atomic<bool> grant{false}, done{false};
+        int result = INT_MIN;
+        sp::HTTPRangeIO io(base + "/admission-probe", [] { return false; }, 0.3);
+        io.setReadAdmission([&] { return grant.load(); });
+        std::thread opening([&] { @autoreleasepool { result = io.open(); done.store(true); } });
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        expect(!done.load(), "denied initial probe waits beyond configured active-I/O timeout");
+        expect(loopbackMetric(base, "/admission-probe", @"get") == 0, "no HTTP probe starts before admission");
+        grant.store(true);
+        expect(waitFor([&] { return done.load(); }), "grant releases the waiting probe");
+        opening.join();
+        expect(result == 0 && io.size() == fixtureSize, "paused time does not consume probe's active budget");
+    }
+    {
+        std::atomic<bool> stop{false}, done{false};
+        int result = INT_MIN;
+        sp::HTTPRangeIO io(base + "/admission-cancel", [&] { return stop.load(); }, 0.1);
+        io.setReadAdmission([] { return false; });
+        std::thread opening([&] { @autoreleasepool { result = io.open(); done.store(true); } });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const auto cancelledAt = std::chrono::steady_clock::now();
+        stop.store(true);
+        expect(waitFor([&] { return done.load(); }, 150), "permanent stop promptly cancels admission wait");
+        opening.join();
+        expect(result == AVERROR_EXIT && std::chrono::steady_clock::now() - cancelledAt < std::chrono::milliseconds(150),
+               "denied cancellation returns AVERROR_EXIT without waiting for grant");
+        expect(loopbackMetric(base, "/admission-cancel", @"get") == 0, "cancelled denied probe never opens HTTP");
+    }
+    for (const std::string path : {"/admission-mid", "/admission-many", "/admission-mixed"}) {
+        std::atomic<bool> grant{true}, done{false};
+        std::vector<bool> transitions;
+        sp::HTTPRangeIO io(base + path, [] { return false; }, path == "/admission-mid" ? 0.2 : 2.0,
+                          [&](bool value) { transitions.push_back(value); });
+        io.setReadAdmission([&] { return grant.load(); });
+        expect(io.setReadBlockSize(32 * 1024), "admitted metadata reader uses32KiB ranges");
+        expect(io.open() >= 0 && io.seek(16, SEEK_SET) == 16, "open admitted reader before body preemption");
+        uint8_t bytes[64]{};
+        int result = INT_MIN;
+        std::thread reading([&] { @autoreleasepool { result = io.read(bytes, sizeof(bytes)); done.store(true); } });
+        const int cycles = path == "/admission-mid" ? 1 : 4;
+        for (int i = 1; i <= cycles; ++i) {
+            expect(waitFor([&] { return loopbackMetric(base, path, @"partial_started") >= i; }),
+                   "fixture has actually sent an incomplete range body before revocation");
+            grant.store(false);
+            expect(waitFor([&] { return loopbackMetric(base, path, @"disconnected") >= i; }, 500),
+                   "revocation disconnects active server reader instead of holding bandwidth");
+            const int before = loopbackMetric(base, path, @"get");
+            std::this_thread::sleep_for(std::chrono::milliseconds(path == "/admission-mid" ? 350 : 50));
+            expect(!done.load(), "preempted read exposes no data or transport error while denied");
+            expect(loopbackMetric(base, path, @"get") == before, "no replacement HTTP request starts while denied");
+            grant.store(true);
+        }
+        expect(waitFor([&] { return done.load(); }, 1500), "regrant transparently resumes exact pending range");
+        reading.join();
+        expect(result == sizeof(bytes), "preemption does not poison AVIO with an error or partial result");
+        expectBytes(bytes, result, 16, "reissued range returns every original byte exactly once");
+        expect(io.seek(0, SEEK_CUR) == 16 + sizeof(bytes), "position advances once only after complete admitted body");
+        expect(balancedWaiting(transitions), "preemption leaves waiting callback transitions balanced");
+    }
+    {
+        std::atomic<bool> grant{true}, done{false};
+        int result = INT_MIN;
+        sp::HTTPRangeIO io(base + "/admission-entity-change", [] { return false; }, 1.0);
+        io.setReadAdmission([&] { return grant.load(); });
+        expect(io.open() >= 0 && io.seek(16, SEEK_SET) == 16, "probe establishes immutable entity before body preemption");
+        uint8_t bytes[64]{};
+        std::thread opening([&] { @autoreleasepool { result = io.read(bytes, sizeof(bytes)); done.store(true); } });
+        expect(waitFor([&] { return loopbackMetric(base, "/admission-entity-change", @"partial_started") == 1; }),
+               "established entity body begins before being preempted");
+        grant.store(false);
+        expect(waitFor([&] { return loopbackMetric(base, "/admission-entity-change", @"disconnected") == 1; }),
+               "preempted body disconnects without delivering partial data");
+        grant.store(true);
+        expect(waitFor([&] { return done.load(); }), "regranted identity-validated body completes");
+        opening.join();
+        expect(result == AVERROR_INVALIDDATA && io.size() == fixtureSize, "entity change across preemption fails closed");
+    }
+}
+
+void admissionConflictChecks(const std::string& base) {
+    for (const std::string path : {"/conflict-default", "/admission-conflict-plain"}) {
+        sp::HTTPRangeIO io(base + path, [] { return false; }, 1.0);
+        if (path == "/admission-conflict-plain") io.setReadAdmission([] { return true; });
+        expect(io.open() == 0 && io.seek(16, SEEK_SET) == 16, "open plain-conflict fixture");
+        uint8_t bytes[64]{};
+        expect(io.read(bytes, sizeof(bytes)) == AVERROR(EIO), "409 without observed denial remains terminal");
+        expect(io.seek(0, SEEK_CUR) == 16, "terminal409 never advances position");
+    }
+    for (const std::string path : {"/admission-conflict-once", "/admission-conflict-repeat", "/admission-invalid-overbody"}) {
+        std::atomic<bool> grant{true}, done{false}, deniedSeen{false};
+        std::atomic<int64_t> lastCheck{0};
+        sp::HTTPRangeIO io(base + path, [] { return false; }, 2.0);
+        io.setReadBlockSize(32 * 1024);
+        io.setReadAdmission([&] {
+            const bool allowed = grant.load();
+            // Publish after taking the gate snapshot, so the test controller
+            // can revoke immediately after an admitted pending-loop poll.
+            lastCheck.store(std::chrono::steady_clock::now().time_since_epoch().count());
+            if (!allowed) deniedSeen.store(true);
+            return allowed;
+        });
+        expect(io.open() == 0 && io.seek(16, SEEK_SET) == 16, "open controlled priority-conflict fixture");
+        uint8_t bytes[64];
+        std::fill(std::begin(bytes), std::end(bytes), 0xCC);
+        int result = INT_MIN;
+        std::thread reading([&] { @autoreleasepool { result = io.read(bytes, sizeof(bytes)); done.store(true); } });
+        const int cycles = path == "/admission-conflict-repeat" ? 3 : 1;
+        for (int index = 1; index <= cycles; ++index) {
+            expect(waitFor([&] { return loopbackMetric(base, path, @"response_pending") >= index; }),
+                   "controlled response is pending before priority revocation");
+            const int64_t previousCheck = lastCheck.load();
+            expect(waitFor([&] { return lastCheck.load() != previousCheck; }),
+                   "observe a fresh admitted pending-loop gate poll");
+            deniedSeen.store(false);
+            grant.store(false);
+            const std::string control = base + "/release/" + path.substr(1) + "/" + std::to_string(index);
+            (void)[NSData dataWithContentsOfURL:[NSURL URLWithString:[NSString stringWithUTF8String:control.c_str()]]];
+            expect(waitFor([&] { return deniedSeen.load(); }), "priority denial is observed before response interpretation");
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            expect(!done.load(), "even a completed response is withheld while admission is denied");
+            grant.store(true);
+        }
+        expect(waitFor([&] { return done.load(); }), "regranted controlled response completes within bounded attempts");
+        reading.join();
+        if (path == "/admission-conflict-once") {
+            expect(result == sizeof(bytes), "observed-denial409 transparently replays exact range on grant");
+            expectBytes(bytes, result, 16, "conflict replay preserves every selected byte");
+            expect(io.seek(0, SEEK_CUR) == 16 + sizeof(bytes), "conflict replay advances byte position once");
+        } else {
+            expect(result == (path == "/admission-conflict-repeat" ? AVERROR(EIO) : AVERROR_INVALIDDATA),
+                   "repeat409 budget and true invalid body remain terminal");
+            expect(io.seek(0, SEEK_CUR) == 16, "terminal controlled response leaves byte position unchanged");
+            expect(std::all_of(std::begin(bytes), std::end(bytes), [](uint8_t b) { return b == 0xCC; }),
+                   "invalid or failed controlled bodies never reach caller");
+        }
+    }
+}
+
 void cacheWindowChecks(const std::string& base) {
     auto readAt = [](sp::HTTPRangeIO& io, int64_t offset) {
         expect(io.seek(offset, SEEK_SET) == offset, "select an interleaved cache region");
@@ -349,6 +541,9 @@ int main(int argc, char** argv) {
         authenticationChecks(base);
         cacheWindowChecks(base);
         transientRetryChecks(base);
+        readBlockSizeChecks(base);
+        admissionChecks(base);
+        admissionConflictChecks(base);
         std::cout << "HTTP range IO checks passed (" << checks << " assertions)." << std::endl;
     }
 }

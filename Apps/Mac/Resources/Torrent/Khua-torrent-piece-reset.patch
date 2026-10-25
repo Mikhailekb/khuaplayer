@@ -1,3 +1,47 @@
+diff --git a/auxiliary_priority_test.go b/auxiliary_priority_test.go
+new file mode 100644
+--- /dev/null
++++ b/auxiliary_priority_test.go
+@@ -0,0 +1,39 @@
++package torrent
++
++import (
++	"github.com/anacrolix/missinggo/bitmap"
++	"github.com/anacrolix/torrent/metainfo"
++	"testing"
++)
++
++func TestStrategy3AuxiliaryNextPrecedesContinuousReaderAhead(t *testing.T) {
++	for _, strategy := range []int{2, 3} {
++		tor := &Torrent{info: &metainfo.Info{Length: 8 << 20, PieceLength: 1 << 20, Pieces: make([]byte, 8*20)}, pieces: make([]Piece, 8), requestStrategy: strategy}
++		tor.readers = map[*reader]struct{}{&reader{pieces: pieceRange{begin: 4, end: 7}}: {}}
++		for _, id := range []int{0, 1, 4, 5, 6} {
++			tor.pendingPieces.Set(bitmap.BitIndex(id), PiecePriorityNormal.BitmapPriority())
++		}
++		tor.pieces[1].priority = PiecePriorityNext
++		tor.pendingPieces.Set(1, PiecePriorityNext.BitmapPriority())
++		cn := &connection{t: tor, peerSentHaveAll: true}
++		var order []int
++		cn.iterUnbiasedPieceRequestOrder(func(p pieceIndex) bool { order = append(order, int(p)); return true })
++		if len(order) != 5 || order[0] != 4 {
++			t.Fatalf("strategy%d current reader lost priority: %v", strategy, order)
++		}
++		if strategy == 3 && order[1] != 1 {
++			t.Fatalf("auxiliary Next starved behind moving reader readahead: %v", order)
++		}
++		if strategy == 2 && (order[1] != 5 || order[2] != 6) {
++			t.Fatalf("other strategy ordering changed: %v", order)
++		}
++		tor.completedPieces.Add(1)
++		order = nil
++		cn.iterUnbiasedPieceRequestOrder(func(p pieceIndex) bool { order = append(order, int(p)); return true })
++		for _, id := range order {
++			if id == 1 {
++				t.Fatal("completed auxiliary requested again")
++			}
++		}
++	}
++}
 diff --git a/connection.go b/connection.go
 --- a/connection.go
 +++ b/connection.go
@@ -10,6 +54,34 @@ diff --git a/connection.go b/connection.go
  				// Request only as many as we expect to receive in the
  				// dupliateRequestTimeout window. We are trying to avoid having to
  				// duplicate requests.
+@@ -738,6 +738,18 @@
+ 
+ func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) bool) bool {
+ 	now, readahead := cn.t.readerPiecePriorities()
++	// Strategy3 must honor explicit urgent auxiliary pieces before a primary
++	// reader's continuously advancing speculative readahead. Actual readers
++	// remain first; other request strategies keep their prior ordering.
++	var explicitNext bitmap.Bitmap
++	if cn.t.requestStrategy == 3 {
++		cn.t.pendingPieces.IterTyped(func(piece int) bool {
++			if cn.t.pieces[piece].priority >= PiecePriorityNext {
++				explicitNext.Add(piece)
++			}
++			return true
++		})
++	}
+ 	var skip bitmap.Bitmap
+ 	if !cn.peerSentHaveAll {
+ 		// Pieces to skip include pieces the peer doesn't have.
+@@ -756,7 +768,7 @@
+ 			}
+ 			return f(pieceIndex(i))
+ 		},
+-		iterBitmapsDistinct(&skip, now, readahead),
++		iterBitmapsDistinct(&skip, now, explicitNext, readahead),
+ 		func(cb iter.Callback) {
+ 			cn.t.pendingPieces.IterTyped(func(piece int) bool {
+ 				if skip.Contains(piece) {
 diff --git a/piece_discard.go b/piece_discard.go
 new file mode 100644
 --- /dev/null

@@ -105,6 +105,7 @@ private struct SPTorrentPlaybackWindow {
     var torrentPauseBuffer = TestPauseBuffer()
     var authorizedFills = 0
     func updateTorrentPauseBuffer() { authorizedFills += 1 }
+    func pauseTorrentBackgroundJobsForSeek() {}
     func start() { startTorrentPlaybackWindowPolicyIfNeeded() }
     func seek(_ target: Double) { issueForegroundSeek(to: target) }
     private func yieldDirectoryScanToForegroundIO() {}

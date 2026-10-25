@@ -239,6 +239,28 @@ NS_SWIFT_UI_ACTOR
 // pending external load. Invalidate it without clearing the displayed track.
 - (void)cancelPendingSubtitleLoad;
 
+// Adopt a complete, independently validated embedded text-track cache while
+// preserving its logical container selection. After a successful atomic
+// renderer commit the main demuxer no longer requests this subtitle's bytes.
+// Empty UTF-8 files represent validated empty tracks. Async completion runs on
+// main; source/track changes and superseding subtitle requests reject adoption.
+- (BOOL)adoptCachedEmbeddedSubtitleFile:(NSString *)path
+                           streamIndex:(NSInteger)streamIndex
+                            completion:(void (^_Nullable)(BOOL ok))completion
+    NS_SWIFT_NAME(adoptCachedEmbeddedSubtitleFile(_:streamIndex:completion:));
+
+// Opt in an independently admitted torrent background source for persistent
+// five-second previews. Main-thread only; reject a stale expected media URL.
+// Passing both source/cache nil revokes the opt-in. Local-file behavior is
+// unchanged, and configuring performs no filesystem work on the main thread.
+- (BOOL)configureTorrentPreviewSourceURL:(nullable NSURL *)sourceURL
+                     cacheDirectoryURL:(nullable NSURL *)cacheDirectoryURL
+                           forMediaURL:(NSURL *)expectedMediaURL;
+// Suspend preview network preparation while subtitles or foreground playback
+// have priority; already-persisted preview lookup remains available.
+- (void)setTorrentPreviewPreparationPaused:(BOOL)paused;
+@property (nonatomic, readonly) BOOL torrentPreviewPreparationPending;
+
 // Immutable track snapshots prepared off the main thread. Main-thread reads
 // never touch the demuxer. Entries contain container stream index and display title.
 @property (nonatomic, readonly) NSArray<NSDictionary *> *audioTrackList;

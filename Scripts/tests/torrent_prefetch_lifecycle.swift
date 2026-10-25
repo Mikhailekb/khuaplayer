@@ -67,6 +67,7 @@ private struct Context {
                                                      fileID: torrentContext!.file.id)
     }
     func refreshPlaylistView() {}
+    func updateTorrentBackgroundJobs() {}
     func startTorrentPlaybackWindowPolicyIfNeeded() {}
     func cancelTorrentPlaybackWindowPolicy(releaseRetainedWindow: Bool = false) {}
     func stateChanged(_ state: Core.State) {

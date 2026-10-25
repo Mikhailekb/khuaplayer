@@ -70,7 +70,7 @@ struct SPTorrentPlaybackWindow: Equatable, Sendable {
 @MainActor
 final class SPTorrentServer {
     static let shared = SPTorrentServer()
-    nonisolated static let workerVersion = "MatriX.147-khua.7"
+    nonisolated static let workerVersion = "MatriX.147-khua.8"
     /// Default for callers without an active worker; runtime status uses the
     /// configuration captured by the worker, never the desired preference.
     nonisolated static let cacheSizeBytes = SPTorrentConfiguration().cacheSizeBytes
@@ -369,6 +369,44 @@ final class SPTorrentServer {
         }
         guard let url = components.url else { throw SPTorrentServerError.invalidResponse }
         return url
+    }
+
+    /// A private low-priority producer has its own bounded working set. It
+    /// never advances the main player's history/playback window.
+    func backgroundStreamURL(_ descriptor: SPTorrentDescriptor, file: SPTorrentFile,
+                             consumer: UUID) throws -> URL {
+        guard consumer != descriptor.leaseID,
+              leaseHashes[descriptor.leaseID] == descriptor.hash else {
+            throw SPTorrentServerError.invalidLease
+        }
+        let primary = try streamURL(hash: descriptor.hash, file: file,
+                                    playbackConsumer: descriptor.leaseID)
+        guard var components = URLComponents(url: primary, resolvingAgainstBaseURL: false) else {
+            throw SPTorrentServerError.invalidResponse
+        }
+        components.queryItems = (components.queryItems ?? []).filter {
+            !["playback_consumer", "playback_prefetch", "playback_prefetch_request",
+              "playback_background", "playback_parent"].contains($0.name)
+        } + [URLQueryItem(name: "playback_consumer", value: consumer.uuidString),
+             URLQueryItem(name: "playback_background", value: "1"),
+             URLQueryItem(name: "playback_parent", value: descriptor.leaseID.uuidString)]
+        guard let url = components.url else { throw SPTorrentServerError.invalidResponse }
+        return url
+    }
+
+    /// Source/track cancellation retires the job token. Ordinary seeks keep it
+    /// so a paused independent reader can reacquire the new parent epoch.
+    func endBackgroundStream(_ descriptor: SPTorrentDescriptor, consumer: UUID) {
+        guard consumer != descriptor.leaseID,
+              leaseHashes[descriptor.leaseID] == descriptor.hash,
+              let worker, worker.process.isRunning else { return }
+        let expectedGeneration = worker.generation
+        Task { @MainActor [weak self] in
+            _ = try? await self?.jsonRequest(path: "/playback/background", body: [
+                "hash": descriptor.hash, "consumer": consumer.uuidString,
+                "parent": descriptor.leaseID.uuidString, "remove": true
+            ], expectedGeneration: expectedGeneration)
+        }
     }
 
     /// Release the old playback reservation without discarding its resident

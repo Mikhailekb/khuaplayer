@@ -61,6 +61,29 @@ def main() -> None:
             for path in ["/not-found", "/forbidden", "/bad-origin", "/bad-total", "/bad-length", "/ignore-range"]:
                 assert stats[path]["get"] == 1, (path, stats[path])
             assert 1 <= len([r for r in stats["/retry-deadline"]["requests"] if r["first"] == 16]) <= 2
+            small = stats["/cache-small-block"]
+            assert small["get"] == 14, small
+            assert small["requested_counts"].count(1) == 1, small
+            assert small["requested_counts"].count(32 * 1024) == 12, small
+            assert small["requested_counts"].count(64 * 1024) == 1, small
+            for path, bodies in {"/admission-mid": 2, "/admission-many": 5, "/admission-mixed": 7}.items():
+                entry = stats[path]
+                requests = [r for r in entry["requests"] if r["first"] == 16]
+                assert len(requests) == bodies, (path, entry)
+                assert all(r["count"] == 32 * 1024 and r["if_range"] == '\"fixture-v1\"' for r in requests), (path, entry)
+                assert entry.get("not_preempted", 0) == 0, (path, entry)
+                assert entry["disconnected"] == (1 if path == "/admission-mid" else 4), (path, entry)
+            assert stats["/admission-probe"]["get"] == 1
+            assert stats.get("/admission-cancel", {}).get("get", 0) == 0
+            changed = [r for r in stats["/admission-entity-change"]["requests"] if r["first"] == 16]
+            assert len(changed) == 2 and all(r["count"] == 256 * 1024 for r in changed), changed
+            assert all(r["if_range"] == '\"fixture-v1\"' for r in changed), changed
+            for path, expected in {"/conflict-default": 1, "/admission-conflict-plain": 1,
+                                   "/admission-conflict-once": 2, "/admission-conflict-repeat": 3,
+                                   "/admission-invalid-overbody": 1}.items():
+                bodies = [r for r in stats[path]["requests"] if r["first"] == 16]
+                assert len(bodies) == expected, (path, bodies)
+            assert stats["/admission-conflict-repeat"]["conflicts_sent"] == 3
             print("Loopback server observed bounded requests.")
             print("Loopback observed 3 interleaved fetches, 11 bounded LRU fetches and exact bounded retry counts.")
         finally:

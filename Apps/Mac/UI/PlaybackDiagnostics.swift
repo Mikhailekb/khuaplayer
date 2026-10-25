@@ -33,6 +33,7 @@ final class SPPlaybackDiagnostics {
         case prefetchLowerByte, prefetchUpperByte, residentBytes, capacityBytes, interactionFlags
         case prefetchFileID, prefetchMatchesContext
         case selectedFileID, fileOffsetByte, seekTargetUs, commandValueMilli, rangesKnown
+        case selectedAudioTrackIndex, selectedSubtitleTrackIndex
         case rangeReader, rangeStart, rangeRequestCount, rangeWaitMs, rangePhase, rangeResult, rangeAttempt
     }
 

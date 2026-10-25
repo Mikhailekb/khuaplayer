@@ -1,5 +1,5 @@
 {
-  "worker_version": "MatriX.147-khua.7",
+  "worker_version": "MatriX.147-khua.8",
   "source_commit": "a86d8fa7fd4e07605f240fe69bf299392f7cb023",
   "source_name": "TorrServer-MatriX.147-source.tar.gz",
   "source_url": "https://codeload.github.com/YouROK/TorrServer/tar.gz/a86d8fa7fd4e07605f240fe69bf299392f7cb023",
@@ -12,14 +12,14 @@
   "go_toolchain": "go1.26.4",
   "goos": "darwin",
   "goarch": "arm64",
-  "worker_bytes": 62375186,
-  "worker_sha256": "ef643b96a115a3270b9442d35760aa8e9d847990a5c3cf6ca858e46a6d3bb999",
+  "worker_bytes": 62409186,
+  "worker_sha256": "d7e962fd0749ab35e1d92ac171776c5b76c70e25704de76d16e6a3a1da29f251",
   "source_bytes": 53638818,
   "source_sha256": "3a2510e05b297358c2009e97ed313bbc55e15b862fdb3ee5b2cbd57dabafbf45",
-  "patch_bytes": 194237,
-  "patch_sha256": "7cea1eaf6e09cb9256278850cdb421ef1021407dafbdf999f669523d63e0e0bd",
+  "patch_bytes": 261852,
+  "patch_sha256": "bee38d4e539d14b55d2e43ccef942e9b77247f44d89449d2540b39c60f3fec0d",
   "dependency_source_bytes": 357174,
   "dependency_source_sha256": "6e350783b3fe2391e0c7f5c20f73166aa90473e2e1036da70f264fbc2403e60c",
-  "dependency_patch_bytes": 13237,
-  "dependency_patch_sha256": "5cb05f283349ae87b57aa9de41ca9a6203b8d393f58f1a7d7948f6058e413584"
+  "dependency_patch_bytes": 15973,
+  "dependency_patch_sha256": "01da7c64fc6b25dabfe0186f2ed259f0ac6b96c64a1e33ad9df0309ffe598067"
 }

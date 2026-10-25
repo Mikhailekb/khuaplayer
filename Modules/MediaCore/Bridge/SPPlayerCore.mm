@@ -27,6 +27,12 @@ static BOOL spPlanarOutputEnabled(void) {
 #import "SPAudioOutput.h"
 #import "SPSubtitleRenderer.h"
 #import "SPTimelineThumbnailer.h"
+// Private implementation contract; the canonical thumbnailer header and local
+// preview ABI remain unchanged.
+@interface SPTimelineThumbnailer (TorrentPreparation)
+- (BOOL)configurePersistentCacheDirectory:(NSURL *)directory intervalSeconds:(double)seconds;
+@property (nonatomic, readonly) BOOL persistentPreparationPending;
+@end
 #import "Demuxer.hpp"
 #include "HTTPRangeIO.hpp"
 #include "SPSourceGrowthPolicy.hpp"
@@ -654,6 +660,8 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
 
     std::atomic<int64_t> _subLoadGen;
     NSInteger _currentSubtitleTrackPub;
+    NSInteger _cachedEmbeddedSubtitleTrackIndex;
+    BOOL _externalSubtitleLoadPending;
     double _subtitleScale;
     NSString *_hdrDescription;
     NSString *_hdrStaticDetail;
@@ -1005,6 +1013,10 @@ static bool spFlacNativeMd5Wanted(const AVCodecParameters *par, spresil::FlacStr
     // is the idle signal because bursty audio muxing can keep the video queue level
     // low even while playback has sufficient supply.
     SPTimelineThumbnailer *_thumbnailer;
+    NSString *_torrentPreviewSourcePath;
+    NSString *_torrentPreviewCachePath;
+    int64_t _torrentPreviewOpenGeneration;
+    std::atomic<bool> _torrentPreviewPreparationPaused;
 
     std::atomic<int64_t> _presentStarveWallUs;
 
@@ -1336,6 +1348,9 @@ static BOOL spProbeStreamEmitsBFrames(NSString *path) {
         _audioRebuildTrack.store(-2);
         _currentAudioTrackPub.store(-1);
         _currentSubtitleTrackPub = -1;
+        _cachedEmbeddedSubtitleTrackIndex = -1;
+        _torrentPreviewOpenGeneration = -1;
+        _torrentPreviewPreparationPaused.store(false);
         _subtitleScale = 1.0;
         _subtitleActive = NO;
         _subtitleIsSRT = NO;
@@ -3673,9 +3688,85 @@ static BOOL spThumbsEnabled(void) {
 }
 
 - (BOOL)timelinePreviewEligible {
+    const BOOL network = _currentFilePath &&
+        sp::HTTPRangeIO::supportsURL(_currentFilePath.UTF8String ?: "");
+    const BOOL configured = _torrentPreviewSourcePath && _torrentPreviewCachePath &&
+        _torrentPreviewOpenGeneration == _openGeneration.load();
     return spThumbsEnabled() && !_previewMode && !_audioOnlySession.load() &&
-           _currentFilePath != nil &&
-           !sp::HTTPRangeIO::supportsURL(_currentFilePath.UTF8String ?: "");
+           _currentFilePath != nil && (!network || configured);
+}
+
+- (BOOL)configureTorrentPreviewSourceURL:(NSURL *)sourceURL
+                     cacheDirectoryURL:(NSURL *)cacheDirectoryURL
+                           forMediaURL:(NSURL *)expectedMediaURL {
+    if (!_currentFilePath || !expectedMediaURL ||
+        ![_currentFilePath isEqualToString:expectedMediaURL.absoluteString]) return NO;
+    if (!sourceURL || !cacheDirectoryURL) {
+        if (sourceURL || cacheDirectoryURL) return NO;
+        if (_torrentPreviewSourcePath) {
+            [_thumbnailer shutdown];
+            _thumbnailer = nil;
+        }
+        _torrentPreviewSourcePath = nil;
+        _torrentPreviewCachePath = nil;
+        _torrentPreviewOpenGeneration = -1;
+        _torrentPreviewPreparationPaused.store(false);
+        return YES;
+    }
+    if (!_sourceReadHTTP.load() ||
+        !sp::HTTPRangeIO::supportsURL(sourceURL.absoluteString.UTF8String ?: "") ||
+        !cacheDirectoryURL.isFileURL || ![cacheDirectoryURL.path hasPrefix:@"/"]) return NO;
+    NSURLComponents *source = [NSURLComponents componentsWithURL:sourceURL resolvingAgainstBaseURL:NO];
+    NSURLComponents *expected = [NSURLComponents componentsWithURL:expectedMediaURL resolvingAgainstBaseURL:NO];
+    if (![source.scheme.lowercaseString isEqualToString:expected.scheme.lowercaseString] ||
+        ![source.host.lowercaseString isEqualToString:expected.host.lowercaseString] ||
+        !((!source.port && !expected.port) || [source.port isEqualToNumber:expected.port]) ||
+        ![source.path isEqualToString:expected.path]) return NO;
+    auto uniqueQuery = [](NSURLComponents *components, NSString *name) -> NSString * {
+        NSString *value = nil;
+        int count = 0;
+        for (NSURLQueryItem *item in components.queryItems) {
+            if (![item.name isEqualToString:name]) continue;
+            ++count;
+            value = item.value;
+        }
+        return count == 1 ? value : nil;
+    };
+    NSString *primaryConsumer = uniqueQuery(expected, @"playback_consumer");
+    NSString *backgroundConsumer = uniqueQuery(source, @"playback_consumer");
+    if (!primaryConsumer || !backgroundConsumer ||
+        ![[NSUUID alloc] initWithUUIDString:primaryConsumer] ||
+        ![[NSUUID alloc] initWithUUIDString:backgroundConsumer] ||
+        [primaryConsumer caseInsensitiveCompare:backgroundConsumer] == NSOrderedSame ||
+        ![uniqueQuery(source, @"playback_background") isEqualToString:@"1"] ||
+        ![uniqueQuery(source, @"playback_parent") isEqualToString:primaryConsumer]) return NO;
+    for (NSString *field in @[@"link", @"index"]) {
+        NSString *foregroundValue = uniqueQuery(expected, field);
+        if (!foregroundValue || ![uniqueQuery(source, field) isEqualToString:foregroundValue]) return NO;
+    }
+    const int64_t generation = _openGeneration.load();
+    if (_torrentPreviewOpenGeneration == generation &&
+        [_torrentPreviewSourcePath isEqualToString:sourceURL.absoluteString] &&
+        [_torrentPreviewCachePath isEqualToString:cacheDirectoryURL.path]) return YES;
+    [_thumbnailer shutdown];
+    _thumbnailer = nil;
+    _torrentPreviewSourcePath = [sourceURL.absoluteString copy];
+    _torrentPreviewCachePath = [cacheDirectoryURL.path copy];
+    _torrentPreviewOpenGeneration = generation;
+    if (_state != SPPlayerStateOpening) [self scheduleTimelineThumbnails];
+    return YES;
+}
+
+- (void)setTorrentPreviewPreparationPaused:(BOOL)paused {
+    _torrentPreviewPreparationPaused.store(paused);
+}
+
+- (BOOL)torrentPreviewPreparationPending {
+    if (!_torrentPreviewSourcePath || !_torrentPreviewCachePath ||
+        _torrentPreviewOpenGeneration != _openGeneration.load() ||
+        ![self timelinePreviewEligible] || !std::isfinite(_duration) ||
+        _duration <= 0 || !_thumbVideoPar || _videoStreamIndex < 0) return NO;
+    return _thumbnailer ? _thumbnailer.persistentPreparationPending : YES;
 }
 
 - (void)scheduleTimelineThumbnails {
@@ -3683,7 +3774,10 @@ static BOOL spThumbsEnabled(void) {
         SPLOG(@"[Thumb] Dolby Vision：缩略图走 Metal 转换核（逐图 RPU 重建）");
     }
 
-    if (![self timelinePreviewEligible] || _duration < 10.0) return;
+    const BOOL persistentHTTP = _torrentPreviewSourcePath &&
+        _torrentPreviewOpenGeneration == _openGeneration.load();
+    if (![self timelinePreviewEligible] ||
+        (persistentHTTP ? _duration <= 0 : _duration < 10.0)) return;
     const int64_t gen = _openGeneration.load();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
@@ -3696,12 +3790,19 @@ static BOOL spThumbsEnabled(void) {
 
     if (gen != _openGeneration.load() || ![self timelinePreviewEligible]) return nil;
     if (_thumbnailer) return _thumbnailer;
+    const BOOL httpPreview = _torrentPreviewSourcePath &&
+        _torrentPreviewOpenGeneration == gen;
+    if (httpPreview && (!_thumbVideoPar || _videoStreamIndex < 0)) return nil;
     __weak SPPlayerCore *weakSelf = self;
 
     SPThumbIdleProbe probe = ^BOOL {
         SPPlayerCore *s = weakSelf;
         if (!s || s->_openGeneration.load() != gen) return NO;
-        if (s->_thumbSuspendedByUI.load()) return NO; // non-key window yields scanning
+        if (httpPreview && s->_torrentPreviewPreparationPaused.load()) return NO;
+        // Local sweeps keep their non-key-window rule. Torrent preparation is
+        // governed by the cross-window producer grant above; silently adding a
+        // second key-window gate could retain that grant without doing work.
+        if (!httpPreview && s->_thumbSuspendedByUI.load()) return NO;
         if (s->_firstFramePending.load()) return NO;
         if (s->_seekPending.load() || s->_seekFramePending.load()) return NO;
         if (s->_catchUpTargetUs.valid()) return NO;
@@ -3715,6 +3816,7 @@ static BOOL spThumbsEnabled(void) {
     SPThumbSeekBusyProbe seekBusy = ^BOOL {
         SPPlayerCore *s = weakSelf;
         if (!s || s->_openGeneration.load() != gen) return YES;
+        if (httpPreview && s->_torrentPreviewPreparationPaused.load()) return YES;
         return s->_firstFramePending.load() || s->_seekPending.load() ||
                s->_seekFramePending.load() || s->_catchUpTargetUs.valid();
     };
@@ -3727,7 +3829,7 @@ static BOOL spThumbsEnabled(void) {
         }
     };
     _thumbnailer = [[SPTimelineThumbnailer alloc]
-            initWithPath:_currentFilePath
+            initWithPath:httpPreview ? _torrentPreviewSourcePath : _currentFilePath
               durationUs:(int64_t)(_duration * 1e6)
         timelineOriginUs:_demuxer->timelineOriginUs()
             remoteVolume:_demuxer->onRemoteVolume()
@@ -3743,6 +3845,13 @@ static BOOL spThumbsEnabled(void) {
            seekBusyProbe:seekBusy
                 onUpdate:onUpdate];
     _thumbnailer.spLogId = _spLogId;
+    if (httpPreview && ![_thumbnailer configurePersistentCacheDirectory:
+                            [NSURL fileURLWithPath:_torrentPreviewCachePath isDirectory:YES]
+                            intervalSeconds:5.0]) {
+        [_thumbnailer shutdown];
+        _thumbnailer = nil;
+        return nil;
+    }
     return _thumbnailer;
 }
 
@@ -4168,11 +4277,83 @@ static BOOL spThumbsEnabled(void) {
 
 - (void)cancelPendingSubtitleLoad {
     _subLoadGen.fetch_add(1);
+    _externalSubtitleLoadPending = NO;
     [_subtitleRenderer invalidatePendingLoads];
 }
 
 - (BOOL)loadSubtitleFile:(NSString *)path {
     return [self loadSubtitleFile:path silent:NO completion:nil];
+}
+
+- (BOOL)adoptCachedEmbeddedSubtitleFile:(NSString *)path
+                           streamIndex:(NSInteger)streamIndex
+                            completion:(void (^)(BOOL))completion {
+    if (!_running.load() || !_subtitleRenderer || _externalSubtitleLoadPending || streamIndex < 0 ||
+        streamIndex != _currentSubtitleTrackPub ||
+        _subTrackMeta.find((int)streamIndex) == _subTrackMeta.end()) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
+        return NO;
+    }
+    const int64_t openGeneration = _openGeneration.load();
+    const int64_t loadGeneration = _subLoadGen.fetch_add(1) + 1;
+    [_subtitleRenderer invalidatePendingLoads];
+    NSString *file = [path copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        constexpr size_t maximumBytes = 8 * 1024 * 1024;
+        int fd = ::open(file.fileSystemRepresentation, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) {
+            if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
+            return;
+        }
+        struct stat attributes {};
+        const bool regular = fstat(fd, &attributes) == 0 && S_ISREG(attributes.st_mode) &&
+                             attributes.st_size >= 0 && attributes.st_size <= (off_t)maximumBytes;
+        NSMutableData *data = regular ? [NSMutableData dataWithCapacity:(NSUInteger)attributes.st_size] : nil;
+        bool valid = regular;
+        uint8_t buffer[64 * 1024];
+        while (valid) {
+            if (self->_openGeneration.load() != openGeneration ||
+                self->_subLoadGen.load() != loadGeneration) { valid = false; break; }
+            ssize_t count = ::read(fd, buffer, sizeof buffer);
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) { valid = false; break; }
+            if (count == 0) break;
+            if ((size_t)count > maximumBytes - data.length) { valid = false; break; }
+            [data appendBytes:buffer length:(NSUInteger)count];
+        }
+        ::close(fd);
+        if (valid && data.length != (NSUInteger)attributes.st_size) valid = false;
+        NSString *text = valid ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+        if (text && [text rangeOfString:@"\0"].location != NSNotFound) text = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            auto current = [self, openGeneration, loadGeneration, streamIndex] {
+                return self->_running.load() && self->_openGeneration.load() == openGeneration &&
+                       self->_subLoadGen.load() == loadGeneration &&
+                       self->_currentSubtitleTrackPub == streamIndex;
+            };
+            if (!text || !current()) { if (completion) completion(NO); return; }
+            void (^commit)(BOOL) = ^(BOOL ok) {
+                if (!ok || !current()) { if (completion) completion(NO); return; }
+                {
+                    std::lock_guard<std::mutex> lock(self->_subSwitchMtx);
+                    self->_subtitleActive = NO;
+                    self->_cachedEmbeddedSubtitleTrackIndex = streamIndex;
+                    // _currentSubtitleTrackPub deliberately remains selected.
+                }
+                self->_streamDiscardDirty.store(true);
+                [self refreshSubtitleDisplay];
+                if (completion) completion(YES);
+            };
+            if (text.length == 0) {
+                [self->_subtitleRenderer resetTrack];
+                self->_renderer.subtitleTexture = nil;
+                commit(YES);
+            } else {
+                [self->_subtitleRenderer loadSubtitleText:text completion:commit];
+            }
+        });
+    });
+    return YES;
 }
 
 - (BOOL)loadSubtitleFile:(NSString *)path
@@ -4184,6 +4365,7 @@ static BOOL spThumbsEnabled(void) {
         return NO;
     }
     const int64_t loadGen = _subLoadGen.fetch_add(1) + 1;
+    _externalSubtitleLoadPending = YES;
 
     [_subtitleRenderer invalidatePendingLoads];
 
@@ -4193,6 +4375,7 @@ static BOOL spThumbsEnabled(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (completion) completion(NO);
             if (self->_subLoadGen.load() != loadGen) return;
+            self->_externalSubtitleLoadPending = NO;
             if (silent) return;
             if ([self->_delegate respondsToSelector:
                      @selector(playerCore:didFailWithError:)]) {
@@ -4292,7 +4475,10 @@ static BOOL spThumbsEnabled(void) {
                     std::lock_guard<std::mutex> lk(self->_subSwitchMtx);
                     self->_subtitleActive = NO;
                     self->_currentSubtitleTrackPub = -1;
+                    self->_cachedEmbeddedSubtitleTrackIndex = -1;
                 }
+                self->_externalSubtitleLoadPending = NO;
+                self->_streamDiscardDirty.store(true);
                 [self refreshSubtitleDisplay];
                 if (completion) completion(YES);
             }];
@@ -4850,6 +5036,10 @@ static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
     _rendererConfiguredOpenGeneration.store(-1, std::memory_order_release);
     [_thumbnailer shutdown];
     _thumbnailer = nil;
+    _torrentPreviewSourcePath = nil;
+    _torrentPreviewCachePath = nil;
+    _torrentPreviewOpenGeneration = -1;
+    _torrentPreviewPreparationPaused.store(false);
 
     _presentStarveWallUs.store(0);
     // A cold-open software race may already have passed its generation check
@@ -4869,6 +5059,8 @@ static constexpr double kSPResumeKeyframeMaxBackSec = 5.0;
     _subtitleTrackList = nil;
     _generatedSubtitleActive.store(false);
     _currentSubtitleTrackPub = -1;
+    _cachedEmbeddedSubtitleTrackIndex = -1;
+    _externalSubtitleLoadPending = NO;
     _pendingAudioTrack.store(-2);
     _audioRebuildTrack.store(-2);
     _currentAudioTrackPub.store(-1);
@@ -5517,12 +5709,15 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
 - (void)selectSubtitleTrackAtIndex:(NSInteger)streamIndex {
     if (!_running.load()) return;
     _subLoadGen.fetch_add(1);
+    _externalSubtitleLoadPending = NO;
+    [_subtitleRenderer invalidatePendingLoads];
     _generatedSubtitleActive.store(false);
     if (streamIndex < 0) {
         {
             std::lock_guard<std::mutex> lk(_subSwitchMtx);
             _subtitleActive = NO;
             _currentSubtitleTrackPub = -1;
+            _cachedEmbeddedSubtitleTrackIndex = -1;
         }
         _streamDiscardDirty.store(true);
         [_subtitleRenderer resetTrack];
@@ -5533,10 +5728,12 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
     }
     auto it = _subTrackMeta.find((int)streamIndex);
     if (it == _subTrackMeta.end()) return;
-    if (streamIndex == _currentSubtitleTrackPub && _subtitleActive) return;
+    if (streamIndex == _currentSubtitleTrackPub &&
+        (_subtitleActive || _cachedEmbeddedSubtitleTrackIndex == streamIndex)) return;
     {
         std::lock_guard<std::mutex> lk(_subSwitchMtx);
         _subtitleActive = NO;
+        _cachedEmbeddedSubtitleTrackIndex = -1;
         [_subtitleRenderer resetTrack];
         _renderer.subtitleTexture = nil;
 
@@ -5576,10 +5773,12 @@ static void spAudioRecoveryTrial(const SPAudioRecoveryRequest &req, const std::a
 - (void)beginGeneratedSubtitleTrackWithHeader:(NSString *)assHeader {
     if (!_running.load() || !_subtitleRenderer) return;
     _subLoadGen.fetch_add(1);
+    _externalSubtitleLoadPending = NO;
     {
         std::lock_guard<std::mutex> lk(_subSwitchMtx);
         _subtitleActive = NO;
         _currentSubtitleTrackPub = -1;
+        _cachedEmbeddedSubtitleTrackIndex = -1;
     }
     _streamDiscardDirty.store(true);
     [_subtitleRenderer invalidatePendingLoads];

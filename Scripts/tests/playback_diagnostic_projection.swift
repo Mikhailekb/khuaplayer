@@ -26,6 +26,7 @@ private struct SourceWindow {
     var position = 12.25, duration = 100.5
     var sourcePlaybackWindow = SourceWindow()
     var sourceReadOffset: Int64 = 400
+    var currentAudioTrackIndex = 2, currentSubtitleTrackIndex = -1
     var sourceWaiting = false, sourceStalled = false, sourcePlaybackWaiting = false
     var sourceGrowing = false, seekSettled = false, sourceWaitingForIndex = false, contentSearching = false
     var sourcePlaybackWaitReason = WaitReason.none
@@ -103,6 +104,12 @@ private struct CacheSnapshot {
         check(local.bufferConstructions == 0, "Local playback never initializes the torrent pause buffer for diagnostics")
         check(local.last.values[.positionUs] == 12_250_000 && local.last.values[.durationUs] == 100_500_000,
               "Finite time values retain microsecond precision")
+        check(local.last.values[.selectedAudioTrackIndex] == 2 && local.last.values[.selectedSubtitleTrackIndex] == -1,
+              "Current audio and disabled subtitles are recorded from the public Core indices")
+        local.core!.currentAudioTrackIndex = -1; local.core!.currentSubtitleTrackIndex = 9
+        local.sample()
+        check(local.last.values[.selectedAudioTrackIndex] == -1 && local.last.values[.selectedSubtitleTrackIndex] == 9,
+              "Track changes replace both numeric indices and preserve the disabled audio sentinel")
         check(local.last.values[.rangesKnown] == 0 && local.last.values[.residentBytes] == -1 &&
               local.last.values[.prefetchState] == -1 && local.last.values[.selectedFileID] == -1,
               "Unknown/local torrent fields use numerical absence sentinels")

@@ -4286,7 +4286,12 @@ void Demuxer::applyStreamDiscard(int audioIndex, int subtitleIndex) {
     lastDiscardAudio_ = audioIndex;
     lastDiscardSub_ = subtitleIndex;
     discardApplied_ = true;
-    if (!fmtCtx_ || !discardEligible_) return;
+    // MOV can place unused tracks far from the selected A/V bytes. Skip their
+    // payload reads before HTTP I/O, rather than fetching packets the player
+    // will discard outside its retained playback window. Keep the recovery
+    // isolation gate unchanged; only HTTP MOV/MP4 gains this read filtering.
+    const bool remoteMov = httpIO_ && sampleEofRetryEligible_;
+    if (!fmtCtx_ || (!discardEligible_ && !remoteMov)) return;
     for (unsigned i = 0; i < fmtCtx_->nb_streams; ++i) {
         AVStream* s = fmtCtx_->streams[i];
         const bool keep = (((int)i == videoStream_ || dovi_.retainsStream(s, (int)i)) && !videoIsolated_) ||

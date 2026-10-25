@@ -1,0 +1,10 @@
+#!/bin/bash
+# Only owned temporary files and injected readers; never starts a player/worker.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kinolet-subtitle-cache.XXXXXX")"
+trap 'rm -rf "$CHECK_DIR"' EXIT
+xcrun swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors -parse-as-library \
+  "$ROOT/Apps/Mac/UI/TorrentSubtitleCache.swift" \
+  "$ROOT/Scripts/tests/torrent_subtitle_cache.swift" -o "$CHECK_DIR/checks"
+"$CHECK_DIR/checks" "$CHECK_DIR"

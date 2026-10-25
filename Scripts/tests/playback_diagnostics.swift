@@ -55,7 +55,9 @@ struct PlaybackDiagnosticChecks {
                 .positionUs: Int64(index), .durationUs: Int64.max, .state: 2,
                 .control: SPPlaybackDiagnostics.Control.autoPauseScroll.rawValue,
                 .selectedFileID: 9, .rangesKnown: 1, .requestedHistoryLowerByte: 100,
-                .fileOffsetByte: 1000, .seekTargetUs: 5000, .commandValueMilli: -1000
+                .fileOffsetByte: 1000, .seekTargetUs: 5000, .commandValueMilli: -1000,
+                .selectedAudioTrackIndex: index.isMultiple(of: 2) ? 3 : -1,
+                .selectedSubtitleTrackIndex: index.isMultiple(of: 2) ? -1 : 6
             ], completeRanges: ranges)
         }
         check(!files.fileExists(atPath: directory.path), "Record admission never creates, opens or encodes files on MainActor")
@@ -72,6 +74,12 @@ struct PlaybackDiagnosticChecks {
         check(number(admitted[0], "event") == 0, "Snapshot uses its fixed numerical event code")
         check(number(admitted[0], "wallMs") > 0 && number(admitted[0], "uptimeMs") > 0, "Wall and monotonic clocks are present")
         check(number(admitted[0], "durationUs") == Int64.max, "Large integer counters are not serialized as strings")
+        check(admitted[0]["selectedAudioTrackIndex"] is NSNumber &&
+              number(admitted[0], "selectedAudioTrackIndex") == 3 && number(admitted[1], "selectedAudioTrackIndex") == -1,
+              "Audio track indices round-trip as Int64 numbers, including the absent-track sentinel")
+        check(admitted[0]["selectedSubtitleTrackIndex"] is NSNumber &&
+              number(admitted[0], "selectedSubtitleTrackIndex") == -1 && number(admitted[1], "selectedSubtitleTrackIndex") == 6,
+              "Subtitle track indices round-trip as Int64 numbers, including the absent-track sentinel")
         check(number(admitted[0], "rangeCount") == 73 && number(admitted[0], "rangesOmitted") == 9,
               "The actual range count and truncation remain visible")
         check((admitted[0]["ranges"] as! [[NSNumber]]).count == 64, "Only 64 interval pairs cross the writer queue")

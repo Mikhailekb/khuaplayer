@@ -2,10 +2,14 @@
 #import "SPCaptionSubtitleReader.h"
 #include <unistd.h>
 #include "SPRuntimeGates.hpp"
+#include "HTTPRangeIO.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <fcntl.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
@@ -21,6 +25,8 @@ extern "C" {
 
 @interface SPCaptionSubtitleReader ()
 - (BOOL)interrupted;
+- (BOOL)permanentlyAborted;
+- (BOOL)readAdmitted;
 - (int)ioRead:(uint8_t *)buf size:(int)size;
 - (int64_t)ioSeek:(int64_t)offset whence:(int)whence;
 @end
@@ -41,6 +47,7 @@ extern "C" {
     bool _ioPolicyApplied;
     NSError *_openError;
     int _fd;
+    std::unique_ptr<sp::HTTPRangeIO> _http;
     int64_t _fileSize;
     int64_t _ioPos;
     int64_t _fdPos;
@@ -91,6 +98,7 @@ static int64_t spCapSubSeek(void *opaque, int64_t offset, int whence) {
         _abort.store(false);
         _ctx = nullptr; _pkt = nullptr; _stream = -1; _tb = {1, 1}; _originUs = 0;
         _timelineOriginUs = INT64_MIN; // Unset: derive the timeline origin.
+        _expectedSourceLength = -1;
         _codec = AV_CODEC_ID_NONE; _openFailed = false; _ioPolicyApplied = false;
         _fd = -1;
     }
@@ -109,9 +117,14 @@ static int64_t spCapSubSeek(void *opaque, int64_t offset, int whence) {
     }
     if (_ctx) avformat_close_input(&_ctx);
     if (_fd >= 0) { ::close(_fd); _fd = -1; }
+    _http.reset();
 }
 
 - (void)abort { _abort.store(true); }
+- (BOOL)permanentlyAborted { return _abort.load(); }
+- (BOOL)readAdmitted {
+    return !_abort.load() && (!_pauseBlock || !_pauseBlock());
+}
 
 - (BOOL)open { return [self openWithShouldPause:nil]; }
 
@@ -148,6 +161,11 @@ static int64_t spCapSubSeek(void *opaque, int64_t offset, int whence) {
 // Custom AVIO checks before each local or remote block, including open and probing.
 - (int)ioRead:(uint8_t *)buf size:(int)size {
     if ([self interrupted]) return AVERROR_EXIT;
+    if (_http) {
+        int n = _http->read(buf, MIN(size, _ioGranule));
+        if (n > 0) _ioPos += n;
+        return n;
+    }
     if (_fd < 0) return AVERROR(EIO);
     size = MIN(size, _ioGranule);
     if (_fdPos != _ioPos) {
@@ -165,6 +183,11 @@ static int64_t spCapSubSeek(void *opaque, int64_t offset, int whence) {
 - (int64_t)ioSeek:(int64_t)offset whence:(int)whence {
     if ([self interrupted]) return AVERROR_EXIT;
     if (whence == AVSEEK_SIZE) return _fileSize;
+    if (_http) {
+        int64_t position = _http->seek(offset, whence);
+        if (position >= 0) _ioPos = position;
+        return position;
+    }
     int64_t base;
     switch (whence & ~AVSEEK_FORCE) {
         case SEEK_SET: base = 0; break;
@@ -185,19 +208,41 @@ static int64_t spCapSubSeek(void *opaque, int64_t offset, int whence) {
         setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE);
         _ioPolicyApplied = true;
     }
-    _fd = ::open(_path.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
-    if (_fd < 0) { [self recordOpenError:AVERROR(errno)]; return NO; }
-    struct stat sb {};
-    if ([self interrupted]) { [self teardown]; return NO; }
-    if (fstat(_fd, &sb) != 0) {
-        [self recordOpenError:AVERROR(errno)]; [self teardown]; return NO;
+    bool remote = false;
+    if (sp::HTTPRangeIO::supportsURL(_path.UTF8String ?: "")) {
+        __weak SPCaptionSubtitleReader *weakReader = self;
+        _http = std::make_unique<sp::HTTPRangeIO>(_path.UTF8String ?: "", [weakReader] {
+            SPCaptionSubtitleReader *reader = weakReader;
+            return !reader || [reader permanentlyAborted];
+        });
+        // Subtitle samples can contain only a handful of bytes. A small local
+        // range avoids fetching256KiB of unrelated movie data per sparse cue.
+        _http->setReadBlockSize(32 * 1024);
+        _http->setReadAdmission([weakReader] {
+            SPCaptionSubtitleReader *reader = weakReader;
+            return reader && [reader readAdmitted];
+        });
+        int result = _http->open();
+        if (result < 0) { [self recordOpenError:result]; [self teardown]; return NO; }
+        _fileSize = _http->size(); _ioPos = 0; _fdPos = -1;
+    } else {
+        _fd = ::open(_path.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
+        if (_fd < 0) { [self recordOpenError:AVERROR(errno)]; return NO; }
+        struct stat sb {};
+        if ([self interrupted]) { [self teardown]; return NO; }
+        if (fstat(_fd, &sb) != 0) {
+            [self recordOpenError:AVERROR(errno)]; [self teardown]; return NO;
+        }
+        _fileSize = sb.st_size; _ioPos = 0; _fdPos = 0;
+        struct statfs sfs {};
+        if ([self interrupted]) { [self teardown]; return NO; }
+        remote = fstatfs(_fd, &sfs) == 0 &&
+            (!strcmp(sfs.f_fstypename, "smbfs") || !strcmp(sfs.f_fstypename, "afpfs") ||
+             !strcmp(sfs.f_fstypename, "nfs") || !strcmp(sfs.f_fstypename, "webdav"));
     }
-    _fileSize = sb.st_size; _ioPos = 0; _fdPos = 0;
-    struct statfs sfs {};
-    if ([self interrupted]) { [self teardown]; return NO; }
-    bool remote = fstatfs(_fd, &sfs) == 0 &&
-        (!strcmp(sfs.f_fstypename, "smbfs") || !strcmp(sfs.f_fstypename, "afpfs") ||
-         !strcmp(sfs.f_fstypename, "nfs") || !strcmp(sfs.f_fstypename, "webdav"));
+    if (_expectedSourceLength >= 0 && _fileSize != _expectedSourceLength) {
+        [self recordOpenError:AVERROR_INVALIDDATA]; [self teardown]; return NO;
+    }
     const int granule = remote ? (1 << 20) : (256 << 10);
     _ioGranule = granule;
     uint8_t *iobuf = (uint8_t *)av_malloc(granule);
@@ -279,6 +324,182 @@ static NSString *spCapSubPlainText(enum AVCodecID codec, const uint8_t *data, in
     [tags replaceMatchesInString:m options:0 range:NSMakeRange(0, m.length) withTemplate:@""];
     NSString *trimmed = [m stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     return trimmed.length ? trimmed : nil;
+}
+
+static NSString *spWholeSubtitleTime(int64_t us, bool ass, bool roundUp) {
+    const int64_t quantum = ass ? 10000 : 1000;
+    int64_t ticks = us / quantum;
+    if (roundUp && us % quantum) ++ticks;
+    const int64_t rate = ass ? 100 : 1000;
+    const int64_t seconds = ticks / rate;
+    return ass
+        ? [NSString stringWithFormat:@"%lld:%02lld:%02lld.%02lld",
+           seconds / 3600, (seconds / 60) % 60, seconds % 60, ticks % rate]
+        : [NSString stringWithFormat:@"%02lld:%02lld:%02lld,%03lld",
+           seconds / 3600, (seconds / 60) % 60, seconds % 60, ticks % rate];
+}
+
+// Unlike the translation reader, persistent playback keeps text formatting.
+// This matches the main player's MOV_TEXT prefix handling; styling boxes that
+// the existing renderer does not interpret remain outside the displayed text.
+static bool spWholeSubtitleText(enum AVCodecID codec, const AVPacket *packet, NSString **out) {
+    *out = nil;
+    const uint8_t *data = packet->data;
+    int size = packet->size;
+    if (size < 0 || size > 1024 * 1024 || (size > 0 && !data)) return false;
+    if (codec == AV_CODEC_ID_MOV_TEXT) {
+        if (size < 2) return false;
+        const int declared = (data[0] << 8) | data[1];
+        data += 2; size -= 2;
+        if (declared > size) return false;
+        size = declared;
+    }
+    if (size == 0) return true;
+    while (size > 0 && data[size - 1] == 0) --size;
+    if (size == 0) return true;
+    NSString *text = [[NSString alloc] initWithBytes:data length:(NSUInteger)size encoding:NSUTF8StringEncoding];
+    if (!text || [text rangeOfString:@"\0"].location != NSNotFound) return false;
+    *out = text;
+    return true;
+}
+
+- (nullable NSString *)exportWholeTrackWithShouldPause:(nullable BOOL (^)(void))shouldPause {
+    std::lock_guard<std::mutex> lock(_mtx);
+    _lastError = nil;
+    _pauseBlock = shouldPause;
+    auto finish = [&](NSString *text) -> NSString * {
+        _pauseBlock = nil;
+        return text;
+    };
+    auto fail = [&](int code) -> NSString * {
+        _cursorValid = false;
+        [self recordError:code];
+        return finish(nil);
+    };
+    if (![self ensureOpen]) return finish(nil);
+    const bool indexedMov = _ctx->iformat && _ctx->iformat->name &&
+        (strstr(_ctx->iformat->name, "mov") || strstr(_ctx->iformat->name, "mp4"));
+    // A generic network MKV/TS traversal can require the entire video payload.
+    // Keep those inputs on the auxiliary rolling-cache fallback.
+    if (_http && !indexedMov) return fail(AVERROR(ENOSYS));
+    const bool ass = _codec == AV_CODEC_ID_ASS || _codec == AV_CODEC_ID_SSA;
+    if (!ass && _codec != AV_CODEC_ID_SUBRIP && _codec != AV_CODEC_ID_MOV_TEXT &&
+        _codec != AV_CODEC_ID_WEBVTT) return fail(AVERROR(ENOSYS));
+    if (_tb.num <= 0 || _tb.den <= 0) return fail(AVERROR_INVALIDDATA);
+    if (!_cursorValid || _cursorEnd != 0 || _hasLookahead) {
+        AVStream *stream = _ctx->streams[_stream];
+        const int64_t beginning = stream->start_time != AV_NOPTS_VALUE ? stream->start_time : 0;
+        if (av_seek_frame(_ctx, _stream, beginning, AVSEEK_FLAG_BACKWARD) < 0)
+            return fail(AVERROR(EIO));
+    }
+    constexpr NSUInteger outputCap = 8 * 1024 * 1024;
+    constexpr NSUInteger eventCap = 100000;
+    constexpr NSUInteger packetCap = 1000000;
+    NSMutableString *output = [NSMutableString string];
+    NSUInteger bytes = 0, events = 0, packets = 0;
+    if (ass) {
+        AVCodecParameters *parameters = _ctx->streams[_stream]->codecpar;
+        if (parameters->extradata_size <= 0 || parameters->extradata_size > 1024 * 1024)
+            return fail(AVERROR_INVALIDDATA);
+        NSString *header = [[NSString alloc] initWithBytes:parameters->extradata
+            length:(NSUInteger)parameters->extradata_size encoding:NSUTF8StringEncoding];
+        if (!header) return fail(AVERROR_INVALIDDATA);
+        // Codec private data may carry terminating C NULs. Interior NULs are
+        // malformed; silently dropping them could change the authored script.
+        while (header.length && [header characterAtIndex:header.length - 1] == 0)
+            header = [header substringToIndex:header.length - 1];
+        if ([header rangeOfString:@"\0"].location != NSNotFound) return fail(AVERROR_INVALIDDATA);
+        [output appendString:header];
+        if (![header hasSuffix:@"\n"]) [output appendString:@"\n"];
+        if ([header rangeOfString:@"[Events]" options:NSCaseInsensitiveSearch].location == NSNotFound) {
+            [output appendString:@"[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"];
+        }
+        bytes = [output lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    }
+    for (;;) {
+        @autoreleasepool {
+            if ([self interrupted]) return finish(nil);
+            const int result = av_read_frame(_ctx, _pkt);
+            const int ioError = _ctx->pb ? _ctx->pb->error : 0;
+            if (ioError < 0 && ioError != AVERROR_EOF) {
+                av_packet_unref(_pkt);
+                return fail(ioError);
+            }
+            if (result == AVERROR_EOF) {
+                av_packet_unref(_pkt);
+                _cursorEOF = true; _cursorValid = false;
+                // An empty complete track is intentionally different from a
+                // failed extraction, even if its ASS header contained styles.
+                return finish(events ? [output copy] : @"");
+            }
+            if (result < 0) { av_packet_unref(_pkt); return fail(result); }
+            if (++packets > packetCap) { av_packet_unref(_pkt); return fail(AVERROR(EFBIG)); }
+            if (_pkt->stream_index != _stream) { av_packet_unref(_pkt); continue; }
+            NSString *text = nil;
+            if ((_pkt->flags & AV_PKT_FLAG_CORRUPT) || !spWholeSubtitleText(_codec, _pkt, &text)) {
+                av_packet_unref(_pkt); return fail(AVERROR_INVALIDDATA);
+            }
+            if (!ass && text.length) {
+                // Match the streaming renderer's whitespace/blank-line rules,
+                // and keep a blank paragraph from terminating an SRT cue early.
+                NSMutableArray<NSString *> *lines = [NSMutableArray array];
+                NSCharacterSet *whitespace = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+                for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+                    NSString *trimmed = [line stringByTrimmingCharactersInSet:whitespace];
+                    if (trimmed.length) [lines addObject:trimmed];
+                }
+                text = [lines componentsJoinedByString:@"\n"];
+            }
+            if (!text.length) { av_packet_unref(_pkt); continue; }
+            const int64_t timestamp = _pkt->pts != AV_NOPTS_VALUE ? _pkt->pts : _pkt->dts;
+            if (timestamp == AV_NOPTS_VALUE) { av_packet_unref(_pkt); return fail(AVERROR_INVALIDDATA); }
+            const int64_t absoluteUs = av_rescale_q(timestamp, _tb, AV_TIME_BASE_Q);
+            const int64_t durationUs = _pkt->duration > 0
+                ? av_rescale_q(_pkt->duration, _tb, AV_TIME_BASE_Q) : 0;
+            const __int128 startWide = (__int128)absoluteUs - _originUs;
+            const __int128 endWide = startWide + durationUs;
+            if (durationUs <= 0 || startWide < INT64_MIN || startWide > INT64_MAX || endWide > INT64_MAX) {
+                av_packet_unref(_pkt); return fail(AVERROR_INVALIDDATA);
+            }
+            if (endWide <= 0) { av_packet_unref(_pkt); continue; }
+            const int64_t startUs = std::max<int64_t>(0, (int64_t)startWide);
+            const int64_t endUs = (int64_t)endWide;
+            NSString *entry = nil;
+            if (ass) {
+                // Matroska ASS chunks: ReadOrder,Layer,Style,Name,MarginL,
+                // MarginR,MarginV,Effect,Text. The file owns Start/End columns.
+                NSUInteger cursor = 0;
+                NSRange first = NSMakeRange(NSNotFound, 0), layer = first;
+                bool valid = true;
+                for (int column = 0; column < 8; ++column) {
+                    NSRange comma = [text rangeOfString:@"," options:0
+                        range:NSMakeRange(cursor, text.length - cursor)];
+                    if (comma.location == NSNotFound) { valid = false; break; }
+                    if (column == 0) first = comma;
+                    if (column == 1) layer = comma;
+                    cursor = comma.location + 1;
+                }
+                if (!valid) { av_packet_unref(_pkt); return fail(AVERROR_INVALIDDATA); }
+                NSString *layerValue = [text substringWithRange:
+                    NSMakeRange(first.location + 1, layer.location - first.location - 1)];
+                NSString *tail = [text substringFromIndex:layer.location + 1];
+                entry = [NSString stringWithFormat:@"Dialogue: %@,%@,%@,%@\n", layerValue,
+                    spWholeSubtitleTime(startUs, true, false), spWholeSubtitleTime(endUs, true, true), tail];
+            } else {
+                // SRT parsing retains the same inline HTML styling already
+                // handled by SPSubtitleInlineTagsToASS in the renderer.
+                entry = [NSString stringWithFormat:@"%lu\n%@ --> %@\n%@\n\n",
+                    (unsigned long)(events + 1), spWholeSubtitleTime(startUs, false, false),
+                    spWholeSubtitleTime(endUs, false, true), text];
+            }
+            av_packet_unref(_pkt);
+            const NSUInteger entryBytes = [entry lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+            if (++events > eventCap || entryBytes > outputCap || bytes > outputCap - entryBytes)
+                return fail(AVERROR(EFBIG));
+            bytes += entryBytes;
+            [output appendString:entry];
+        }
+    }
 }
 
 - (nullable NSArray<SPCaptionSubtitleCue *> *)readCuesFromSeconds:(double)start

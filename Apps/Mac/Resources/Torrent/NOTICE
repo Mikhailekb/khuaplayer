@@ -3,7 +3,7 @@ Upstream project: YouROK/TorrServer, by YouROK and contributors
 Project URL: https://github.com/YouROK/TorrServer
 Upstream release: MatriX.147 (published 2026-10-16)
 Upstream source commit: a86d8fa7fd4e07605f240fe69bf299392f7cb023
-Worker version: MatriX.147-khua.7
+Worker version: MatriX.147-khua.8
 License: GNU General Public License, version 3; see the accompanying LICENSE.
 
 This worker contains downstream source changes in Khua-playback-window.patch.
@@ -55,7 +55,7 @@ The script extracts the dependency ZIP as khua-torrent beside server, applies it
 patch, and changes only the existing torrent replacement to ../khua-torrent in
 the temporary build's go.mod. All other module versions and go.sum stay fixed.
 Build from that patched server directory using Go go1.26.4:
-GOTOOLCHAIN=go1.26.4 GOWORK=off GOFLAGS= GOEXPERIMENT= GOOS=darwin GOARCH=arm64 GOARM64=v8.0 CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=false -tags=nosqlite -ldflags="-s -w -checklinkname=0 -buildid= -X server/version.Version=MatriX.147-khua.7" -o TorrServer ./cmd
+GOTOOLCHAIN=go1.26.4 GOWORK=off GOFLAGS= GOEXPERIMENT= GOOS=darwin GOARCH=arm64 GOARM64=v8.0 CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=false -tags=nosqlite -ldflags="-s -w -checklinkname=0 -buildid= -X server/version.Version=MatriX.147-khua.8" -o TorrServer ./cmd
 The Khua source also includes Scripts/build_torrent_worker.py and
 Scripts/prepare_torrent_worker.sh to verify, patch and build these pinned inputs.
 The build does not regenerate web assets, update API docs, or run go mod tidy.
@@ -105,3 +105,21 @@ intervals backed by complete, allocated RAM pieces of the selected actual file.
 It preserves holes and excludes partial, evicted and other-file data without
 creating readers or download priorities. Excessively fragmented snapshots are
 rejected rather than merging gaps or truncating the truthful interval set.
+
+Selected subtitle and container-dependent data may be physically separated from
+selected video/audio. Successful finite foreground reads now retain a small
+auxiliary working set outside the primary window, sharing the same cache cap:
+min(capacity/8, 32 MiB), rounded to whole torrent pieces, at least one piece when
+it fits alongside hard demand. One adjacent piece may warm while that consumer
+has an active foreground/prefetch reader. Strategy3 honors explicit Next priority
+after current readers and before speculative reader readahead. No reader means
+no auxiliary background priority. Cached auxiliary bytes survive pause and nearby
+same-file seeks; generation fences prevent stale reads from restoring demand.
+The primary requested watched-history cutoff remains unchanged.
+
+Authenticated background range lanes support independent subtitle/preview jobs.
+Each finite body is at most 256 KiB; parent playback ownership and a separate job
+identity prevent changing the primary playback window. Recent delivered pieces
+share a small global budget min(capacity/16, 16 MiB) (whole-piece rounded), with
+at most two pieces per job. Background lanes have no speculative readahead and
+explicit release revokes their pending work. They do not persist media themselves.
