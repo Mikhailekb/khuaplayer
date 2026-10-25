@@ -2543,6 +2543,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         yieldDirectoryScanToForegroundIO()
         cancelTorrentPauseBuffer()
         cancelTorrentPlaybackWindowPolicy()
+        if let context = torrentContext {
+            SPTorrentServer.shared.beginPlaybackSeek(context.descriptor, file: context.file)
+        }
         core?.seek(to: target, precise: precise, forward: forward)
         startTorrentPlaybackWindowPolicyIfNeeded()
     }

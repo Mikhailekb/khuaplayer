@@ -70,7 +70,7 @@ struct SPTorrentPlaybackWindow: Equatable, Sendable {
 @MainActor
 final class SPTorrentServer {
     static let shared = SPTorrentServer()
-    nonisolated static let workerVersion = "MatriX.147-khua.5"
+    nonisolated static let workerVersion = "MatriX.147-khua.6"
     /// Default for callers without an active worker; runtime status uses the
     /// configuration captured by the worker, never the desired preference.
     nonisolated static let cacheSizeBytes = SPTorrentConfiguration().cacheSizeBytes
@@ -128,6 +128,7 @@ final class SPTorrentServer {
     private var downloads: [UUID: SPTorrentFileDownload] = [:]
     private var retirementTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     private var playbackConsumerRevisions: [UUID: Int64] = [:]
+    private var playbackSeekTasks: [UUID: Task<Void, Never>] = [:]
 
     var activeTorrentCount: Int { records.count }
     var activeDownloadCount: Int { downloads.count }
@@ -350,6 +351,56 @@ final class SPTorrentServer {
         return url
     }
 
+    /// Release the old playback reservation without discarding its resident
+    /// bytes. The demuxer supplies the exact new byte demand; only its later
+    /// packet-derived window can establish watched history at the new position.
+    /// Reserving the revision synchronously keeps rapid seeks and source close
+    /// ordered even when their loopback requests complete out of order.
+    func beginPlaybackSeek(_ descriptor: SPTorrentDescriptor, file: SPTorrentFile) {
+        guard leaseHashes[descriptor.leaseID] == descriptor.hash,
+              let record = records[descriptor.hash], record.files.contains(file),
+              let worker, worker.process.isRunning,
+              let revision = try? nextPlaybackWindowRevision(descriptor.leaseID) else { return }
+        playbackSeekTasks.removeValue(forKey: descriptor.leaseID)?.cancel()
+        let expectedGeneration = worker.generation
+        playbackSeekTasks[descriptor.leaseID] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.playbackConsumerRevisions[descriptor.leaseID] == revision {
+                    self.playbackSeekTasks.removeValue(forKey: descriptor.leaseID)
+                }
+            }
+            // A brief transport failure must not leave a healthy retained
+            // window permanently hard-pinned. Retry only this still-current
+            // intent; a later seek/landed window/close always supersedes it.
+            for attempt in 0..<3 {
+                guard !Task.isCancelled, self.worker?.generation == expectedGeneration,
+                      self.leaseHashes[descriptor.leaseID] == descriptor.hash,
+                      self.playbackConsumerRevisions[descriptor.leaseID] == revision else { return }
+                do {
+                    let reply = try await self.jsonRequest(path: "/playback/window", body: [
+                        "hash": descriptor.hash, "file_index": file.id,
+                        "consumer": descriptor.leaseID.uuidString, "revision": revision, "seeking": true
+                    ], expectedGeneration: expectedGeneration)
+                    guard !Task.isCancelled,
+                          self.playbackConsumerRevisions[descriptor.leaseID] == revision,
+                          let object = reply as? [String: Any],
+                          Self.windowInteger(object["revision"]) == revision,
+                          object["seeking"] as? Bool == true else { return }
+                    return
+                } catch is CancellationError { return }
+                catch SPTorrentServerError.http(409) {
+                    // The worker may have applied a request whose HTTP reply
+                    // was lost, or a newer revision may already own the window.
+                    return
+                } catch {
+                    guard attempt < 2 else { return }
+                    do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+                }
+            }
+        }
+    }
+
     /// Media timestamps, rather than the moving network reader, choose history
     /// and playback offsets. The worker assigns the shared forward RAM budget.
     func updatePlaybackWindow(_ descriptor: SPTorrentDescriptor, file: SPTorrentFile,
@@ -366,6 +417,7 @@ final class SPTorrentServer {
             throw SPTorrentServerError.invalidFile
         }
         let revision = try nextPlaybackWindowRevision(descriptor.leaseID)
+        playbackSeekTasks.removeValue(forKey: descriptor.leaseID)?.cancel()
         let expectedGeneration = worker.generation
         let reply = try await jsonRequest(path: "/playback/window", body: [
             "hash": descriptor.hash, "file_index": file.id, "consumer": descriptor.leaseID.uuidString,
@@ -415,6 +467,7 @@ final class SPTorrentServer {
     /// removing the last retained window. The next valid media window replaces
     /// it atomically in the worker; a temporary unknown position is not a close.
     func invalidatePlaybackWindow(_ descriptor: SPTorrentDescriptor) {
+        playbackSeekTasks.removeValue(forKey: descriptor.leaseID)?.cancel()
         guard leaseHashes[descriptor.leaseID] == descriptor.hash,
               playbackConsumerRevisions[descriptor.leaseID] != nil else { return }
         _ = try? nextPlaybackWindowRevision(descriptor.leaseID)
@@ -441,6 +494,7 @@ final class SPTorrentServer {
     }
 
     private func playbackWindowRemoval(_ descriptor: SPTorrentDescriptor) -> PlaybackWindowRemoval? {
+        playbackSeekTasks.removeValue(forKey: descriptor.leaseID)?.cancel()
         guard leaseHashes[descriptor.leaseID] == descriptor.hash,
               playbackConsumerRevisions[descriptor.leaseID] != nil,
               let worker, let revision = try? nextPlaybackWindowRevision(descriptor.leaseID) else { return nil }
@@ -520,6 +574,8 @@ final class SPTorrentServer {
         records.removeAll()
         leaseHashes.removeAll()
         playbackConsumerRevisions.removeAll()
+        playbackSeekTasks.values.forEach { $0.cancel() }
+        playbackSeekTasks.removeAll()
         if let previous = worker {
             worker = nil
             disposeWorker(previous)
@@ -681,6 +737,8 @@ final class SPTorrentServer {
         records.removeAll()
         leaseHashes.removeAll()
         playbackConsumerRevisions.removeAll()
+        playbackSeekTasks.values.forEach { $0.cancel() }
+        playbackSeekTasks.removeAll()
         downloads.values.forEach { $0.cancel() }
         Self.removeDirectory(previous.directory)
         notifications.post(name: Self.cacheConfigurationDidChangeNotification, object: self)
@@ -742,6 +800,8 @@ final class SPTorrentServer {
         generation &+= 1
         worker = nil
         playbackConsumerRevisions.removeAll()
+        playbackSeekTasks.values.forEach { $0.cancel() }
+        playbackSeekTasks.removeAll()
         keepaliveTask?.cancel()
         keepaliveTask = nil
         idleTask?.cancel()

@@ -48,6 +48,59 @@ struct TorrentWorkerStartupCheck {
                 throw SPTorrentServerError.invalidResponse
             }
             print("PASS: actual worker handshake, authenticated metainfo upload, descriptor and status")
+            // Exercise the shipped route with its real authentication and
+            // revision ordering. This independent consumer has no media reader
+            // and cannot allocate or download payload from a swarm.
+            let file = descriptor.files[0]
+            let stream = try server.streamURL(hash: descriptor.hash, file: file)
+            guard var endpoint = URLComponents(url: stream, resolvingAgainstBaseURL: false),
+                  let user = endpoint.user, let password = endpoint.password else {
+                throw SPTorrentServerError.invalidResponse
+            }
+            endpoint.user = nil
+            endpoint.password = nil
+            endpoint.path = "/playback/window"
+            endpoint.queryItems = nil
+            guard let windowURL = endpoint.url else { throw SPTorrentServerError.invalidResponse }
+            let consumer = UUID().uuidString
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.connectionProxyDictionary = [:]
+            let protocolSession = URLSession(configuration: configuration)
+            defer { protocolSession.invalidateAndCancel() }
+            func command(_ fields: [String: Any], status expectedStatus: Int = 200) async throws -> [String: Any] {
+                var body = fields
+                body["hash"] = descriptor.hash
+                body["consumer"] = consumer
+                var request = URLRequest(url: windowURL)
+                request.httpMethod = "POST"
+                request.timeoutInterval = 3
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue("Basic " + Data((user + ":" + password).utf8).base64EncodedString(),
+                                 forHTTPHeaderField: "Authorization")
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let (data, response) = try await protocolSession.data(for: request)
+                guard (response as? HTTPURLResponse)?.statusCode == expectedStatus else {
+                    throw SPTorrentServerError.invalidResponse
+                }
+                if expectedStatus != 200 { return [:] }
+                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw SPTorrentServerError.invalidResponse
+                }
+                return object
+            }
+            _ = try await command(["file_index": file.id, "revision": 1, "lower": 0, "current": 0, "upper": 1])
+            let seeking = try await command(["file_index": file.id, "revision": 2, "seeking": true])
+            guard seeking["seeking"] as? Bool == true, (seeking["revision"] as? NSNumber)?.intValue == 2 else {
+                throw SPTorrentServerError.invalidResponse
+            }
+            let settled = try await command(["file_index": file.id, "revision": 3, "lower": 0, "current": 0, "upper": 1])
+            guard (settled["revision"] as? NSNumber)?.intValue == 3, settled["seeking"] as? Bool != true else {
+                throw SPTorrentServerError.invalidResponse
+            }
+            _ = try await command(["file_index": file.id, "revision": 2, "seeking": true], status: 409)
+            _ = try await command(["revision": 4, "remove": true])
+            _ = try await command(["file_index": file.id, "revision": 3, "seeking": true], status: 409)
+            print("PASS: shipped seek handover, settled replacement and stale revision rejection")
             print("Expected worker: \(SPTorrentServer.workerVersion)")
             print(String(format: "Startup and metadata elapsed: %.3f s", ProcessInfo.processInfo.systemUptime - started))
             server.release(descriptor)

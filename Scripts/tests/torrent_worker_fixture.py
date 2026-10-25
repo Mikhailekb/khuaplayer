@@ -16,7 +16,7 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 from pathlib import Path
 
-WORKER_VERSION = 'MatriX.147-khua.5'
+WORKER_VERSION = 'MatriX.147-khua.6'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--ip', default='127.0.0.1')
@@ -76,6 +76,12 @@ class Handler(BaseHTTPRequestHandler):
                 command = json.loads(body)
                 hash_value, consumer, revision = command['hash'], command['consumer'], command['revision']
                 key = (hash_value, consumer)
+                transient = args.path.parent / ('fail-next-seek-' + consumer)
+                if command.get('seeking') and transient.exists():
+                    transient.unlink()
+                    audit('seek-transient-failure', **command)
+                    self.answer(503)
+                    return
                 with records_lock:
                     if revision <= playback_revisions.get(key, 0):
                         self.answer(409)
@@ -87,6 +93,12 @@ class Handler(BaseHTTPRequestHandler):
                     if command.get('remove'):
                         playback_windows.pop(key, None)
                         result = {'revision': revision, 'removed': True}
+                    elif command.get('seeking'):
+                        if command['file_index'] != 7:
+                            self.answer(400)
+                            return
+                        result = dict(playback_windows.get(key, {}), revision=revision, seeking=True)
+                        playback_windows[key] = result
                     else:
                         lower, current, upper = command['lower'], command['current'], command['upper']
                         if command['file_index'] != 7 or not 0 <= lower <= current <= upper <= len(payload):

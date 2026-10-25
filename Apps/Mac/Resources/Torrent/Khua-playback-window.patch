@@ -773,7 +773,7 @@ diff --git a/server/torr/storage/torrstor/cache.go b/server/torr/storage/torrsto
 +		c.replanWindowsLocked()
 +		candidates, filled := c.remPiecesLocked()
 +		for _, p := range candidates {
-+			if !c.managedPolicy && filled <= c.capacity {
++			if (!c.managedPolicy || c.seekingLocked()) && filled <= c.capacity {
 +				continue
 +			}
 +			if size, ok := p.releaseCached(); ok {
@@ -1274,7 +1274,7 @@ diff --git a/server/torr/storage/torrstor/playback_window.go b/server/torr/stora
 new file mode 100644
 --- /dev/null
 +++ b/server/torr/storage/torrstor/playback_window.go
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,520 @@
 +package torrstor
 +
 +import (
@@ -1296,6 +1296,7 @@ new file mode 100644
 +	Upper        int64                 `json:"upper"`
 +	PieceLength  int64                 `json:"piece_length"`
 +	Revision     uint64                `json:"revision"`
++	Seeking      bool                  `json:"seeking,omitempty"`
 +	PrefetchStop *PlaybackPrefetchStop `json:"prefetch_stop,omitempty"`
 +}
 +
@@ -1304,6 +1305,8 @@ new file mode 100644
 +	fileIndex                      int
 +	fileOffset, fileLength         int64
 +	requestedLower, requestedUpper int64
++	seekLower, seekUpper           int64
++	seekDemand                     bool
 +}
 +
 +// HasPlaybackWindows reports explicit playback-session ownership. A paused
@@ -1323,6 +1326,17 @@ new file mode 100644
 +// Revisions remain in Storage after release/cache close, so late HTTP requests
 +// cannot resurrect an older range. A higher revision may reuse a released token.
 +func (c *Cache) UpdatePlaybackWindow(fileIndex int, fileOffset, fileLength int64, consumer string, lower, current, upper int64, revision uint64, remove bool) (PlaybackWindow, error) {
++	return c.updatePlaybackWindow(fileIndex, fileOffset, fileLength, consumer, lower, current, upper, revision, remove, false)
++}
++
++// BeginPlaybackSeek releases the previous hard reservation without throwing its
++// payload away. Only actual foreground reads establish provisional byte demand;
++// an estimated timestamp must never destroy an overlapping cached range.
++func (c *Cache) BeginPlaybackSeek(fileIndex int, fileOffset, fileLength int64, consumer string, revision uint64) (PlaybackWindow, error) {
++	return c.updatePlaybackWindow(fileIndex, fileOffset, fileLength, consumer, 0, 0, fileLength, revision, false, true)
++}
++
++func (c *Cache) updatePlaybackWindow(fileIndex int, fileOffset, fileLength int64, consumer string, lower, current, upper int64, revision uint64, remove, seeking bool) (PlaybackWindow, error) {
 +	if consumer == "" || revision == 0 || (!remove && (fileIndex <= 0 || fileOffset < 0 || fileLength <= 0 || lower < 0 || lower > current || current < 0 || current >= fileLength || upper <= current || upper > fileLength)) {
 +		return PlaybackWindow{}, ErrInvalidPlaybackWindow
 +	}
@@ -1354,14 +1368,36 @@ new file mode 100644
 +			delete(c.prefetchStops, consumer)
 +			delete(c.prefetchRequests, consumer)
 +		}
-+		c.windows[consumer] = &playbackWindow{PlaybackWindow: PlaybackWindow{Lower: lower, Current: current, Upper: upper, PieceLength: c.pieceLength, Revision: revision}, fileIndex: fileIndex, fileOffset: fileOffset, fileLength: fileLength, requestedLower: lower, requestedUpper: upper}
++		if seeking {
++			if old := c.windows[consumer]; old != nil && old.fileIndex == fileIndex && old.fileOffset == fileOffset && old.fileLength == fileLength {
++				lower, current, upper = old.Lower, old.Current, old.Upper
++			}
++			delete(c.prefetchStops, consumer)
++			delete(c.prefetchRequests, consumer)
++		}
++		c.windows[consumer] = &playbackWindow{PlaybackWindow: PlaybackWindow{Lower: lower, Current: current, Upper: upper, PieceLength: c.pieceLength, Revision: revision, Seeking: seeking}, fileIndex: fileIndex, fileOffset: fileOffset, fileLength: fileLength, requestedLower: lower, requestedUpper: upper}
 +	}
 +	c.replanWindowsLocked()
 +	result := PlaybackWindow{PieceLength: c.pieceLength, Revision: revision}
 +	if w := c.windows[consumer]; w != nil {
 +		result = c.playbackWindowSnapshotLocked(consumer, w)
 +	}
++	stalePrefetchReaders := make([]*Reader, 0)
++	if seeking {
++		for _, r := range c.readersSnapshot() {
++			r.mu.Lock()
++			stale := r.consumer == consumer && r.prefetch
++			r.mu.Unlock()
++			if stale {
++				stalePrefetchReaders = append(stalePrefetchReaders, r)
++			}
++		}
++	}
 +	c.muPolicy.Unlock()
++	for _, r := range stalePrefetchReaders {
++		c.CloseReader(r)
++	}
++
 +	c.applyReaderReadahead()
 +	c.cleanPiecesSync()
 +	c.muPolicy.Lock()
@@ -1443,8 +1479,16 @@ new file mode 100644
 +			kept[id] = true
 +		}
 +	}
++	for _, w := range c.windows {
++		if w.Seeking && w.seekDemand {
++			add(int((w.fileOffset+w.seekLower)/c.pieceLength), int((w.fileOffset+w.seekUpper-1)/c.pieceLength))
++		}
++	}
 +	keys := make([]string, 0, len(c.windows))
 +	for key, w := range c.windows {
++		if w.Seeking {
++			continue
++		}
 +		keys = append(keys, key)
 +		current := w.currentPiece(c.pieceLength)
 +		add(current, current)
@@ -1456,6 +1500,50 @@ new file mode 100644
 +	for id := range kept {
 +		used += c.pieceBytes(id)
 +	}
++	// A seek's old window is soft retention. The actual foreground frontier,
++	// including container/index probes, borrows only a bounded contiguous range.
++	// Count it before normal forward windows, never the entire gap from the old
++	// playhead to the new reader. Readers/export and other consumers remain hard.
++	seekingReaders := make([]*Reader, 0)
++	for _, r := range c.readersSnapshot() {
++		r.mu.Lock()
++		w, ok := c.readerWindowLocked(r)
++		if ok && w.Seeking && !r.prefetch && r.isUse && !r.isClosed {
++			r.minOffset = r.offset
++			last := r.offset
++			if r.inFlight > 0 {
++				last = max(last, r.readEnd-1)
++			}
++			r.maxOffset = min(r.file.Length(), int64(r.getPieceNum(last)+1)*c.pieceLength-r.file.Offset())
++			seekingReaders = append(seekingReaders, r)
++		}
++		r.mu.Unlock()
++	}
++	for {
++		progress := false
++		for _, r := range seekingReaders {
++			r.mu.Lock()
++			id := r.getPieceNum(max(r.offset, r.maxOffset-1)) + 1
++			limit := min(r.file.Length(), r.offset+min(r.readahead, int64(16<<20)))
++			if r.finiteForeground {
++				limit = min(limit, r.foregroundEnd)
++			}
++			end := min(r.file.Length(), int64(id+1)*c.pieceLength-r.file.Offset())
++			cost := c.pieceBytes(id)
++			if id < c.pieceCount && r.maxOffset < limit && end > r.maxOffset && (kept[id] || cost <= c.capacity-used) {
++				if !kept[id] {
++					kept[id] = true
++					used += cost
++				}
++				r.maxOffset = min(end, limit)
++				progress = true
++			}
++			r.mu.Unlock()
++		}
++		if !progress {
++			break
++		}
++	}
 +	// Reserve useful forward data beyond the current demux/read frontier
 +	// before optional history. Assign contiguous pieces so the returned upper
 +	// cannot authorize gaps that were omitted from the union budget.
@@ -1465,7 +1553,7 @@ new file mode 100644
 +	}
 +	for _, r := range c.readersSnapshot() {
 +		r.mu.Lock()
-+		if _, ok := c.readerWindowLocked(r); ok && r.isUse && !r.isClosed {
++		if w, ok := c.readerWindowLocked(r); ok && !w.Seeking && r.isUse && !r.isClosed {
 +			at := r.offset
 +			if r.inFlight > 0 {
 +				at = max(at, r.readEnd-1)
@@ -1569,7 +1657,12 @@ new file mode 100644
 +		r.mu.Lock()
 +		w, ok := c.readerWindowLocked(r)
 +		r.managed = r.consumer != ""
-+		if ok {
++		if ok && w.Seeking {
++			if r.prefetch || !r.isUse {
++				r.minOffset = r.offset
++				r.maxOffset = r.offset
++			}
++		} else if ok {
 +			r.minOffset = w.Lower
 +			r.maxOffset = w.Upper
 +		} else if r.managed {
@@ -1608,10 +1701,33 @@ new file mode 100644
 +		}
 +		r.mu.Unlock()
 +	}
++	for _, r := range c.readersSnapshot() {
++		r.mu.Lock()
++		w, ok := c.readerWindowLocked(r)
++		if ok && w.Seeking && r.isUse && !r.isClosed && !r.prefetch && r.maxOffset > r.offset {
++			ranges = append(ranges, Range{r.getPieceNum(r.offset), r.getPieceNum(r.maxOffset - 1), nil})
++		}
++		r.mu.Unlock()
++	}
 +	for _, w := range c.windows {
++		if w.Seeking {
++			if w.seekDemand {
++				ranges = append(ranges, Range{int((w.fileOffset + w.seekLower) / c.pieceLength), int((w.fileOffset + w.seekUpper - 1) / c.pieceLength), nil})
++			}
++			continue
++		}
 +		ranges = append(ranges, Range{w.lowerPiece(c.pieceLength), w.endPiece(c.pieceLength), nil})
 +	}
 +	return ranges
++}
++
++func (c *Cache) seekingLocked() bool {
++	for _, w := range c.windows {
++		if w.Seeking {
++			return true
++		}
++	}
++	return false
 +}
 +
 +// Watched means wholly below every consumer cutoff touching this torrent
@@ -2904,7 +3020,7 @@ new file mode 100644
 diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrstor/reader.go
 --- a/server/torr/storage/torrstor/reader.go
 +++ b/server/torr/storage/torrstor/reader.go
-@@ -1,227 +1,393 @@
+@@ -1,227 +1,432 @@
  package torrstor
  
  import (
@@ -2977,12 +3093,10 @@ diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrst
 +	ctx, cancel := context.WithCancel(context.Background())
 +	backend := file.NewReader()
 +	backend.SetReadahead(0)
-+	if finiteForeground {
++	if finiteForeground || prefetch {
 +		// A finite HTTP request has not demanded bytes while ServeContent
 +		// probes length and seeks. EOF has no mandatory library piece.
 +		backend.Seek(file.Length(), io.SeekStart)
-+	} else if prefetch {
-+		backend.Seek(start, io.SeekStart)
 +	}
 +	r := &Reader{readContext: ctx, cancelRead: cancel, Reader: backend, file: file, cache: cache, isUse: !prefetch && !finiteForeground, consumer: consumer, lastAccess: time.Now().Unix(), offset: start, prefetch: prefetch, finiteForeground: finiteForeground, foregroundEnd: min(end, file.Length())}
 +	if consumer != "" {
@@ -3017,7 +3131,7 @@ diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrst
 -	}
 -	r.beginIO()
 -	defer r.endIO()
-+	if r.finiteForeground && !r.isUse {
++	if (r.finiteForeground || r.prefetch) && !r.isUse {
 +		// Keep length/range probes logical until the first actual Read. A
 +		// temporary byte-zero or file-tail cursor must not shrink another
 +		// reader's retained forward window or request unrelated pieces.
@@ -3306,10 +3420,26 @@ diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrst
 +func (r *Reader) beginIO()               { r.claimIO(1, false) }
 +func (r *Reader) beginRead(length int64) { r.claimIO(length, false) }
 +func (r *Reader) claimIO(length int64, limit bool) int64 {
++	needsSeekReplan := false
 +	if r.cache != nil {
 +		r.cache.muPolicy.Lock()
 +	}
 +	r.mu.Lock()
++	if r.isClosed {
++		length = 0
++	}
++	if r.cache != nil {
++		if w, ok := r.cache.readerWindowLocked(r); ok && w.Seeking {
++			if r.prefetch || r.isClosed {
++				length = 0
++			} else {
++				needsSeekReplan = true
++				if limit {
++					length = min(length, max(0, r.file.Length()-r.offset))
++				}
++			}
++		}
++	}
 +	if limit && r.finiteForeground {
 +		// HTTP end is independent of the cache-window quota. A foreground
 +		// request may keep reading as playback moves that window forward.
@@ -3318,6 +3448,9 @@ diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrst
 +	if limit && r.prefetch {
 +		requestedLength := length
 +		length = min(length, max(0, r.maxOffset-r.offset))
++		if r.managed && r.offset < r.minOffset {
++			length = 0
++		}
 +		if length == 0 && requestedLength > 0 && !r.isClosed && r.managed && r.prefetchRequest != nil && r.cache != nil {
 +			request := r.prefetchRequest
 +			if w, ok := r.cache.readerWindowLocked(r); ok && r.offset >= w.Upper && r.offset >= request.start && r.offset < request.end && r.offset < r.file.Length() {
@@ -3326,6 +3459,25 @@ diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrst
 +		}
 +	}
 +	if length > 0 {
++		if needsSeekReplan && limit {
++			// Keep the most recent actual body span across finite EOF/Close. Old
++			// playback bytes stay soft, while a subsequent demux retry must not lose
++			// the newly delivered target to equal-second LRU timestamps.
++			w, _ := r.cache.readerWindowLocked(r)
++			length = min(length, max(r.cache.pieceLength, r.cache.capacity))
++			lower, upper := r.offset, min(r.file.Length(), r.offset+length)
++			if w.seekDemand && lower <= w.seekUpper && upper >= w.seekLower {
++				unionLower, unionUpper := min(lower, w.seekLower), max(upper, w.seekUpper)
++				first := (r.file.Offset() + unionLower) / r.cache.pieceLength
++				last := (r.file.Offset() + unionUpper - 1) / r.cache.pieceLength
++				if (last-first+1)*r.cache.pieceLength <= max(r.cache.capacity, r.cache.pieceLength) {
++					lower, upper = unionLower, unionUpper
++				}
++			}
++			w.seekLower = lower
++			w.seekUpper = upper
++			w.seekDemand = true
++		}
 +		r.inFlight++
 +		r.readStart = r.offset
 +		r.readEnd = r.offset + length
@@ -3336,7 +3488,7 @@ diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrst
 +	}
 +	if length > 0 {
  		r.readerOn()
- 	}
+-	}
 -}
 -
 -// beginIO claims the reader for one read or seek and resumes it if the sweep parked it.
@@ -3359,6 +3511,10 @@ diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrst
 -	defer r.mu.Unlock()
 -	r.resume()
 -}
++		if needsSeekReplan {
++			r.cache.cleanPiecesSync()
++		}
++	}
 +	return length
 +}
 +func (r *Reader) endIO()    { r.mu.Lock(); r.inFlight--; r.mu.Unlock() }
@@ -3437,7 +3593,7 @@ diff --git a/server/torr/storage/torrstor/reader.go b/server/torr/storage/torrst
 +	}
 +	r.prefetchRequest = &playbackPrefetchRequest{id: requestID, start: start, end: end}
 +	if r.cache != nil && r.prefetch && r.managed && !r.isClosed {
-+		if _, ok := r.cache.readerWindowLocked(r); ok {
++		if w, ok := r.cache.readerWindowLocked(r); ok && !w.Seeking && start >= w.Lower {
 +			if r.cache.prefetchRequests == nil {
 +				r.cache.prefetchRequests = make(map[string]string)
 +			}
@@ -3525,7 +3681,7 @@ diff --git a/server/torr/stream.go b/server/torr/stream.go
  )
  
  // Add atomic counter for concurrent streams
-@@ -88,7 +91,19 @@
+@@ -88,7 +91,20 @@
  		return err
  	}
  	// Create reader with context for timeout
@@ -3535,10 +3691,11 @@ diff --git a/server/torr/stream.go b/server/torr/stream.go
 +	start, end, finiteRange := finitePrefetchRange(req.Header.Get("Range"))
 +	mime, mimeErr := mt.MimeTypeByPath(file.Path())
 +	knownMediaType := mimeErr == nil && mime.IsMedia()
++	etag := httptoo.EncodeQuotedString(hex.EncodeToString([]byte(fmt.Sprintf("%s/%s", t.Hash().HexString(), file.Path()))))
 +	var reader *torrstor.Reader
 +	if prefetch && req.Method == http.MethodGet && finiteRange {
 +		reader = t.newPrefetchStreamReader(file, consumer, start)
-+	} else if !prefetch && consumer != "" && req.Method == http.MethodGet && finiteRange && start < file.Length() && knownMediaType && req.Header.Get("If-Range") == "" {
++	} else if !prefetch && consumer != "" && req.Method == http.MethodGet && finiteRange && start < file.Length() && knownMediaType && finiteForegroundValidatorMatches(req, etag, time.Unix(t.Timestamp, 0)) {
 +		reader = t.newFinitePlaybackStreamReader(file, consumer, start, end)
 +	} else {
 +		reader = t.newStreamReader(file, consumer)
@@ -3546,7 +3703,7 @@ diff --git a/server/torr/stream.go b/server/torr/stream.go
  	if reader == nil {
  		// NewReader returns nil only for a torrent closed after the GotInfo check above
  		err := errors.New("cannot create torrent reader")
-@@ -96,7 +111,25 @@
+@@ -96,7 +112,25 @@
  		return err
  	}
  	// Ensure reader is always closed
@@ -3572,7 +3729,7 @@ diff --git a/server/torr/stream.go b/server/torr/stream.go
  
  	if sets.BTsets.ResponsiveMode {
  		reader.SetResponsive()
-@@ -128,7 +161,9 @@
+@@ -128,7 +162,9 @@
  	})
  
  	// Set response headers
@@ -3583,7 +3740,13 @@ diff --git a/server/torr/stream.go b/server/torr/stream.go
  	// Set response header for Kodi
  	resp.Header().Set("Server", "TorrServer (Portable SDK for UPnP devices)")
  	// Add timeout header if configured
-@@ -141,8 +176,9 @@
+@@ -136,13 +172,13 @@
+ 		resp.Header().Set("X-Stream-Timeout", fmt.Sprintf("%d", streamTimeout))
+ 	}
+ 	// Add ETag
+-	etag := hex.EncodeToString([]byte(fmt.Sprintf("%s/%s", t.Hash().HexString(), file.Path())))
+-	resp.Header().Set("ETag", httptoo.EncodeQuotedString(etag))
++	resp.Header().Set("ETag", etag)
  	// DLNA headers
  	resp.Header().Set("transferMode.dlna.org", "Streaming")
  	// add MimeType
@@ -3607,7 +3770,7 @@ diff --git a/server/torr/stream.go b/server/torr/stream.go
  
  	if sets.BTsets.EnableDebug {
  		if clerr != nil {
-@@ -188,3 +229,85 @@
+@@ -188,3 +229,96 @@
  func GetActiveStreams() int32 {
  	return atomic.LoadInt32(&activeStreams)
  }
@@ -3692,6 +3855,17 @@ diff --git a/server/torr/stream.go b/server/torr/stream.go
 +		return 0, 0, false
 +	}
 +	return start, end + 1, true
++}
++
++// A validated conditional range still has a finite body. Mismatched validators
++// retain ServeContent's full-response fallback and its unrestricted reader.
++func finiteForegroundValidatorMatches(req *http.Request, etag string, modified time.Time) bool {
++	value := strings.TrimSpace(req.Header.Get("If-Range"))
++	if value == "" || value == etag {
++		return true
++	}
++	stamp, err := http.ParseTime(value)
++	return err == nil && !modified.IsZero() && stamp.Unix() == modified.Unix()
 +}
 diff --git a/server/torr/stream_keepalive_test.go b/server/torr/stream_keepalive_test.go
 new file mode 100644
@@ -4161,7 +4335,7 @@ diff --git a/server/web/api/playback_window.go b/server/web/api/playback_window.
 new file mode 100644
 --- /dev/null
 +++ b/server/web/api/playback_window.go
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,98 @@
 +package api
 +
 +import (
@@ -4185,6 +4359,7 @@ new file mode 100644
 +	Upper     *int64 `json:"upper"`
 +	Revision  uint64 `json:"revision"`
 +	Remove    bool   `json:"remove"`
++	Seeking   bool   `json:"seeking"`
 +}
 +
 +var playbackConsumerPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -4202,7 +4377,7 @@ new file mode 100644
 +		return
 +	}
 +	hash, err := hex.DecodeString(req.Hash)
-+	if err != nil || len(hash) != 20 || (!req.Remove && req.FileIndex <= 0) || !playbackConsumerPattern.MatchString(req.Consumer) || req.Revision == 0 || (!req.Remove && (req.Lower == nil || req.Current == nil || req.Upper == nil || *req.Lower < 0 || *req.Lower > *req.Current || *req.Current < 0 || *req.Upper <= *req.Current)) {
++	if err != nil || len(hash) != 20 || (!req.Remove && req.FileIndex <= 0) || !playbackConsumerPattern.MatchString(req.Consumer) || req.Revision == 0 || (req.Remove && req.Seeking) || (!req.Remove && !req.Seeking && (req.Lower == nil || req.Current == nil || req.Upper == nil || *req.Lower < 0 || *req.Lower > *req.Current || *req.Current < 0 || *req.Upper <= *req.Current)) {
 +		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid playback window"})
 +		return
 +	}
@@ -4248,6 +4423,9 @@ new file mode 100644
 +	if !found {
 +		return torrstor.PlaybackWindow{}, errPlaybackNotFound
 +	}
++	if req.Seeking {
++		return tor.GetCache().BeginPlaybackSeek(req.FileIndex, fileOffset, fileLength, req.Consumer, req.Revision)
++	}
 +	lower, current, upper := int64(0), int64(0), int64(0)
 +	if !req.Remove {
 +		lower, current, upper = *req.Lower, *req.Current, *req.Upper
@@ -4260,7 +4438,7 @@ diff --git a/server/web/api/playback_window_test.go b/server/web/api/playback_wi
 new file mode 100644
 --- /dev/null
 +++ b/server/web/api/playback_window_test.go
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,110 @@
 +package api
 +
 +import (
@@ -4285,6 +4463,9 @@ new file mode 100644
 +		name, body string
 +		code       int
 +	}{
++		{"seek without guessed offsets", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":2,"seeking":true}`, playbackTestHash), 200},
++		{"seek cannot remove", fmt.Sprintf(`{"hash":%q,"file_index":1,"consumer":"a","revision":2,"seeking":true,"remove":true}`, playbackTestHash), 400},
++		{"seek needs file", fmt.Sprintf(`{"hash":%q,"consumer":"a","revision":2,"seeking":true}`, playbackTestHash), 400},
 +		{"malformed", "{", 400},
 +		{"missing", "{}", 400},
 +		{"bad hash", `{"hash":"xyz","file_index":1,"consumer":"a","revision":1,"lower":0,"current":1,"upper":10}`, 400},
@@ -4528,4 +4709,311 @@ new file mode 100644
 +			t.Logf("finite_end=%d exact_body=%d resident=%d parked_before_close=true", end, len(body), c.GetState().Filled)
 +		})
 +	}
++}
+diff --git a/server/torr/seek_handover_http_test.go b/server/torr/seek_handover_http_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/seek_handover_http_test.go
+@@ -0,0 +1,176 @@
++package torr
++
++import (
++	"bytes"
++	"context"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"testing"
++	"time"
++
++	"github.com/anacrolix/torrent"
++	"server/settings"
++)
++
++// Real Stream, finite HTTP bodies, patched torrent library and RAM storage.
++// The source has no peers: test-controlled verified writes represent arrival
++// from the swarm, so the test can observe demand and retention independently.
++func TestPlaybackSeekHandoverHTTP(t *testing.T) {
++	const childKey = "KINOLET_SEEK_HTTP_TEST"
++	if os.Getenv(childKey) != "1" {
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestPlaybackSeekHandoverHTTP$", "-test.v")
++		cmd.Env = append(os.Environ(), childKey+"=1")
++		out, err := cmd.CombinedOutput()
++		if err != nil {
++			t.Fatalf("isolated seek HTTP test: %v\n%s", err, out)
++		}
++		t.Logf("%s", out)
++		return
++	}
++	settings.Path = t.TempDir()
++	settings.Args = &settings.ExecArgs{}
++	if err := settings.InitSets(false, false); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(settings.CloseDB)
++	settings.BTsets.UseDisk = false
++	settings.BTsets.ResponsiveMode = true
++	settings.BTsets.TrackTimecode = false
++	settings.BTsets.ReaderReadAHead = 95
++	settings.BTsets.ConnectionsLimit = 25
++	const piece = int64(64 << 10)
++	for _, validator := range []string{"none", "etag", "last-modified"} {
++		t.Run(validator, func(t *testing.T) {
++			f := newCapacityHTTPFixtureAt(t, 256*piece, 8*piece, 8*piece)
++			if f.cache.GetState().Filled != f.quota {
++				t.Fatal("fixture was not full")
++			}
++			original := f.cache.GetState()
++			ack, err := f.cache.BeginPlaybackSeek(1, 0, f.length, "capacity-http", 2)
++			if err != nil || !ack.Seeking || ack.Revision != 2 {
++				t.Fatalf("seek marker: %+v %v", ack, err)
++			}
++			after := f.cache.GetState()
++			if after.Filled != original.Filled {
++				t.Fatal("seek marker discarded cached payload")
++			}
++			for id, old := range original.Pieces {
++				if now, ok := after.Pieces[id]; !ok || now.Size != old.Size || !now.Completed {
++					t.Fatalf("seek marker changed resident piece%d", id)
++				}
++			}
++			// A nearby seek is fulfilled completely offline, retaining all old bytes.
++			runRange := func(start, end int64, feed bool) []byte {
++				t.Helper()
++				done := make(chan error, 1)
++				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { done <- f.torrent.Stream(1, r, w) }))
++				defer server.Close()
++				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
++				defer cancel()
++				req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/stream/capacity.mkv?playback_consumer=capacity-http", nil)
++				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end-1))
++				if validator == "etag" {
++					req.Header.Set("If-Range", `"`+hex.EncodeToString([]byte(fmt.Sprintf("%s/%s", f.torrent.Hash().HexString(), f.torrent.Files()[0].Path())))+`"`)
++				}
++				if validator == "last-modified" {
++					req.Header.Set("If-Range", time.Unix(f.torrent.Timestamp, 0).UTC().Format(http.TimeFormat))
++				}
++				result := make(chan struct {
++					data []byte
++					err  error
++				}, 1)
++				go func() {
++					resp, err := server.Client().Do(req)
++					if err != nil {
++						result <- struct {
++							data []byte
++							err  error
++						}{nil, err}
++						return
++					}
++					defer resp.Body.Close()
++					data, err := io.ReadAll(resp.Body)
++					if resp.StatusCode != 206 {
++						err = fmt.Errorf("status%d", resp.StatusCode)
++					}
++					result <- struct {
++						data []byte
++						err  error
++					}{data, err}
++				}()
++				if feed {
++					deadline := time.Now().Add(2 * time.Second)
++					id := int(start / piece)
++					ready := func() bool {
++						if f.cache.GetUseReaders() == 0 || f.torrent.PieceState(id).Priority == torrent.PiecePriorityNone {
++							return false
++						}
++						for _, r := range f.cache.GetState().Readers {
++							if r.Reader == id && r.Start == id {
++								return true
++							}
++						}
++						return false
++					}
++					for !ready() && time.Now().Before(deadline) {
++						time.Sleep(time.Millisecond)
++					}
++					if !ready() {
++						t.Fatal("new target never acquired active foreground download demand")
++					}
++
++					for id := int(start / piece); int64(id)*piece < end; id++ {
++						data := f.payload[int64(id)*piece : int64(id+1)*piece]
++						if n, err := f.cache.Piece(f.torrent.Info().Piece(id)).WriteAt(data, 0); err != nil || n != len(data) {
++							t.Fatalf("feed piece%d %d %v", id, n, err)
++						}
++						f.torrent.Piece(id).VerifyData()
++					}
++				}
++				got := <-result
++				if got.err != nil || !bytes.Equal(got.data, f.payload[start:end]) {
++					state, _ := json.Marshal(f.cache.GetState())
++					t.Fatalf("range[%d,%d): bytes%d error%v state%s", start, end, len(got.data), got.err, state)
++				}
++				if err := <-done; err != nil {
++					t.Fatal(err)
++				}
++				return got.data
++			}
++			runRange(9*piece+17, 10*piece+17, false)
++			if f.cache.GetState().Filled != f.quota {
++				t.Fatal("near cached seek changed occupancy")
++			}
++			// Far target requests data before a presentation-position ACK can exist.
++			// Reading it again after finite EOF proves the old hard window did not
++			// regrow and evict this new working set between demux requests.
++			runRange(160*piece, 164*piece, true)
++			deadline := time.Now().Add(time.Second)
++			for f.cache.GetState().Filled > f.quota && time.Now().Before(deadline) {
++				time.Sleep(time.Millisecond)
++			}
++			for retry := 0; retry < 3; retry++ {
++				runRange(160*piece, 164*piece, false)
++			}
++			if got := f.cache.GetState().Filled; got > f.quota {
++				t.Fatalf("cache remained over capacity: %d > %d", got, f.quota)
++			}
++			settled, err := f.cache.UpdatePlaybackWindow(1, 0, f.length, "capacity-http", 160*piece, 160*piece, f.length, 3, false)
++			if err != nil || settled.Seeking {
++				t.Fatalf("settled ACK: %+v %v", settled, err)
++			}
++			if _, err := f.cache.BeginPlaybackSeek(1, 0, f.length, "capacity-http", 2); err == nil {
++				t.Fatal("late seek marker superseded settled window")
++			}
++			t.Logf("full=%d nearby_offline=true far_target=%d repeated_offline_reads=3 final_cache=%d cap=%d", f.quota, 160*piece, f.cache.GetState().Filled, f.quota)
++		})
++	}
++}
+diff --git a/server/torr/storage/torrstor/seek_handover_test.go b/server/torr/storage/torrstor/seek_handover_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/torr/storage/torrstor/seek_handover_test.go
+@@ -0,0 +1,121 @@
++package torrstor
++
++import (
++	"errors"
++	"io"
++	"sync"
++	"testing"
++)
++
++func TestPlaybackSeekHandoverOwnershipAndRevision(t *testing.T) {
++	const mib = int64(1 << 20)
++	file, c := playbackTestTorrent(t, 64*mib, 12*mib)
++	marker, err := c.BeginPlaybackSeek(1, 0, 64*mib, "new", 1)
++	if err != nil || !marker.Seeking || !c.HasPlaybackWindows() {
++		t.Fatalf("seek before window %+v %v", marker, err)
++	}
++	assertNoMissingPiecePriority(t, c)
++	retained := seedRetainedPayloads(t, c, 24, 25, 26, 27)
++	for rev := uint64(2); rev < 5; rev++ {
++		if _, err := c.BeginPlaybackSeek(1, 0, 64*mib, "new", rev); err != nil {
++			t.Fatal(err)
++		}
++	}
++	assertRetainedPayloads(t, c, retained)
++	r := c.NewPlaybackReaderAt(file, "new", 24*mib, 25*mib)
++	defer c.CloseReader(r)
++	if _, err := io.ReadFull(r, make([]byte, 128)); err != nil {
++		t.Fatal(err)
++	}
++	if !c.windows["new"].Seeking {
++		t.Fatal("finite body restored old reservation")
++	}
++	if _, err := c.UpdatePlaybackWindow(1, 0, 64*mib, "new", 24*mib, 25*mib, 64*mib, 5, false); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.BeginPlaybackSeek(1, 0, 64*mib, "new", 4); !errors.Is(err, ErrStalePlaybackRevision) {
++		t.Fatalf("late marker accepted: %v", err)
++	}
++	if c.windows["new"].Seeking {
++		t.Fatal("normal window did not end handover")
++	}
++}
++
++func TestPlaybackSeekHandoverPreservesForeignConsumerAndSave(t *testing.T) {
++	const mib = int64(1 << 20)
++	file, c := playbackTestTorrent(t, 64*mib, 16*mib)
++	setWindow(t, c, "seek", 24*mib, 24*mib, 64*mib, 1)
++	setWindow(t, c, "other", 40*mib, 40*mib, 64*mib, 1)
++	save := c.NewReader(file)
++	defer c.CloseReader(save)
++	if _, err := save.Seek(8*mib, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	retained := seedRetainedPayloads(t, c, 0, 8, 40)
++	if _, err := c.BeginPlaybackSeek(1, 0, 64*mib, "seek", 2); err != nil {
++		t.Fatal(err)
++	}
++	c.cleanPiecesSync()
++	assertRetainedPayloads(t, c, retained)
++}
++
++func TestPlaybackSeekHandoverConcurrentUpdatesAndReads(t *testing.T) {
++	const mib = int64(1 << 20)
++	file, c := playbackTestTorrent(t, 64*mib, 8*mib)
++	setWindow(t, c, "seek", 20*mib, 20*mib, 64*mib, 1)
++	seedRetainedPayloads(t, c, 20, 21, 22, 23)
++	var wg sync.WaitGroup
++	wg.Add(3)
++	go func() {
++		defer wg.Done()
++		for rev := uint64(2); rev < 60; rev++ {
++			if rev%2 == 0 {
++				c.BeginPlaybackSeek(1, 0, 64*mib, "seek", rev)
++			} else {
++				c.UpdatePlaybackWindow(1, 0, 64*mib, "seek", 20*mib, 20*mib, 64*mib, rev, false)
++			}
++		}
++	}()
++	go func() {
++		defer wg.Done()
++		for n := 0; n < 50; n++ {
++			r := c.NewPlaybackReaderAt(file, "seek", 20*mib, 20*mib+64)
++			io.ReadFull(r, make([]byte, 64))
++			c.CloseReader(r)
++		}
++	}()
++	go func() {
++		defer wg.Done()
++		for n := 0; n < 50; n++ {
++			c.cleanPiecesSync()
++			c.GetState()
++		}
++	}()
++	wg.Wait()
++}
++
++func TestPlaybackSeekHandoverRejectsLateOldPrefetch(t *testing.T) {
++	const mib = int64(1 << 20)
++	file, c := playbackTestTorrent(t, 64*mib, 8*mib)
++	setWindow(t, c, "main", 40*mib, 40*mib, 64*mib, 3)
++	c.prefetchRequests = map[string]string{"main": "fresh-request"}
++	old := c.NewPrefetchReaderAt(file, "main", 24*mib)
++	defer c.CloseReader(old)
++	old.SetPrefetchRequest("late-old-request", 24*mib, 28*mib)
++	if _, err := old.Seek(24*mib, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	if pos, err := old.Reader.Seek(0, io.SeekCurrent); err != nil || pos != file.Length() {
++		t.Fatalf("stale dormant backend pos%d %v", pos, err)
++	}
++	if n, err := old.Read(make([]byte, 64)); n != 0 || err != io.EOF {
++		t.Fatalf("stale range read %d %v", n, err)
++	}
++	if c.prefetchRequests["main"] != "fresh-request" || old.PrefetchCapacityStop() != nil {
++		t.Fatal("late old prefetch replaced nonce or issued a capacity stop")
++	}
++	if old.active() {
++		t.Fatal("late old prefetch became active")
++	}
++	assertNoMissingPiecePriority(t, c)
 +}

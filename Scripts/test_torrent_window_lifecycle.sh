@@ -12,7 +12,11 @@ start = source.index('    private func cancelTorrentPlaybackWindowPolicy(')
 end = source.index('    private func cancelTorrentPauseBuffer(', start)
 fixture = (root / 'Scripts/tests/torrent_window_lifecycle.swift').read_text()
 assert fixture.count('// INSERT_PRODUCTION_WINDOW_METHODS') == 1
-(scratch / 'checks.swift').write_text(fixture.replace('// INSERT_PRODUCTION_WINDOW_METHODS', source[start:end]))
+seek_start = source.index('    private func issueForegroundSeek(')
+seek_end = source.index('    private func cancelDirectoryScanForSessionBoundary()', seek_start)
+assert fixture.count('// INSERT_PRODUCTION_SEEK_METHOD') == 1
+(scratch / 'checks.swift').write_text(fixture.replace('// INSERT_PRODUCTION_WINDOW_METHODS', source[start:end])
+    .replace('// INSERT_PRODUCTION_SEEK_METHOD', source[seek_start:seek_end]))
 PY
 xcrun swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library \
   "$CHECK_DIR/checks.swift" -o "$CHECK_DIR/checks"

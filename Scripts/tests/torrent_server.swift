@@ -145,6 +145,7 @@ struct TorrentServerChecks {
         try await explicitCacheRestartChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await retirementShutdownChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await playbackWindowChecks(fixture: CommandLine.arguments[1], scratch: scratch)
+        try await playbackSeekHandoverChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await prefetchCapacityProofChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         print("Torrent server protocol checks passed (\(assertions) assertions).")
     }
@@ -681,5 +682,119 @@ struct TorrentServerChecks {
         check(!events().contains { $0["path"] as? String == "/settings" },
               "Playback-window updates never call the destructive settings endpoint")
         server.release(second)
+    }
+
+    static func playbackSeekHandoverChecks(fixture: String, scratch: URL) async throws {
+        let directory = scratch.appendingPathComponent("seek-handover-checks", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let server = SPTorrentServer(workerURL: URL(fileURLWithPath: fixture), temporaryDirectory: directory,
+                                    peerDiscoveryEnabled: false, settingsProvider: { SPTorrentConfiguration() },
+                                    notifications: NotificationCenter())
+        ownedServer = server
+        defer { server.shutdown() }
+        func events() -> [[String: Any]] {
+            guard let text = try? String(contentsOf: directory.appendingPathComponent("fixture-events.jsonl"),
+                                         encoding: .utf8) else { return [] }
+            return text.split(separator: "\n").compactMap {
+                (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any]
+            }
+        }
+        func barrier(_ descriptor: SPTorrentDescriptor, _ revision: Int) throws -> URL {
+            let value = directory.appendingPathComponent("hold-window-reply-" + descriptor.leaseID.uuidString + "-" + String(revision))
+            try Data().write(to: value)
+            return value
+        }
+        func marker(_ descriptor: SPTorrentDescriptor, _ revision: Int) -> [String: Any]? {
+            events().last { $0["kind"] as? String == "window" && $0["consumer"] as? String == descriptor.leaseID.uuidString
+                && $0["seeking"] as? Bool == true && $0["revision"] as? Int == revision }
+        }
+        let descriptor = try await server.add(magnet: link(71))
+        let file = descriptor.files[0]
+        _ = try await server.updatePlaybackWindow(descriptor, file: file, historyLowerBound: 131072,
+                                                  playbackOffset: 262144, forwardUpperBound: file.length)
+        let invalidFileEventCount = events().count
+        server.beginPlaybackSeek(descriptor, file: SPTorrentFile(id: file.id + 1, path: file.path, length: file.length))
+        try await Task.sleep(for: .milliseconds(150))
+        check(events().dropFirst(invalidFileEventCount).allSatisfy { $0["seeking"] as? Bool != true },
+              "An invented file cannot reserve a seek revision or send a worker marker")
+        let delayed = try barrier(descriptor, 2)
+        server.beginPlaybackSeek(descriptor, file: file)
+        check(try await wait({ marker(descriptor, 2) != nil }),
+              "A seek sends an authenticated soft-reservation marker before any landed packet window")
+        let sent = marker(descriptor, 2)
+        check(sent?["file_index"] as? Int == file.id && sent?["hash"] as? String == descriptor.hash
+              && sent?["lower"] == nil && sent?["current"] == nil && sent?["upper"] == nil,
+              "Seek handover uses the exact file and consumer without estimating new byte bounds")
+        let landed = try await server.updatePlaybackWindow(descriptor, file: file, historyLowerBound: 589824,
+                                                           playbackOffset: 655360, forwardUpperBound: file.length)
+        check(landed.playbackOffset == 655360 && events().contains {
+            $0["kind"] as? String == "window" && $0["consumer"] as? String == descriptor.leaseID.uuidString
+                && $0["revision"] as? Int == 3 && $0["seeking"] == nil
+        }, "A normal landed window has a strictly newer revision than the pending seek marker")
+        try FileManager.default.removeItem(at: delayed)
+        _ = try await server.status(hash: descriptor.hash)
+        check(!events().contains { $0["kind"] as? String == "window" && $0["remove"] as? Bool == true },
+              "A delayed handover acknowledgement cannot remove the source's retained cache")
+
+        let superseded = try barrier(descriptor, 4)
+        server.beginPlaybackSeek(descriptor, file: file)
+        check(try await wait({ marker(descriptor, 4) != nil }), "The first rapid seek reaches the worker")
+        server.beginPlaybackSeek(descriptor, file: file)
+        check(try await wait({ marker(descriptor, 5) != nil }),
+              "A later seek supersedes a pending marker without awaiting its HTTP reply")
+        try FileManager.default.removeItem(at: superseded)
+        let replacement = try await server.updatePlaybackWindow(descriptor, file: file, historyLowerBound: 65536,
+                                                               playbackOffset: 131072, forwardUpperBound: file.length)
+        check(replacement.playbackOffset == 131072 && events().contains {
+            $0["kind"] as? String == "window" && $0["revision"] as? Int == 6 && $0["seeking"] == nil
+        }, "A second seek's landed window cannot be replaced by the older marker's completion")
+
+        // Fail before applying the marker: the retry must preserve the exact
+        // intent/revision and remain independent of playback presentation.
+        let transient = directory.appendingPathComponent("fail-next-seek-" + descriptor.leaseID.uuidString)
+        try Data().write(to: transient)
+        server.beginPlaybackSeek(descriptor, file: file)
+        check(try await wait({ marker(descriptor, 7) != nil }),
+              "A transient marker transport failure is retried while the seek remains current")
+        let failedMarkers = events().filter { $0["kind"] as? String == "seek-transient-failure" }
+        check(failedMarkers.count == 1 && failedMarkers[0]["revision"] as? Int == 7,
+              "A retry preserves the exact current seek revision rather than creating a later stale intent")
+
+        let closing = try barrier(descriptor, 8)
+        server.beginPlaybackSeek(descriptor, file: file)
+        check(try await wait({ marker(descriptor, 8) != nil }), "A source can close with its seek marker reply pending")
+        server.endPlaybackWindow(descriptor)
+        check(try await wait({ events().contains {
+            $0["kind"] as? String == "window" && $0["remove"] as? Bool == true && $0["revision"] as? Int == 9
+        } }), "Source close supersedes and cancels a pending seek with a newer removal revision")
+        try FileManager.default.removeItem(at: closing)
+        server.release(descriptor)
+        let beforeInvalid = events().count
+        server.beginPlaybackSeek(descriptor, file: file)
+        try await Task.sleep(for: .milliseconds(200))
+        check(events().dropFirst(beforeInvalid).allSatisfy { $0["seeking"] as? Bool != true },
+              "A released lease cannot start or retry a seek handover")
+
+        let early = try await server.add(magnet: link(72))
+        let earlyFile = early.files[0]
+        server.beginPlaybackSeek(early, file: earlyFile)
+        check(try await wait({ marker(early, 1) != nil }),
+              "An initial seek can hand over before the first authoritative packet window exists")
+        let firstLanded = try await server.updatePlaybackWindow(early, file: earlyFile,
+            historyLowerBound: 0, playbackOffset: 65536, forwardUpperBound: earlyFile.length)
+        check(firstLanded.playbackOffset == 65536 && events().contains {
+            $0["kind"] as? String == "window" && $0["consumer"] as? String == early.leaseID.uuidString
+                && $0["revision"] as? Int == 2 && $0["seeking"] == nil
+        }, "The first landed packet window supersedes an initial seek marker normally")
+        let shutdownBarrier = try barrier(early, 3)
+        server.beginPlaybackSeek(early, file: earlyFile)
+        check(try await wait({ marker(early, 3) != nil }), "Shutdown begins while its owned marker HTTP reply is pending")
+        server.shutdown()
+        try FileManager.default.removeItem(at: shutdownBarrier)
+        let markersAtShutdown = events().filter { $0["seeking"] as? Bool == true }.count
+        try await Task.sleep(for: .milliseconds(400))
+        check(!server.isRunning && server.activeTorrentCount == 0 &&
+              events().filter { $0["seeking"] as? Bool == true }.count == markersAtShutdown,
+              "Shutdown cancels pending marker work without restarting a worker or retrying its former lease")
     }
 }

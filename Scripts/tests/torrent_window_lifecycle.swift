@@ -2,7 +2,7 @@ import Foundation
 
 private struct SPTorrentPrefetchCapacityStop {}
 
-// The runner inserts the two actual PlayerViewController methods here. These
+// The runner inserts the actual window policy and foreground seek methods here. These
 // controlled dependencies expose asynchronous ordering without a media player,
 // user defaults, a real clipboard, or an external torrent swarm.
 private struct Descriptor { let leaseID = UUID() }
@@ -27,6 +27,13 @@ private struct SPTorrentPlaybackWindow {
     var state = State.paused
     var seekSettled = true
     var sourcePlaybackWindow = MediaWindow()
+    var seekTargets: [Double] = []
+    func seek(to target: Double, precise: Bool, forward: Bool) {
+        SPTorrentServer.shared.seekOrder.append("core")
+        seekTargets.append(target)
+        seekSettled = false
+        sourcePlaybackWindow = .unknown
+    }
 }
 @MainActor private final class TestPauseBuffer {
     var cancellations = 0
@@ -45,6 +52,13 @@ private struct SPTorrentPlaybackWindow {
     var removals = 0
     var requests = 0
     var remoteWindow: SPTorrentPlaybackWindow?
+    var seekOrder: [String] = []
+    var remoteSeeking = false
+    func beginPlaybackSeek(_ descriptor: Descriptor, file: MediaFile) {
+        revision += 1
+        remoteSeeking = true
+        seekOrder.append("handover")
+    }
     func updatePlaybackWindow(_ descriptor: Descriptor, file: MediaFile,
                               historyLowerBound: Int64, playbackOffset: Int64,
                               forwardUpperBound: Int64) async throws -> SPTorrentPlaybackWindow {
@@ -53,6 +67,7 @@ private struct SPTorrentPlaybackWindow {
         let reply = SPTorrentPlaybackWindow(historyLowerBound: historyLowerBound,
             playbackOffset: playbackOffset, forwardUpperBound: forwardUpperBound)
         remoteWindow = reply // Worker commits before its delayed HTTP reply.
+        remoteSeeking = false
         return try await withCheckedThrowingContinuation {
             pending.append(Pending(revision: revision, reply: reply, continuation: $0))
         }
@@ -88,6 +103,10 @@ private struct SPTorrentPlaybackWindow {
     var authorizedFills = 0
     func updateTorrentPauseBuffer() { authorizedFills += 1 }
     func start() { startTorrentPlaybackWindowPolicyIfNeeded() }
+    func seek(_ target: Double) { issueForegroundSeek(to: target) }
+    private func yieldDirectoryScanToForegroundIO() {}
+    private func cancelTorrentPauseBuffer() { torrentPauseBuffer.cancel() }
+    // INSERT_PRODUCTION_SEEK_METHOD
     func cancel(terminal: Bool = false) { cancelTorrentPlaybackWindowPolicy(releaseRetainedWindow: terminal) }
     // INSERT_PRODUCTION_WINDOW_METHODS
 }
@@ -161,6 +180,26 @@ private struct SPTorrentPlaybackWindow {
         check(vc.torrentAppliedPlaybackWindow?.playbackOffset != 250,
               "A different lease cannot inherit the old source's late acknowledgement")
         vc.torrentContext = originalContext
+        let retainedBeforeSeek = server.remoteWindow?.playbackOffset
+        server.seekOrder.removeAll()
+        vc.seek(500)
+        check(server.seekOrder == ["handover", "core"] && vc.core!.seekTargets == [500],
+              "Foreground seeking reserves handover before dispatching the immediate Core seek")
+        check(server.remoteSeeking && server.remoteWindow?.playbackOffset == retainedBeforeSeek,
+              "A seek softens the old reservation while preserving its resident cache")
+        try? await Task.sleep(for: .milliseconds(300))
+        check(server.pending.isEmpty && !vc.core!.seekSettled,
+              "An unsettled far seek never invents a time-to-byte playback anchor")
+        vc.seek(600)
+        check(vc.core!.seekTargets == [500, 600] && server.remoteSeeking,
+              "A rapid second seek immediately supersedes the first intent")
+        vc.core!.seekSettled = true
+        vc.core!.sourcePlaybackWindow = MediaWindow(seekGeneration: 3,
+            historyStartOffset: 600_000, playbackOffset: 650_000)
+        check(await wait { server.pending.count == 1 }, "The new packet mapping replaces seek handover after landing")
+        server.complete()
+        check(await wait { vc.torrentAppliedPlaybackWindow?.playbackOffset == 650_000 && !server.remoteSeeking },
+              "Only the landed exact byte window authorizes new background filling")
         vc.cancel(terminal: true)
         check(server.removals == 1 && server.remoteWindow == nil,
               "A terminal source boundary explicitly releases retained ownership")
