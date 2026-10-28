@@ -38,7 +38,9 @@ private enum SPHoldDiagnostic { case control }
 private enum SPHoldControl { case toggle }
 @MainActor private final class SPHoldWindow: NSWindow {
     var fixtureKey = true
+    var fixtureSheet: NSWindow?
     override var isKeyWindow: Bool { fixtureKey }
+    override var attachedSheet: NSWindow? { fixtureSheet }
 }
 
 @MainActor private final class SPHoldPanel: NSPanel {
@@ -149,6 +151,96 @@ private enum SPHoldControl { case toggle }
             wait(0.30)
             check(owner.core?.rates.isEmpty == true && owner.turboHUD?.visible == false, "short click cancels late threshold and HUD")
         }
+        // A timer can observe physical button-up before AppKit dispatches the
+        // queued leftMouseUp. Both paths must finish exactly the same gesture.
+        for mode in ["playing", "disabled", "paused"] {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            if mode == "disabled" { SPHoldFixtureInput.enabled = false }
+            if mode == "paused" { owner.core?.state = .paused }
+            mouse(owner, window, down: true)
+            SPHoldFixtureInput.buttons = 0
+            owner.poll()
+            check(owner.core?.toggles == 1,
+                  "watchdog-before-queued-up preserves an ordinary click: \(mode)")
+            check(owner.core?.state == (mode == "paused" ? .playing : .paused),
+                  "watchdog release applies the intended visible playback state: \(mode)")
+            mouse(owner, window, down: false)
+            check(owner.core?.toggles == 1 && owner.turbo.owners.isEmpty,
+                  "queued native up after watchdog completion is consumed once: \(mode)")
+            wait(0.30)
+            check(owner.core?.rates.isEmpty == true && owner.turboHUD?.visible == false,
+                  "watchdog tap completion cancels threshold and HUD: \(mode)")
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            mouse(owner, window, down: true)
+            owner.videoHoldTimer?.invalidate() // Exercise threshold callback itself.
+            SPHoldFixtureInput.buttons = 0
+            wait(0.30)
+            check(owner.core?.toggles == 1 && owner.core?.state == .paused,
+                  "threshold callback can finish a queued short release without engaging turbo")
+            mouse(owner, window, down: false)
+            check(owner.core?.toggles == 1 && owner.core?.rates.isEmpty == true && owner.turboHUD?.visible == false,
+                  "late up after threshold arbitration cannot double-toggle or boost")
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            mouse(owner, window, down: true); space(owner, down: true)
+            SPHoldFixtureInput.buttons = 0; owner.poll()
+            check(owner.turbo.owners == [.space] && owner.core?.toggles == 0,
+                  "watchdog mouse release preserves independently held Space ownership")
+            mouse(owner, window, down: false); wait(0.30)
+            check(owner.core?.playbackRate == 2 && owner.core?.toggles == 0,
+                  "queued mouse up cannot cancel remaining Space threshold")
+            space(owner, down: false)
+            check(owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
+                  "remaining Space release restores base without accidental tap")
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            mouse(owner, window, down: true)
+            SPHoldFixtureInput.pointer.x += 5; SPHoldFixtureInput.buttons = 0; owner.poll()
+            mouse(owner, window, down: false)
+            check(owner.core?.toggles == 0 && owner.core?.rates.isEmpty == true,
+                  "geometry invalidation wins over a simultaneously observed physical release")
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            // A queued down can be delivered after the global pointer has left
+            // the surface, without a later displacement from that sampled point.
+            SPHoldFixtureInput.pointer = CGPoint(x: -10_000, y: -10_000)
+            mouse(owner, window, down: true)
+            SPHoldFixtureInput.buttons = 0; owner.poll()
+            mouse(owner, window, down: false)
+            check(owner.core?.toggles == 0 && owner.core?.rates.isEmpty == true,
+                  "watchdog never fabricates an inside-video release from an outside pointer")
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            SPHoldFixtureInput.pointer = CGPoint(x: -10_000, y: -10_000)
+            mouse(owner, window, down: true); wait(0.30)
+            check(owner.core?.rates.isEmpty == true && owner.turbo.owners.isEmpty,
+                  "a queued down sampled outside the video cannot charge or engage a hold")
+            mouse(owner, window, down: false)
+            check(owner.core?.toggles == 0, "outside hold cancellation consumes its trailing release")
+        }
+        for invalid in ["outside", "key", "sheet", "settings", "playlist"] {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            if invalid == "outside" { SPHoldFixtureInput.pointer = CGPoint(x: -10_000, y: -10_000) }
+            mouse(owner, window, down: true)
+            if invalid == "key" { window.fixtureKey = false }
+            if invalid == "sheet" {
+                window.fixtureSheet = NSWindow(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
+            }
+            if invalid == "settings" { owner.isSettingsPanelShown = true }
+            if invalid == "playlist" { owner.isPlaylistShown = true }
+            // Deliberately no poll/run-loop yield before native mouseUp.
+            mouse(owner, window, down: false)
+            check(owner.core?.toggles == 0 && owner.turbo.owners.isEmpty,
+                  "native-up-first rejects invalid release context: \(invalid)")
+            check(owner.core?.rates.isEmpty == true && owner.turboHUD?.visible == false,
+                  "native-up-first invalidation cancels charge/HUD: \(invalid)")
+        }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }
             mouse(owner, window, down: true); wait(0.32)
@@ -254,6 +346,7 @@ private enum SPHoldControl { case toggle }
                                     styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             window.fixtureKey = false
             panel.contentView = owner.playerView
+            SPHoldFixtureInput.pointer = CGPoint(x: 100, y: 100)
             mouse(owner, panel, down: true); wait(0.30)
             check(owner.core?.playbackRate == 2, "PiP hold uses the actual keyable panel rather than the main window")
             mouse(owner, panel, down: false)

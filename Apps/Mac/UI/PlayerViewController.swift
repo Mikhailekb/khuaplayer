@@ -1662,14 +1662,34 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             return
         }
         guard let win = playerView.window, win.isKeyWindow, win.attachedSheet == nil,
-              NSEvent.pressedMouseButtons & 1 != 0, hasMediaSession,
-              !isSettingsPanelShown, !isPlaylistShown else { cancelVideoClick(); return }
+              hasMediaSession, !isSettingsPanelShown, !isPlaylistShown else { cancelVideoClick(); return }
+        // Geometry is sticky and must be rejected before interpreting a missing
+        // button as a release. The real mouseUp may still be queued behind this
+        // timer; both paths consume the same candidate exactly once.
         cancelClickCandidateIfDragged()
+        guard turbo.hasOwner(.mouse) else { return }
+        let point = playerView.convert(win.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        guard playerView.bounds.contains(point) else { cancelVideoClick(); return }
+        if NSEvent.pressedMouseButtons & 1 == 0 { finishVideoPress(sameWindow: true) }
     }
 
     private func resolveClickCandidate(_ event: NSEvent) {
-        guard let win = playerView.window,
-              let token = videoClick.mouseUp(sameWindow: event.window === win,
+        finishVideoPress(sameWindow: event.window === playerView.window)
+    }
+
+    private func finishVideoPress(sameWindow: Bool) {
+        // Native mouseUp can arrive before the watchdog or focus notification.
+        // Every release path must validate the same live context and surface.
+        guard let win = playerView.window, win.isKeyWindow, win.attachedSheet == nil,
+              hasMediaSession, !isSettingsPanelShown, !isPlaylistShown,
+              let state = core?.state,
+              state == .playing || state == .paused || state == .ended else {
+            cancelVideoClick()
+            return
+        }
+        let point = playerView.convert(win.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        guard playerView.bounds.contains(point),
+              let token = videoClick.mouseUp(sameWindow: sameWindow,
                                              windowOrigin: win.frame.origin,
                                              pointer: NSEvent.mouseLocation) else {
             cancelVideoClick()
@@ -1677,13 +1697,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         videoHoldTimer?.invalidate()
         videoHoldTimer = nil
-        guard videoClick.consume(token), win.attachedSheet == nil,
-              hasMediaSession, !isSettingsPanelShown, !isPlaylistShown,
-              let state = core?.state,
-              state == .playing || state == .paused || state == .ended else {
-            cancelVideoClick()
-            return
-        }
+        guard videoClick.consume(token) else { cancelVideoClick(); return }
         applyTurbo(turbo.up(owner: .mouse), reason: "videoMouseUp")
     }
 

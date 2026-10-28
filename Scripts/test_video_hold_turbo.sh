@@ -8,7 +8,7 @@ trap 'rm -rf "$CHECK_DIR"' EXIT
 python3 - "$ROOT" "$CHECK_DIR" <<'PY'
 import os, pathlib, sys
 root, output = map(pathlib.Path, sys.argv[1:])
-source = (root / 'Apps/Mac/UI/PlayerViewController.swift').read_text()
+source = pathlib.Path(os.environ.get('VIDEO_HOLD_CONTROLLER_SOURCE', str(root / 'Apps/Mac/UI/PlayerViewController.swift'))).read_text()
 def region(start, end):
     assert source.count(start) == 1, start
     return source.split(start, 1)[1].split(end, 1)[0]
@@ -33,6 +33,7 @@ if baseline := os.environ.get('VIDEO_HOLD_BASELINE_SOURCE'):
     # runtime assertion, not a missing API, proves the absent feature.
     methods += '\n' + function('    private func startVideoHoldMonitor()')
     methods += '\n' + function('    private func validateVideoHold()')
+    methods += '\n' + function('    private func finishVideoPress(sameWindow: Bool)')
 for signature in ['    private static func turboAllowedKey(_ event: NSEvent) -> Bool',
                   '    private func togglePlaybackNow()',
                   '    private func handleKeyUp(_ event: NSEvent)',
