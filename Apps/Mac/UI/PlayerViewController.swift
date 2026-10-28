@@ -209,6 +209,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private var turbo = SPTurboGesture()
     private var turboTimer: Timer?
+    private var videoHoldTimer: Timer?
     private var turboHUD: SPTurboHUDView?
     private var playbackNotice: SPPlaybackNoticeView?
     private var playbackFeedback: SPPlaybackFeedbackView?
@@ -707,6 +708,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             NotificationCenter.default.removeObserver(token)
         }
 
+        MainActor.assumeIsolated { videoHoldTimer?.invalidate() }
         if let monitor = clickUpMonitor {
             MainActor.assumeIsolated { NSEvent.removeMonitor(monitor) }
         }
@@ -1016,6 +1018,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
                     if self?.floatingVideo.isActive == true { self?.floatingVideo.restore() }
+                    self?.cancelVideoClick()
+                    self?.endTurbo(reason: "fullscreenTransition")
                     self?.gestureFullscreenTransition = true
                     self?.setSettingsPanelShown(false)
                     self?.setPlaylistShown(false)
@@ -1034,6 +1038,11 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 }
             })
         }
+        observerTokens.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: win, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.cancelClickCandidateIfDragged() }
+        })
         observerTokens.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeScreenNotification, object: win, queue: .main
         ) { [weak self] _ in
@@ -1590,8 +1599,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         guard let win = playerView.window else { return }
         videoClick.mouseDown(clickCount: event.clickCount,
                              eligible: event.type == .leftMouseDown &&
-                                !event.modifierFlags.contains(.control) && hasMediaSession,
+                                !event.modifierFlags.contains(.control) && hasMediaSession &&
+                                win.attachedSheet == nil && !isSettingsPanelShown && !isPlaylistShown,
                              windowOrigin: win.frame.origin, pointer: NSEvent.mouseLocation)
+        if videoClick.isTracking {
+            beginTurbo(owner: .mouse)
+            startVideoHoldMonitor()
+        }
         if clickUpMonitor == nil {
             clickUpMonitor = NSEvent.addLocalMonitorForEvents(
                 matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown,
@@ -1618,23 +1632,59 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func cancelVideoClick() {
         videoClick.cancel()
+        videoHoldTimer?.invalidate()
+        videoHoldTimer = nil
+        applyTurbo(turbo.forceEnd(owner: .mouse), reason: "videoPressCancelled")
     }
 
     private func cancelClickCandidateIfDragged() {
         guard let win = playerView.window else { cancelVideoClick(); return }
         videoClick.mouseDragged(windowOrigin: win.frame.origin, pointer: NSEvent.mouseLocation)
+        if !videoClick.isTracking { cancelVideoClick() }
+    }
+
+    /// Native window dragging may consume responder events. Poll only during a
+    /// video press, in common modes, so a lost release cannot leave speed stuck.
+    private func startVideoHoldMonitor() {
+        videoHoldTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            MainActor.assumeIsolated { self.validateVideoHold() }
+        }
+        videoHoldTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func validateVideoHold() {
+        guard turbo.hasOwner(.mouse) else {
+            videoHoldTimer?.invalidate()
+            videoHoldTimer = nil
+            return
+        }
+        guard let win = playerView.window, win.isKeyWindow, win.attachedSheet == nil,
+              NSEvent.pressedMouseButtons & 1 != 0, hasMediaSession,
+              !isSettingsPanelShown, !isPlaylistShown else { cancelVideoClick(); return }
+        cancelClickCandidateIfDragged()
     }
 
     private func resolveClickCandidate(_ event: NSEvent) {
         guard let win = playerView.window,
               let token = videoClick.mouseUp(sameWindow: event.window === win,
                                              windowOrigin: win.frame.origin,
-                                             pointer: NSEvent.mouseLocation) else { return }
+                                             pointer: NSEvent.mouseLocation) else {
+            cancelVideoClick()
+            return
+        }
+        videoHoldTimer?.invalidate()
+        videoHoldTimer = nil
         guard videoClick.consume(token), win.attachedSheet == nil,
               hasMediaSession, !isSettingsPanelShown, !isPlaylistShown,
               let state = core?.state,
-              state == .playing || state == .paused || state == .ended else { return }
-        perform(.togglePlayback)
+              state == .playing || state == .paused || state == .ended else {
+            cancelVideoClick()
+            return
+        }
+        applyTurbo(turbo.up(owner: .mouse), reason: "videoMouseUp")
     }
 
     private var videoActionIdentity: String? {
@@ -4908,8 +4958,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func perform(_ requestedCommand: PlayerCommand) {
-        cancelVideoClick()
         if turbo.blocksPlaybackControls, SPTurboSpeed.blocksCommand(requestedCommand) { return }
+        // Allowed volume/mute commands must not release a physical video hold.
+        // Settings/fullscreen/session transitions have their own cancellation.
+        if !turbo.hasOwner(.mouse) { cancelVideoClick() }
         // A new explicit command supersedes an unfinished trackpad seek.
         if scrollSeekTarget != nil, requestedCommand != .togglePlayback { cancelPlaybackScroll() }
 
@@ -5929,7 +5981,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private static func turboAllowedKey(_ event: NSEvent) -> Bool {
         switch event.keyCode {
-        case 53, 125, 126: return true
+        case turboSpaceKeyCode, 53, 125, 126: return true
         default: break
         }
         switch event.charactersIgnoringModifiers {
@@ -5957,21 +6009,27 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func turboSpaceDown() {
-        cancelVideoClick()
+        beginTurbo(owner: .space)
+    }
+
+    private func beginTurbo(owner: SPTurboGesture.Owner) {
         // A short press toggles the visible state on release. Gesture cleanup
         // must not resume a temporarily paused item before that decision.
         cancelPlaybackScroll(resumePlayback: false)
         guard let core else { return }
 
         if repeatOwnerKeyCode != nil { stopRepeat(resumePlayback: false) }
-        let effects = turbo.keyDown(enabled: SPTurboSettings.isEnabled,
+        let effects = turbo.down(owner: owner, enabled: SPTurboSettings.isEnabled,
                                     playing: core.state == .playing,
                                     currentRate: core.playbackRate,
                                     configuredRate: SPTurboSettings.rate)
-        applyTurbo(effects, reason: "keyDown")
+        applyTurbo(effects, reason: owner == .mouse ? "videoMouseDown" : "keyDown")
     }
 
     private func endTurbo(reason: String) {
+        videoClick.cancel()
+        videoHoldTimer?.invalidate()
+        videoHoldTimer = nil
         applyTurbo(turbo.forceEnd(), reason: reason)
     }
 
@@ -6004,13 +6062,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 turboTimer?.invalidate()
                 let timer = Timer(timeInterval: SPTurboSpeed.holdThreshold,
                                   repeats: false) { [weak self] _ in
-                    guard let self else { return }
-                    self.turboTimer = nil
-                    guard self.core?.state == .playing else {
-                        self.endTurbo(reason: "thresholdWithoutPlayback")
-                        return
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.turboTimer = nil
+                        self.validateVideoHold()
+                        guard self.core?.state == .playing else {
+                            self.endTurbo(reason: "thresholdWithoutPlayback")
+                            return
+                        }
+                        self.applyTurbo(self.turbo.thresholdFired(), reason: "threshold")
                     }
-                    self.applyTurbo(self.turbo.thresholdFired(), reason: "threshold")
                 }
                 turboTimer = timer
                 RunLoop.main.add(timer, forMode: .common)
@@ -6739,7 +6800,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     /// Only PlayerView forwards these events. Scroll views and playback controls
     /// keep their own input, rather than being intercepted by an app-wide monitor.
     private func handlePlaybackScroll(_ event: NSEvent) -> Bool {
-        cancelVideoClick()
+        if !turbo.hasOwner(.mouse) { cancelVideoClick() }
         guard hasMediaSession, let core,
               core.state == .playing || core.state == .paused || core.state == .ended,
               !turbo.blocksPlaybackControls,
@@ -6867,7 +6928,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func handlePlaybackMagnify(_ event: NSEvent) -> Bool {
-        cancelVideoClick()
+        if !turbo.hasOwner(.mouse) { cancelVideoClick() }
         guard !floatingVideo.isActive else { return false }
         let mode: SPPlaybackPinchGesture.Mode
         switch SPPlaybackGestureSettings.pinchAction {

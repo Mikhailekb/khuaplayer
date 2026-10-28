@@ -92,6 +92,7 @@ jobs:
           ./Scripts/test_brand_migration.sh
           ./Scripts/test_turbo_speed.sh
           ./Scripts/test_video_click.sh
+          ./Scripts/test_video_hold_turbo.sh
           ./Scripts/test_playback_feedback.sh
           ./Scripts/test_playback_control_intent.sh
           ./Scripts/test_playback_diagnostics.sh

@@ -61,6 +61,30 @@ struct TurboSpeedChecks {
         expect(gesture.forceEnd(), [], "Cancelling a plain press never toggles playback")
         expect(gesture.keyUp(), [], "Cancelled plain press ignores late release")
 
+        for first in [SPTurboGesture.Owner.space, .mouse] {
+            let second: SPTurboGesture.Owner = first == .space ? .mouse : .space
+            expect(gesture.down(owner: first, enabled: true, playing: true, currentRate: 1.5, configuredRate: 3),
+                   [.scheduleThreshold], "Either physical input can own the shared threshold")
+            expect(gesture.up(owner: second), [], "An unrelated release cannot end another physical input")
+            expect(gesture.thresholdFired(), [.engage(rate: 3)], "First held input engages once")
+            expect(gesture.down(owner: second, enabled: true, playing: true, currentRate: 3, configuredRate: 3), [],
+                   "A second input does not capture an already boosted base or multiply rate")
+            check(gesture.baseRate == 1.5 && gesture.owners.count == 2, "Original rate and both owners survive joining")
+            expect(gesture.up(owner: first), [], "Releasing the first input leaves the second held")
+            expect(gesture.up(owner: second), [.restore(rate: 1.5)], "Only the last physical release restores the original rate")
+            expect(gesture.up(owner: first), [], "A late first-owner release is inert")
+        }
+        _ = gesture.down(owner: .mouse, enabled: true, playing: true, currentRate: 1.25, configuredRate: 2)
+        _ = gesture.down(owner: .space, enabled: true, playing: true, currentRate: 1.25, configuredRate: 2)
+        expect(gesture.forceEnd(owner: .mouse), [], "Dragging the mouse preserves a charging Space hold")
+        expect(gesture.thresholdFired(), [.engage(rate: 2)], "Space threshold survives mouse-only cancellation")
+        expect(gesture.keyUp(), [.restore(rate: 1.25)], "Space restores the pre-mouse rate after independent drag cancellation")
+        _ = gesture.down(owner: .space, enabled: true, playing: true, currentRate: 1, configuredRate: 2)
+        _ = gesture.down(owner: .mouse, enabled: true, playing: true, currentRate: 1, configuredRate: 2)
+        expect(gesture.up(owner: .space), [], "Overlapping short inputs defer cleanup to the last owner")
+        expect(gesture.up(owner: .mouse), [.cancelThreshold], "Overlapping taps do not cause an accidental playback toggle")
+        check(gesture.owners.isEmpty && gesture.phase == .idle, "Last cancelled overlap leaves no owner or timer state")
+
         check(SPTurboSpeed.targetRate(base: 1.25, configured: 2) == 2, "Normal base uses configured target")
         check(SPTurboSpeed.targetRate(base: 2, configured: 2) == 4, "Already-fast base retains existing boost policy")
         check(SPTurboSpeed.targetRate(base: 4, configured: 2) == 5, "Boost remains bounded by supported playback rate")

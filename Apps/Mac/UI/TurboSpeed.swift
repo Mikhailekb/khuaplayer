@@ -50,6 +50,8 @@ enum SPTurboSettings {
 }
 
 struct SPTurboGesture: Equatable {
+    enum Owner: Hashable { case space, mouse }
+
     enum Phase: Equatable {
         case idle
         case pendingTap
@@ -66,14 +68,31 @@ struct SPTurboGesture: Equatable {
     }
 
     private(set) var phase: Phase = .idle
+    private(set) var owners: Set<Owner> = []
+    private var overlappingPress = false
     private(set) var baseRate: Double = 1
     private(set) var turboRate: Double = 1
 
     var blocksPlaybackControls: Bool { phase != .idle }
 
+    func hasOwner(_ owner: Owner) -> Bool { owners.contains(owner) }
+
     mutating func keyDown(enabled: Bool, playing: Bool,
                           currentRate: Double, configuredRate: Double) -> [Effect] {
-        guard phase == .idle else { return [] }
+        down(owner: .space, enabled: enabled, playing: playing,
+             currentRate: currentRate, configuredRate: configuredRate)
+    }
+
+    /// Both physical inputs share one temporary rate. Joining a hold must not
+    /// capture an already boosted rate as the speed to restore later.
+    mutating func down(owner: Owner, enabled: Bool, playing: Bool,
+                       currentRate: Double, configuredRate: Double) -> [Effect] {
+        guard owners.insert(owner).inserted else { return [] }
+        guard phase == .idle else {
+            overlappingPress = true
+            return []
+        }
+        overlappingPress = false
         guard enabled, playing else {
             phase = .pendingTap
             return []
@@ -90,12 +109,22 @@ struct SPTurboGesture: Equatable {
         return [.engage(rate: turboRate)]
     }
 
-    mutating func keyUp() -> [Effect] {
-        end(released: true)
+    mutating func keyUp() -> [Effect] { up(owner: .space) }
+
+    mutating func up(owner: Owner) -> [Effect] {
+        guard owners.remove(owner) != nil, owners.isEmpty else { return [] }
+        return end(released: !overlappingPress)
+    }
+
+    /// Pointer cancellation leaves an independently held Space intact.
+    mutating func forceEnd(owner: Owner) -> [Effect] {
+        guard owners.remove(owner) != nil, owners.isEmpty else { return [] }
+        return end(released: false)
     }
 
     mutating func forceEnd() -> [Effect] {
-        end(released: false)
+        owners.removeAll()
+        return end(released: false)
     }
 
     private mutating func end(released: Bool) -> [Effect] {

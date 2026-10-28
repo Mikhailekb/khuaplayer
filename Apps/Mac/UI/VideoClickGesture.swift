@@ -11,6 +11,8 @@ struct SPVideoClickGesture {
     private var generation: Token = 0
     private var pending: Token?
 
+    var isTracking: Bool { candidate != nil }
+
     mutating func mouseDown(clickCount: Int, eligible: Bool,
                             windowOrigin: CGPoint, pointer: CGPoint) {
         cancel()

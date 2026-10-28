@@ -33926,103 +33926,103 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Aktivieren (bei Wiedergabe Leertaste gedrückt halten)"
+            "value": "Aktivieren (Leertaste oder linke Maustaste halten)"
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Enable (Hold Space While Playing)"
+            "value": "Enable (Hold Space or Left Mouse Button)"
           }
         },
         "es": {
           "stringUnit": {
             "state": "translated",
-            "value": "Activar (mantener pulsado espacio durante la reproducción)"
+            "value": "Activar (mantén Espacio o el botón izquierdo)"
           }
         },
         "fr": {
           "stringUnit": {
             "state": "translated",
-            "value": "Activer (maintenir espace pendant la lecture)"
+            "value": "Activer (maintenir Espace ou le bouton gauche)"
           }
         },
         "id": {
           "stringUnit": {
             "state": "translated",
-            "value": "Aktifkan (tahan Spasi saat memutar)"
+            "value": "Aktifkan (tahan Spasi atau tombol kiri mouse)"
           }
         },
         "it": {
           "stringUnit": {
             "state": "translated",
-            "value": "Attiva (tieni premuto spazio durante la riproduzione)"
+            "value": "Abilita (tieni premuto Spazio o il tasto sinistro)"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "有効にする（再生中にスペースを長押し）"
+            "value": "有効にする（スペースまたはマウス左ボタンを長押し）"
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "활성화(재생 중 스페이스 바 길게 누르기)"
+            "value": "활성화(스페이스 또는 마우스 왼쪽 버튼 길게 누르기)"
           }
         },
         "nl": {
           "stringUnit": {
             "state": "translated",
-            "value": "Inschakelen (spatiebalk ingedrukt houden tijdens afspelen)"
+            "value": "Inschakelen (houd spatie of linkermuisknop ingedrukt)"
           }
         },
         "pl": {
           "stringUnit": {
             "state": "translated",
-            "value": "Włącz (przytrzymaj spację podczas odtwarzania)"
+            "value": "Włącz (przytrzymaj spację lub lewy przycisk myszy)"
           }
         },
         "pt": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ativar (mantenha a barra de espaço pressionada durante a reprodução)"
+            "value": "Ativar (segure Espaço ou o botão esquerdo)"
           }
         },
         "ru": {
           "stringUnit": {
             "state": "translated",
-            "value": "Включить (удерживайте Пробел при воспроизведении)"
+            "value": "Включить (удерживать Пробел или ЛКМ)"
           }
         },
         "th": {
           "stringUnit": {
             "state": "translated",
-            "value": "เปิดใช้งาน (กด Space ค้างขณะเล่น)"
+            "value": "เปิดใช้งาน (กด Space หรือปุ่มเมาส์ซ้ายค้างไว้)"
           }
         },
         "tr": {
           "stringUnit": {
             "state": "translated",
-            "value": "Etkinleştir (oynatırken Boşluk tuşunu basılı tutun)"
+            "value": "Etkinleştir (Boşluk veya sol fare düğmesini basılı tut)"
           }
         },
         "vi": {
           "stringUnit": {
             "state": "translated",
-            "value": "Bật (giữ phím cách khi đang phát)"
+            "value": "Bật (giữ phím cách hoặc nút chuột trái)"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "启用（播放时按住空格）"
+            "value": "启用（按住空格键或鼠标左键）"
           }
         },
         "zh-Hant": {
           "stringUnit": {
             "state": "translated",
-            "value": "啟用（播放時按住空白鍵）"
+            "value": "啟用（按住空白鍵或滑鼠左鍵）"
           }
         }
       }
