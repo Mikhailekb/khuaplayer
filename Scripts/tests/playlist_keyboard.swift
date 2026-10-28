@@ -9,16 +9,6 @@ struct SPPlaylistEntry: Equatable, Sendable {
     let displayName: String
     let isGrowing: Bool
 }
-struct SPTorrentPlaylistPresentation: Equatable {
-    var status: String
-    var details: String? = nil
-    var downloadProgress: Double? = nil
-    var isSaving = false
-    var canSave = false
-    var isResolving = false
-    var pauseBufferAction: String? = nil
-    var pauseBufferEnabled = true
-}
 @MainActor func L(_ key: String, _ arguments: CVarArg...) -> String { key }
 
 @MainActor private final class SPKeyboardHost: NSView {

@@ -31,6 +31,7 @@ private final class SPPlaylistNode: NSObject {
 /// Enter or a pointer click explicitly opens a leaf.
 private final class SPPlaylistOutlineView: NSOutlineView {
     var onActivate: ((Int) -> Void)?
+    var onActionAtPoint: ((NSPoint) -> Bool)?
     var onEscape: (() -> Void)?
     var onPlaybackKeyDown: ((NSEvent) -> Bool)?
     var onPlaybackKeyUp: ((NSEvent) -> Bool)?
@@ -53,10 +54,23 @@ private final class SPPlaylistOutlineView: NSOutlineView {
     }
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        let actionHit = onActionAtPoint?(point) == true
+        let selectedItems = actionHit ? selectedRowIndexes.compactMap { self.item(atRow: $0) as? SPPlaylistNode } : []
         let clicked = row(at: point)
         let item = clicked >= 0 ? self.item(atRow: clicked) as? SPPlaylistNode : nil
         let wasExpanded = item.map { isItemExpanded($0) } ?? false
         super.mouseDown(with: event)
+        if actionHit {
+            // Child buttons normally receive their own native mouse tracking.
+            // If AppKit routes the press through the outline, don't turn it
+            // into media activation or steal the tree's keyboard selection.
+            let rows = IndexSet(selectedItems.compactMap { item in
+                let row = self.row(forItem: item)
+                return row >= 0 ? row : nil
+            })
+            selectRowIndexes(rows, byExtendingSelection: false)
+            return
+        }
         if let item {
             // Resolve again after tracking: a live catalogue can change indices.
             let current = row(forItem: item)
@@ -87,14 +101,44 @@ private final class SPPlaylistRowView: NSTableRowView {
     }
 }
 
+private final class SPPlaylistDownloadProgressView: NSView {
+    var fraction: Double = 0 {
+        didSet { needsDisplay = true; setAccessibilityValue(fraction) }
+    }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        identifier = NSUserInterfaceItemIdentifier("torrent.playlist.file.progress")
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+        setAccessibilityMinValue(0)
+        setAccessibilityMaxValue(1)
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("SPPlaylistDownloadProgressView: no coder path") }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.white.withAlphaComponent(0.18).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 2, yRadius: 2).fill()
+        guard fraction > 0 else { return }
+        NSColor.white.withAlphaComponent(0.9).setFill()
+        NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: bounds.width * fraction,
+            height: bounds.height), xRadius: 2, yRadius: 2).fill()
+    }
+}
+
 private final class SPPlaylistCellView: NSTableCellView {
     private let icon = NSImageView()
     private let caption = SPPlaylistLabel(size: 13)
     private let detail = SPPlaylistLabel(size: 11, secondary: true)
     private let count = SPPlaylistLabel(size: 11, secondary: true)
+    private let fileAction = NSButton()
+    private let downloadDetail = SPPlaylistLabel(size: 10.5, secondary: true)
+    private let downloadProgress = SPPlaylistDownloadProgressView(frame: .zero)
     private var folder = false
-    private var hasDetail = false
+    private var detailCount = 0
+    private var hasDownloadDetail = false
+    private var fileSave: SPTorrentFileSavePresentation?
     var onActivate: (() -> Void)?
+    var onFileAction: (() -> Void)?
     override var isFlipped: Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
 
@@ -106,14 +150,30 @@ private final class SPPlaylistCellView: NSTableCellView {
         count.alignment = .right
         detail.maximumNumberOfLines = 2
         detail.lineBreakMode = .byWordWrapping
-        for view in [icon, caption, detail, count] { addSubview(view); view.setAccessibilityElement(false) }
+        fileAction.title = ""
+        fileAction.isBordered = false
+        fileAction.contentTintColor = .white
+        fileAction.imagePosition = .imageOnly
+        fileAction.focusRingType = .default
+        fileAction.target = self
+        fileAction.action = #selector(performFileAction)
+        fileAction.identifier = NSUserInterfaceItemIdentifier("torrent.playlist.file.action")
+        downloadDetail.identifier = NSUserInterfaceItemIdentifier("torrent.playlist.file.status")
+        downloadDetail.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        for view in [icon, caption, detail, count, downloadDetail, downloadProgress, fileAction] {
+            addSubview(view)
+        }
+        for view in [icon, caption, detail, count] { view.setAccessibilityElement(false) }
+        downloadDetail.setAccessibilityElement(false)
         setAccessibilityElement(true)
     }
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("SPPlaylistCellView: no coder path") }
 
-    func configure(_ node: SPPlaylistNode, current: Bool) {
+    func configure(_ node: SPPlaylistNode, current: Bool,
+                   canSave: Bool, save: SPTorrentFileSavePresentation?) {
         folder = node.isFolder
+        fileSave = folder || !canSave ? nil : save
         caption.stringValue = node.name
         caption.font = .systemFont(ofSize: 13, weight: folder ? .medium : .regular)
         caption.textColor = .white
@@ -123,26 +183,83 @@ private final class SPPlaylistCellView: NSTableCellView {
         if current { details.append(L("playlist.currentlyPlaying")) }
         if node.entry?.isGrowing == true { details.append(L("playlist.updatingFile")) }
         detail.stringValue = details.joined(separator: "\n")
-        hasDetail = !details.isEmpty
-        detail.isHidden = !hasDetail
+        detailCount = details.count
+        detail.isHidden = detailCount == 0
         let symbol = folder ? "folder" : (current ? "play.fill" : "doc")
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: current ? 13 : 16, weight: .regular))
         icon.contentTintColor = current ? .white : NSColor(white: 0.76, alpha: 1)
         toolTip = node.entry?.relativePath ?? node.name
+        fileAction.isHidden = folder || !canSave
+        fileAction.isEnabled = fileSave?.phase != .cancelling
+        var actionTitle = L("torrent.saveFile")
+        var actionSymbol = "arrow.down.to.line"
+        var saveDetail = ""
+        switch fileSave?.phase {
+        case .saving:
+            actionTitle = L("torrent.cancelSave")
+            actionSymbol = "xmark"
+            if let save = fileSave {
+                let percent = NumberFormatter.localizedString(from: NSNumber(value: save.fraction), number: .percent)
+                let received = ByteCountFormatter.string(fromByteCount: max(0, save.receivedBytes), countStyle: .file)
+                let expected = ByteCountFormatter.string(fromByteCount: max(0, save.expectedBytes), countStyle: .file)
+                saveDetail = L("torrent.fileSaveProgress", percent, received, expected)
+            }
+        case .cancelling:
+            actionTitle = L("torrent.cancellingSave")
+            actionSymbol = "ellipsis"
+            saveDetail = actionTitle
+        case .saved:
+            actionTitle = L("torrent.showSavedFile")
+            actionSymbol = "checkmark.circle"
+            saveDetail = L("torrent.fileSaved")
+        case .failed:
+            actionTitle = L("torrent.retrySave")
+            actionSymbol = "arrow.clockwise"
+            saveDetail = L("torrent.fileSaveFailed")
+        case .cancelled:
+            actionTitle = L("torrent.retrySave")
+            actionSymbol = "arrow.down.to.line"
+            saveDetail = L("torrent.fileSaveCancelled")
+        case nil: break
+        }
+        fileAction.image = NSImage(systemSymbolName: actionSymbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+        fileAction.toolTip = actionTitle
+        fileAction.setAccessibilityLabel(actionTitle + ": " + node.name)
+        hasDownloadDetail = !saveDetail.isEmpty
+        downloadDetail.stringValue = saveDetail
+        downloadDetail.toolTip = fileSave?.failureDescription ?? saveDetail
+        downloadDetail.isHidden = !hasDownloadDetail
+        downloadProgress.isHidden = fileSave?.hasProgress != true
+        downloadProgress.fraction = fileSave?.fraction ?? 0
+        downloadProgress.setAccessibilityLabel(node.name)
         setAccessibilityRole(folder ? .cell : .button)
-        setAccessibilityLabel(([node.entry?.relativePath ?? node.name] + details).joined(separator: ", "))
+        setAccessibilityLabel(([node.entry?.relativePath ?? node.name] + details + (hasDownloadDetail ? [saveDetail] : [])).joined(separator: ", "))
         setAccessibilityValue(current)
+        setAccessibilityChildren(fileAction.isHidden ? [] : [fileAction] + (downloadProgress.isHidden ? [] : [downloadProgress]))
         needsLayout = true
     }
+    func isFileAction(at point: NSPoint, from view: NSView) -> Bool {
+        !fileAction.isHidden && fileAction.frame.contains(convert(point, from: view))
+    }
     override func layout() {
-        let trailing: CGFloat = count.isHidden ? 10 : min(88, bounds.width * 0.32)
+        let trailing: CGFloat = !fileAction.isHidden ? 42 : (count.isHidden ? 10 : min(88, bounds.width * 0.32))
+        let hasDetail = detailCount > 0 || hasDownloadDetail
         icon.frame = NSRect(x: 2, y: hasDetail ? 10 : bounds.midY - 9, width: 18, height: 18)
         caption.frame = NSRect(x: 28, y: hasDetail ? 7 : bounds.midY - 9,
                                width: max(0, bounds.width - 28 - trailing), height: 20)
-        detail.frame = NSRect(x: 28, y: 28, width: max(0, bounds.width - 38), height: max(0, bounds.height - 30))
+        detail.frame = NSRect(x: 28, y: 28, width: max(0, bounds.width - 38), height: CGFloat(detailCount) * 14)
         count.frame = NSRect(x: max(28, bounds.width - trailing), y: bounds.midY - 8,
                              width: max(0, trailing - 8), height: 18)
+        fileAction.frame = NSRect(x: max(0, bounds.width - 34), y: hasDetail ? 3 : bounds.midY - 15, width: 30, height: 30)
+        let downloadY = 28 + CGFloat(detailCount) * 14
+        downloadDetail.frame = NSRect(x: 28, y: downloadY, width: max(0, bounds.width - 38), height: 17)
+        downloadProgress.frame = NSRect(x: 28, y: downloadY + 20, width: max(0, bounds.width - 38), height: 3)
+    }
+    @objc private func performFileAction() {
+        guard !fileAction.isHidden, fileAction.isEnabled else { return }
+        onFileAction?()
     }
     override func accessibilityPerformPress() -> Bool {
         guard !folder else { return false }
@@ -206,6 +323,9 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
     var onAutoAdvanceChanged: ((Bool) -> Void)?
     var onOpenTorrent: (() -> Void)? { didSet { updateSourceButton() } }
     var onSaveTorrentFile: (() -> Void)?
+    var onSaveTorrentEntry: ((URL) -> Void)?
+    var onCancelTorrentEntrySave: ((URL) -> Void)?
+    var onRevealTorrentEntrySave: ((URL) -> Void)?
     var onCancelTorrentSave: (() -> Void)?
     var onCancelTorrentOpen: (() -> Void)?
     var onTogglePauseBuffer: (() -> Void)?
@@ -229,6 +349,7 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
     private let autoAdvanceButton = SPPlaylistAutoAdvanceButton(frame: .zero)
     private let preferencesHint = SPPlaylistLabel(L("playlist.preferencesHint"), size: 10.5, secondary: true)
     private var torrentPresentation: SPTorrentPlaylistPresentation?
+    private let bufferStatusView = SPTorrentBufferStatusView(frame: .zero)
     private let torrentStatus = SPPlaylistLabel(size: 12)
     private let torrentDetails = SPPlaylistLabel(size: 10.5, secondary: true)
     private let torrentProgress = NSProgressIndicator()
@@ -250,6 +371,10 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
     }
     private var torrentContentHeight: CGFloat {
         guard torrentPresentation != nil else { return 0 }
+        if torrentPresentation?.bufferStatus != nil {
+            bufferStatusView.isCompact = compactTorrentFooter
+            return bufferStatusView.preferredHeight
+        }
         if compactTorrentFooter { return 52 + (hasPauseBufferAction ? 34 : 0) }
         return 42 + (hasTorrentDetails ? torrentDetailsHeight + 2 : 0)
             + (hasTorrentProgress ? 12 : 0) + (hasPauseBufferAction ? 34 : 0) + (hasTorrentAction ? 34 : 0)
@@ -259,6 +384,8 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
     }
     private var rootURL: URL?
     private var entries: [SPPlaylistEntry] = []
+    private var torrentFileSourceRoot: String?
+    private var torrentFileSaves: [String: SPTorrentFileSavePresentation] = [:]
     private var currentURL: URL?
     private var rootNode: SPPlaylistNode?
     private var nodes: [String: SPPlaylistNode] = [:]
@@ -348,6 +475,12 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
         outline.identifier = NSUserInterfaceItemIdentifier("playlist.tree")
         outline.setAccessibilityLabel(L("playlist.title"))
         outline.onActivate = { [weak self] row in self?.activate(row) }
+        outline.onActionAtPoint = { [weak self] point in
+            guard let self else { return false }
+            let row = self.outline.row(at: point)
+            guard row >= 0, let cell = self.outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? SPPlaylistCellView else { return false }
+            return cell.isFileAction(at: point, from: self.outline)
+        }
         outline.onEscape = { [weak self] in self?.onClose?() }
         outline.onPlaybackKeyDown = { [weak self] in self?.routePlaybackKeyDown($0) ?? false }
         outline.onPlaybackKeyUp = { [weak self] in self?.routePlaybackKeyUp($0) ?? false }
@@ -395,6 +528,14 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
             view.isHidden = true
             addSubview(view)
         }
+        bufferStatusView.isHidden = true
+        bufferStatusView.onAction = { [weak self] action in
+            switch action {
+            case .stopBuffering, .resumeBuffering: self?.onTogglePauseBuffer?()
+            case .cancelOpening: self?.onCancelTorrentOpen?()
+            }
+        }
+        addSubview(bufferStatusView)
         configure(root: nil, entries: [], currentURL: nil, autoAdvance: true, isRefreshing: false, error: nil)
     }
     @available(*, unavailable)
@@ -421,6 +562,10 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
     }
     func setTorrentPresentation(_ presentation: SPTorrentPlaylistPresentation?) {
         torrentPresentation = presentation
+        let modernFooter = presentation?.bufferStatus != nil
+        bufferStatusView.isCompact = compactTorrentFooter
+        bufferStatusView.setPresentation(presentation?.bufferStatus)
+        bufferStatusView.isHidden = !modernFooter
         torrentStatus.stringValue = presentation?.status ?? ""
         torrentStatus.toolTip = presentation?.status
         torrentStatus.isHidden = presentation == nil
@@ -443,6 +588,11 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
             torrentActionButton.title = title
             torrentActionButton.toolTip = title
             torrentActionButton.setAccessibilityLabel(title)
+        }
+        if modernFooter {
+            for view in [torrentStatus, torrentDetails, torrentProgress, torrentActionButton, pauseBufferButton] {
+                view.isHidden = true
+            }
         }
         updateSourceButton()
         needsLayout = true
@@ -525,6 +675,86 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
         }
     }
 
+    /// Only a current catalogue can receive download observations. Updating a
+    /// progress tick changes existing cells, never the outline selection/tree.
+    func setTorrentFileDownloads(_ states: [URL: SPTorrentFileSavePresentation]?, sourceRoot: URL?) {
+        let previousRoot = torrentFileSourceRoot
+        let previous = torrentFileSaves
+        let validRoot = canonical(sourceRoot)
+        torrentFileSourceRoot = states != nil && validRoot == canonical(rootURL) ? validRoot : nil
+        let known = Set(entries.compactMap { canonical($0.url) })
+        var next: [String: SPTorrentFileSavePresentation] = [:]
+        if torrentFileSourceRoot != nil {
+            for (url, state) in states ?? [:] {
+                if let key = canonical(url), known.contains(key) { next[key] = state }
+            }
+        }
+        torrentFileSaves = next
+        let actionsChanged = previousRoot != torrentFileSourceRoot
+        let changed = actionsChanged ? known : Set(previous.keys).union(next.keys).filter { previous[$0] != next[$0] }
+        guard !changed.isEmpty else { return }
+        let origin = scrollView.contentView.bounds.origin
+        var heightRows = IndexSet()
+        for node in nodes.values {
+            guard let url = node.entry?.url, let key = canonical(url), changed.contains(key) else { continue }
+            let row = outline.row(forItem: node)
+            guard row >= 0 else { continue }
+            let old = previousRoot == canonical(rootURL) ? previous[key] : nil
+            if rowHeight(node, save: old) != rowHeight(node, save: next[key]) { heightRows.insert(row) }
+            if let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? SPPlaylistCellView {
+                configure(cell, node: node)
+            }
+        }
+        if !heightRows.isEmpty {
+            NSAnimationContext.runAnimationGroup { context in
+                // A row action changes its contents at once. Keeping AppKit's
+                // old animated row frame briefly clips the new progress rail.
+                context.duration = 0
+                context.allowsImplicitAnimation = false
+                outline.noteHeightOfRows(withIndexesChanged: heightRows)
+                // Recreate only rows whose structure changed; ordinary byte
+                // ticks keep their existing cell, keyboard focus and scroll.
+                outline.reloadData(forRowIndexes: heightRows, columnIndexes: IndexSet(integer: 0))
+            }
+            layoutSubtreeIfNeeded()
+            let maximumY = max(0, outline.bounds.height - scrollView.contentSize.height)
+            scrollView.contentView.scroll(to: NSPoint(x: origin.x, y: min(maximumY, max(0, origin.y))))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+    private var canSaveTorrentEntries: Bool {
+        torrentFileSourceRoot != nil && torrentFileSourceRoot == canonical(rootURL)
+    }
+    private func fileSave(for node: SPPlaylistNode) -> SPTorrentFileSavePresentation? {
+        guard canSaveTorrentEntries, let key = canonical(node.entry?.url) else { return nil }
+        return torrentFileSaves[key]
+    }
+    private func configure(_ cell: SPPlaylistCellView, node: SPPlaylistNode) {
+        cell.configure(node, current: isCurrent(node), canSave: canSaveTorrentEntries, save: fileSave(for: node))
+        cell.onActivate = { [weak self, weak node] in
+            guard let self, let node, self.nodes[node.key] === node,
+                  let url = node.entry?.url else { return }
+            self.onSelect?(url)
+        }
+        cell.onFileAction = { [weak self, weak node] in
+            guard let self, let node, self.nodes[node.key] === node,
+                  self.canSaveTorrentEntries, let url = node.entry?.url else { return }
+            switch self.fileSave(for: node)?.phase {
+            case .saving: self.onCancelTorrentEntrySave?(url)
+            case .cancelling: break
+            case .saved: self.onRevealTorrentEntrySave?(url)
+            case .failed, .cancelled, nil: self.onSaveTorrentEntry?(url)
+            }
+        }
+    }
+    private func rowHeight(_ node: SPPlaylistNode, save: SPTorrentFileSavePresentation?) -> CGFloat {
+        if node.isFolder { return 34 }
+        let details = (isCurrent(node) ? 1 : 0) + (node.entry?.isGrowing == true ? 1 : 0)
+        let base: CGFloat = details == 0 ? 40 : (details == 1 ? 58 : 72)
+        guard let save else { return base }
+        return max(base, 28 + CGFloat(details) * 14 + 17 + (save.hasProgress ? 16 : 11))
+    }
+
     private func buildTree() {
         nodes.removeAll(keepingCapacity: true)
         guard let rootURL else { rootNode = nil; return }
@@ -602,8 +832,7 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
         guard let node = item as? SPPlaylistNode else { return nil }
         let cell = (outlineView.makeView(withIdentifier: NSUserInterfaceItemIdentifier("playlist.cell"), owner: self) as? SPPlaylistCellView)
             ?? SPPlaylistCellView(frame: .zero)
-        cell.configure(node, current: isCurrent(node))
-        cell.onActivate = { [weak self] in if let url = node.entry?.url { self?.onSelect?(url) } }
+        configure(cell, node: node)
         return cell
     }
     func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
@@ -613,9 +842,7 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
     }
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
         guard let node = item as? SPPlaylistNode else { return 42 }
-        if node.isFolder { return 34 }
-        let details = (isCurrent(node) ? 1 : 0) + (node.entry?.isGrowing == true ? 1 : 0)
-        return details == 0 ? 40 : (details == 1 ? 58 : 72)
+        return rowHeight(node, save: fileSave(for: node))
     }
     func outlineViewItemDidExpand(_ notification: Notification) {
         guard !restoring, let node = notification.userInfo?["NSObject"] as? SPPlaylistNode else { return }
@@ -657,7 +884,10 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
         autoAdvanceButton.frame = NSRect(x: 18, y: max(0, footerTop + torrentContentHeight + 6), width: max(0, bounds.width - 36), height: 42)
         preferencesHint.isHidden = torrentPresentation != nil || footer < 78
         preferencesHint.frame = NSRect(x: 18, y: max(0, bounds.height - 23), width: max(0, bounds.width - 36), height: 15)
-        if torrentPresentation != nil {
+        if torrentPresentation?.bufferStatus != nil {
+            bufferStatusView.isCompact = compactTorrentFooter
+            bufferStatusView.frame = NSRect(x: 18, y: footerTop, width: max(0, bounds.width - 36), height: torrentContentHeight)
+        } else if torrentPresentation != nil {
             if compactTorrentFooter {
                 if torrentPresentation?.isSaving == true || torrentPresentation?.isResolving == true {
                     torrentActionButton.title = L("torrent.cancel")

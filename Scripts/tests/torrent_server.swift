@@ -140,6 +140,7 @@ struct TorrentServerChecks {
         check(try await wait({ server.activeTorrentCount == 0 && !server.isRunning }), "final player close stops worker")
         check(try await wait({ (try? FileManager.default.contentsOfDirectory(at: scratch, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix("KhuaTorrent-") }.isEmpty) == true }), "all owned worker state directories are removed")
+        try await fileSaveIntegrityChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await cacheConfigurationChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await startupConfigurationChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await explicitCacheRestartChecks(fixture: CommandLine.arguments[1], scratch: scratch)
@@ -149,6 +150,73 @@ struct TorrentServerChecks {
         try await prefetchCapacityProofChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         try await cacheSnapshotChecks(fixture: CommandLine.arguments[1], scratch: scratch)
         print("Torrent server protocol checks passed (\(assertions) assertions).")
+    }
+
+    static func fileSaveIntegrityChecks(fixture: String, scratch: URL) async throws {
+        let directory = scratch.appendingPathComponent("save-integrity-checks", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let server = SPTorrentServer(workerURL: URL(fileURLWithPath: fixture), temporaryDirectory: directory,
+                                    peerDiscoveryEnabled: false, settingsProvider: { SPTorrentConfiguration() },
+                                    notifications: NotificationCenter())
+        ownedServer = server
+        defer { server.shutdown() }
+        for (index, mode) in ["short-save", "oversized-save", "unknown-short-save"].enumerated() {
+            let descriptor = try await server.add(magnet: link(150 + index, mode: mode))
+            let destination = directory.appendingPathComponent(mode + ".mp4")
+            do {
+                _ = try await server.saveFile(descriptor, file: descriptor.files[0], to: destination)
+                check(false, "A whole-file save must reject \(mode) HTTP200")
+            } catch SPTorrentServerError.invalidResponse {
+                check(!FileManager.default.fileExists(atPath: destination.path),
+                      "\(mode) HTTP200 cannot commit a partial/oversized destination")
+            }
+            let original = Data("Existing owned destination".utf8)
+            try original.write(to: destination)
+            do {
+                _ = try await server.saveFile(descriptor, file: descriptor.files[0], to: destination,
+                                              replaceExisting: true)
+                check(false, "Invalid body must not replace an existing file")
+            } catch SPTorrentServerError.invalidResponse {
+                check(try Data(contentsOf: destination) == original,
+                      "\(mode) validation happens before replacing the existing destination")
+            }
+            check(server.activeDownloadCount == 0 && server.activeTorrentCount == 1,
+                  "\(mode) failure releases only the download lease")
+            server.release(descriptor)
+            check(try await wait({ server.activeTorrentCount == 0 }), "Invalid save source closes cleanly")
+        }
+        let unknown = try await server.add(magnet: link(154, mode: "unknown-good-save"))
+        let unknownDestination = directory.appendingPathComponent("unknown-good.mp4")
+        _ = try await server.saveFile(unknown, file: unknown.files[0], to: unknownDestination)
+        let expected = Data((0..<4096).flatMap { _ in Array(UInt8.min...UInt8.max) })
+        check(try Data(contentsOf: unknownDestination) == expected,
+              "Unknown HTTP length succeeds when actual saved bytes match authoritative file length")
+        server.release(unknown)
+        check(try await wait({ server.activeTorrentCount == 0 }), "Unknown-length success releases its save lease")
+
+        let multi = try await server.add(magnet: link(155, mode: "multi-save"))
+        check(multi.files.count == 2 && multi.files[0].id != multi.files[1].id,
+              "Owned fixture exposes two distinct playlist files")
+        let first = directory.appendingPathComponent("multi-first.mp4")
+        let second = directory.appendingPathComponent("multi-second.mp4")
+        var firstReceived: Int64 = 0, secondReceived: Int64 = 0
+        let one = Task { try await server.saveFile(multi, file: multi.files[0], to: first) { firstReceived = $0.receivedBytes } }
+        let two = Task { try await server.saveFile(multi, file: multi.files[1], to: second) { secondReceived = $0.receivedBytes } }
+        check(try await wait({ server.activeDownloadCount == 2 && firstReceived > 0 && secondReceived > 0 }),
+              "Two actual authenticated file streams expose independent concurrent progress")
+        server.release(multi)
+        check(server.activeDownloadCount == 2 && server.activeTorrentCount == 1,
+              "Both file saves retain independent leases after closing the playback source")
+        _ = try await one.value; _ = try await two.value
+        check(try Data(contentsOf: first) == expected && Data(contentsOf: second) == Data(expected.reversed()),
+              "Different playlist file IDs reach their own byte-exact destinations")
+        check(try await wait({ server.activeDownloadCount == 0 && server.activeTorrentCount == 0 }),
+              "Completing both saves releases all download leases")
+        let events = try String(contentsOf: directory.appendingPathComponent("fixture-events.jsonl"), encoding: .utf8)
+            .split(separator: "\n").compactMap { (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any] }
+        check(events.contains { $0["kind"] as? String == "stream" && $0["index"] as? String == "8"
+                               && $0["consumer"] is NSNull },
+              "Saving an unselected file uses its own index without a playback-consumer anchor")
     }
 
     static func cacheConfigurationChecks(fixture: String, scratch: URL) async throws {

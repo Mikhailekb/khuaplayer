@@ -6,7 +6,8 @@ CHECK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/khua-playlist-keyboard.XXXXXX")"
 trap 'rm -rf "$CHECK_DIR"' EXIT
 
 xcrun swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library \
-  "$ROOT/Apps/Mac/UI/PlaylistView.swift" "$ROOT/Scripts/tests/playlist_keyboard.swift" \
+  "$ROOT/Apps/Mac/UI/PlaylistView.swift" "$ROOT/Apps/Mac/UI/TorrentViews.swift" \
+  "$ROOT/Apps/Mac/UI/TorrentBufferStatusView.swift" "$ROOT/Scripts/tests/playlist_keyboard.swift" \
   -o "$CHECK_DIR/playlist-keyboard-checks"
 "$CHECK_DIR/playlist-keyboard-checks"
 
@@ -38,6 +39,7 @@ pathlib.Path(sys.argv[2]).write_text(source)
 PY
   xcrun swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library \
     -D PLAYLIST_KEYBOARD_BASELINE "$CHECK_DIR/PlaylistView-baseline.swift" \
+    "$ROOT/Apps/Mac/UI/TorrentViews.swift" "$ROOT/Apps/Mac/UI/TorrentBufferStatusView.swift" \
     "$ROOT/Scripts/tests/playlist_keyboard.swift" -o "$CHECK_DIR/baseline-checks"
   set +e
   "$CHECK_DIR/baseline-checks" > "$CHECK_DIR/baseline.log" 2>&1

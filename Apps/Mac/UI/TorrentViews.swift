@@ -12,6 +12,23 @@ struct SPTorrentPlaylistPresentation: Equatable {
     var isResolving = false
     var pauseBufferAction: String? = nil
     var pauseBufferEnabled = true
+    var bufferStatus: SPTorrentBufferPresentation? = nil
+}
+
+/// A file-save observation, separate from streaming/RAM buffer activity.
+/// A missing observation means the torrent file is available to save.
+struct SPTorrentFileSavePresentation: Equatable {
+    enum Phase: Equatable { case saving, cancelling, saved, failed, cancelled }
+    let phase: Phase
+    let receivedBytes: Int64
+    let expectedBytes: Int64
+    var failureDescription: String? = nil
+
+    var fraction: Double {
+        guard expectedBytes > 0 else { return phase == .saved ? 1 : 0 }
+        return min(1, max(0, Double(receivedBytes) / Double(expectedBytes)))
+    }
+    var hasProgress: Bool { phase == .saving || phase == .cancelling }
 }
 
 private final class SPTorrentFlippedView: NSView {

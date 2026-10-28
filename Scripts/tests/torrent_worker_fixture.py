@@ -198,6 +198,8 @@ class Handler(BaseHTTPRequestHandler):
                 if mode == 'badid':
                     file.pop('id')
                 files = [] if mode == 'timeout' else [file]
+                if mode == 'multi-save':
+                    files.append({'id': 8, 'path': 'Show/Other.mp4', 'length': len(payload)})
                 if mode == 'duplicate':
                     files.append({'id': 7, 'path': 'Other.mp4', 'length': 5})
                 result = {'hash': hash_value, 'name': mode, 'file_stats': files, 'stat': 3,
@@ -236,13 +238,30 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(401)
             return
         query = urllib.parse.parse_qs(url.query)
-        audit('stream', consumer=query.get('playback_consumer', [None])[0])
+        audit('stream', consumer=query.get('playback_consumer', [None])[0],
+              index=query.get('index', [None])[0])
         with records_lock:
             record = records.get(query.get('link', [''])[0])
-        if not record or query.get('index') != ['7']:
+        if not record or not any(query.get('index') == [str(file['id'])] for file in record['file_stats']):
             self.answer(404)
             return
-        data = payload
+        data = bytes(reversed(payload)) if query.get('index') == ['8'] else payload
+        if not self.headers.get('Range'):
+            if record['name'] in ('short-save', 'unknown-short-save'):
+                data = data[:-1]
+            elif record['name'] == 'oversized-save':
+                data += b'extra'
+            if record['name'] in ('unknown-short-save', 'unknown-good-save'):
+                # A successful HTTP body delimited by EOF: actual bytes, not
+                # Content-Length, must decide whether a whole file is complete.
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/mp4')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.close_connection = True
+                if self.command != 'HEAD':
+                    self.wfile.write(data)
+                return
         status = 200
         extra = {}
         if self.headers.get('Range'):
@@ -251,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
             data = payload[start:end + 1]
             status = 206
             extra['Content-Range'] = f'bytes {start}-{end}/{len(payload)}'
-        if record['name'] != 'slow' or self.command == 'HEAD':
+        if record['name'] not in ('slow', 'multi-save') or self.command == 'HEAD':
             self.answer(status, data, 'video/mp4', extra)
             return
         self.send_response(status)

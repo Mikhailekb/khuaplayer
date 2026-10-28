@@ -112,6 +112,9 @@ jobs:
           ./Scripts/test_torrent_cache_polling.sh
           ./Scripts/test_playlist_filesystem.sh
           ./Scripts/test_playlist_keyboard.sh
+          ./Scripts/test_playlist_file_download_rows.sh
+          ./Scripts/test_torrent_file_saves.sh
+          ./Scripts/test_torrent_buffer_metrics.sh
           ./Scripts/test_torrent_models.sh
           ./Scripts/test_torrent_server.sh
           ./Scripts/test_torrent_pause_buffer.sh

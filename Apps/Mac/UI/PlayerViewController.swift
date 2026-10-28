@@ -246,11 +246,14 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var torrentOpenCandidate: SPTorrentPlaybackContext?
     private var torrentOpenTask: Task<Void, Never>?
     private var torrentStatusTask: Task<Void, Never>?
-    private var torrentSaveTask: Task<Void, Never>?
+    private lazy var torrentFileSaves: SPTorrentFileSaves = {
+        let saves = SPTorrentFileSaves()
+        saves.onChange = { [weak self] in self?.refreshPlaylistView() }
+        return saves
+    }()
+    private var torrentSavePanelToken = UUID()
     private var torrentOpenGeneration: UInt64 = 0
-    private var torrentSaveGeneration: UInt64 = 0
     private var torrentResolving = false
-    private var torrentDownloadProgress: Double?
     private var torrentLastStatus: SPTorrentStatus?
     private var torrentLastCacheSnapshot: SPTorrentCacheSnapshot?
     private var torrentTimelinePresentation: SPTorrentTimelinePresentation?
@@ -3086,9 +3089,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         torrentOpenTask?.cancel()
         torrentOpenTask = nil
         torrentResolving = false
-        torrentSaveGeneration &+= 1
-        torrentSaveTask?.cancel()
-        torrentSaveTask = nil
+        torrentSavePanelToken = UUID()
+        torrentFileSaves.cancelAll()
         torrentStatusTask?.cancel()
         torrentStatusTask = nil
         clearTorrentCacheTimeline(visible: false)
@@ -3191,7 +3193,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         return error.localizedDescription
     }
 
-    @objc func cancelTorrentSaveAction(_ sender: Any?) { torrentSaveTask?.cancel() }
+    @objc func cancelTorrentSaveAction(_ sender: Any?) {
+        guard let context = torrentContext else { return }
+        torrentFileSaves.cancel(descriptor: context.descriptor, file: context.file)
+    }
 
     // MARK: - Torrent streaming
 
@@ -3231,7 +3236,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         if let suspended = suspendedTorrentCacheSnapshot,
            torrentCacheRestartToken == suspended.token, torrentContext == nil { return suspended }
         guard let context = torrentContext else { return nil }
-        guard torrentSaveTask == nil, let core, hasMediaSession,
+        guard torrentFileSaves.activeCount == 0, let core, hasMediaSession,
               core.state == .playing || core.state == .paused || core.state == .ended,
               core.position.isFinite, core.position >= 0,
               context.descriptor.originalTorrentData != nil || context.descriptor.originalLink != nil
@@ -3268,7 +3273,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         guard snapshot.owner == ObjectIdentifier(self),
               torrentContext?.descriptor.leaseID == snapshot.descriptor.leaseID,
               torrentContext?.file == snapshot.file, !hasUnsettledTorrentOpen,
-              torrentSaveTask == nil else { throw SPTorrentServerError.cacheRestartBusy }
+              torrentFileSaves.activeCount == 0 else { throw SPTorrentServerError.cacheRestartBusy }
         handleWindowClose()
         // A normal close/new open invalidates this token. Only this deliberate
         // suspension installs it afterwards, so later user navigation wins.
@@ -3722,72 +3727,68 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         refreshPlaylistView()
     }
 
+    /// Cache membership is scoped to the accepted playback/seek generation.
+    /// Unknown anchors remain unknown; old bytes or a distant range do not fill
+    /// the current forward bar merely because the torrent's RAM cache is busy.
+    private var torrentBufferMetrics: SPTorrentBufferMetrics? {
+        guard let context = torrentContext, let core, core.seekSettled,
+              let applied = torrentAppliedPlaybackWindow,
+              applied.leaseID == context.descriptor.leaseID, applied.fileID == context.file.id else { return nil }
+        let source = core.sourcePlaybackWindow
+        guard source.openGeneration >= 0, source.seekGeneration >= 0,
+              source.openGeneration == applied.openGeneration,
+              source.seekGeneration == applied.seekGeneration else { return nil }
+        return SPTorrentBufferMetrics(cache: torrentLastCacheSnapshot, file: context.file,
+            playbackOffset: source.playbackOffset, forwardUpperBound: applied.forwardUpperBound)
+    }
+
     private var torrentPresentation: SPTorrentPlaylistPresentation? {
-        guard torrentContext != nil else { return nil }
-        let saving = torrentSaveTask != nil
+        guard let context = torrentContext else { return nil }
+        let currentSave = torrentFileSaves.snapshot(descriptor: context.descriptor, file: context.file)
         let waiting = core?.state == .opening || core?.sourcePlaybackWaiting == true
         let paused = core?.state == .paused
         let pauseSnapshot = torrentPauseBuffer.snapshot
-        var pauseAction: String?
-        var pauseEnabled = false
-        var details = L("torrent.cachePolicy")
+        let metrics = torrentBufferMetrics
+        let canControl = (paused || core?.state == .playing) && !torrentResolving && torrentCacheRestartToken == nil
+        let resumeBuffer = torrentPauseBufferManuallyStopped || pauseSnapshot.state == .stopped || pauseSnapshot.state == .failed
+        let action: SPTorrentBufferPresentation.Action? = canControl
+            ? (resumeBuffer ? .resumeBuffering : .stopBuffering) : nil
+        let actionTitle = action.map { $0 == .resumeBuffering ? L("torrent.pauseBufferResume") : L("torrent.pauseBufferStop") }
+        let actionEnabled = canControl && (!resumeBuffer || torrentPauseWindowReady)
+        let waitText = core?.sourcePlaybackWaitReason == .pipeline
+            ? L("playback.notice.preparingPlayback") : L("torrent.buffering")
+        let statusText = waiting ? waitText : (paused ? L("torrent.paused") : L("torrent.streaming"))
+        let bufferState: SPTorrentBufferPresentation.State = waiting ? .buffering
+            : (torrentPauseBufferManuallyStopped ? .stopped
+                : (pauseSnapshot.state == .failed ? .failed : (paused ? .paused : .ready)))
+        let secondary: String
+        if metrics == nil { secondary = L("torrent.bufferUnknown") }
+        else if torrentPauseBufferManuallyStopped { secondary = L("torrent.bufferStopped") }
+        else if pauseSnapshot.state == .failed { secondary = L("torrent.bufferRetry") }
+        else { secondary = statusText }
+        var diagnosticLines = [L("torrent.bufferExplanation")]
+        var network: String?
         if let status = torrentLastStatus {
+            let speed = ByteCountFormatter.string(fromByteCount: Int64(status.downloadBytesPerSecond), countStyle: .file)
+            network = String(format: L("torrent.networkRateFormat"), speed)
             let buffered = ByteCountFormatter.string(fromByteCount: status.bufferedBytes, countStyle: .memory)
             let capacity = ByteCountFormatter.string(fromByteCount: status.bufferCapacityBytes > 0
                 ? status.bufferCapacityBytes : (SPTorrentServer.shared.effectiveCacheSizeBytes ?? SPTorrentPreferences.configuration().cacheSizeBytes), countStyle: .memory)
-            if paused && !saving && status.downloadBytesPerSecond < 1 {
-                details = String(format: L("torrent.pausedStatusFormat"), status.activePeers, buffered, capacity)
-            } else {
-                details = String(format: L("torrent.statusFormat"), status.activePeers,
-                    ByteCountFormatter.string(fromByteCount: Int64(status.downloadBytesPerSecond), countStyle: .file),
-                    buffered, capacity)
-            }
+            diagnosticLines.append(String(format: L("torrent.statusFormat"), status.activePeers, speed, buffered, capacity))
         }
         if let cached = torrentLastCacheSnapshot {
-            details += " · " + String(format: L("torrent.currentFileCacheFormat"),
-                ByteCountFormatter.string(fromByteCount: cached.residentBytes, countStyle: .memory))
-            if torrentTimelinePresentation?.mappingAvailable != true ||
-                (torrentTimelinePresentation?.unmappedResidentBytes ?? 0) >= max(1_048_576, cached.pieceLength) {
-                details += " · " + L("torrent.cacheTimelinePending")
-            }
+            diagnosticLines.append(String(format: L("torrent.currentFileCacheFormat"),
+                ByteCountFormatter.string(fromByteCount: cached.residentBytes, countStyle: .memory)))
         }
-        if (paused || core?.state == .playing) && !torrentResolving && torrentCacheRestartToken == nil {
-            switch pauseSnapshot.state {
-            case .filling:
-                let received = ByteCountFormatter.string(fromByteCount: pauseSnapshot.receivedBytes, countStyle: .memory)
-                let budget = ByteCountFormatter.string(fromByteCount: pauseSnapshot.budgetBytes, countStyle: .memory)
-                details += " · " + String(format: L("torrent.pauseBufferFillingFormat"), received, budget)
-                pauseAction = L("torrent.pauseBufferStop")
-                pauseEnabled = true
-            case .filled:
-                details += " · " + L("torrent.pauseBufferFilled")
-                pauseAction = L("torrent.pauseBufferStop")
-                pauseEnabled = true
-            case .waitingForCapacity:
-                details += " · " + L("torrent.pauseBufferWaitingForCapacity")
-                pauseAction = L("torrent.pauseBufferStop")
-                pauseEnabled = true
-            case .stopped:
-                details += " · " + L("torrent.pauseBufferStopped")
-                pauseAction = L("torrent.pauseBufferResume")
-                pauseEnabled = torrentPauseWindowReady
-            case .failed:
-                details += " · " + L("torrent.pauseBufferFailed")
-                pauseAction = L("torrent.pauseBufferResume")
-                pauseEnabled = torrentPauseWindowReady
-            case .idle:
-                if torrentPauseBufferManuallyStopped { details += " · " + L("torrent.pauseBufferStopped") }
-                pauseAction = torrentPauseBufferManuallyStopped ? L("torrent.pauseBufferResume") : L("torrent.pauseBufferStart")
-                pauseEnabled = torrentPauseWindowReady
-            }
-        }
-        let waitText = core?.sourcePlaybackWaitReason == .pipeline
-            ? L("playback.notice.preparingPlayback") : L("torrent.buffering")
-        let statusText = saving ? L("torrent.saving") : (waiting ? waitText : (paused ? L("torrent.paused") : L("torrent.streaming")))
+        let buffer = SPTorrentBufferPresentation(title: L("torrent.bufferAhead"), state: bufferState,
+            primaryValue: metrics.map { ByteCountFormatter.string(fromByteCount: $0.aheadBytes, countStyle: .memory) } ?? "—",
+            secondaryValue: secondary, progress: metrics?.fraction, networkRateText: network,
+            details: diagnosticLines.joined(separator: "\n\n"), detailsTitle: L("torrent.bufferDetails"),
+            action: action, actionTitle: actionTitle, actionEnabled: actionEnabled)
         return SPTorrentPlaylistPresentation(status: statusText,
-            details: details, downloadProgress: saving ? torrentDownloadProgress : nil,
-            isSaving: saving, canSave: !saving && hasMediaSession,
-            pauseBufferAction: pauseAction, pauseBufferEnabled: pauseEnabled)
+            details: L("torrent.cachePolicy"), downloadProgress: currentSave?.isActive == true ? currentSave?.fraction : nil,
+            isSaving: currentSave?.isActive == true, canSave: currentSave?.isActive != true && hasMediaSession,
+            pauseBufferAction: actionTitle, pauseBufferEnabled: actionEnabled, bufferStatus: buffer)
     }
 
     private func startTorrentStatusUpdates() {
@@ -3903,43 +3904,82 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     @objc func saveTorrentFileAction(_ sender: Any?) {
-        guard let context = torrentContext, torrentSaveTask == nil,
+        guard let context = torrentContext else { return }
+        presentTorrentFileSave(context.file, descriptor: context.descriptor)
+    }
+
+    private func saveTorrentPlaylistEntry(_ identity: URL) {
+        guard let context = torrentContext, let file = context.file(for: identity) else { return }
+        presentTorrentFileSave(file, descriptor: context.descriptor)
+    }
+
+    private func cancelTorrentPlaylistEntrySave(_ identity: URL) {
+        guard let context = torrentContext, let file = context.file(for: identity) else { return }
+        torrentFileSaves.cancel(descriptor: context.descriptor, file: file)
+    }
+
+    private func revealTorrentPlaylistEntrySave(_ identity: URL) {
+        guard let context = torrentContext, let file = context.file(for: identity),
+              let snapshot = torrentFileSaves.snapshot(descriptor: context.descriptor, file: file),
+              snapshot.phase == .saved else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([snapshot.destination])
+    }
+
+    /// The panel names the requested playlist file. Its callback must still
+    /// match the visible torrent, but changing the playing episode is harmless.
+    /// Started saves own independent leases and survive subsequent navigation.
+    private func presentTorrentFileSave(_ file: SPTorrentFile, descriptor: SPTorrentDescriptor) {
+        guard torrentCacheRestartToken == nil, hasMediaSession,
+              torrentFileSaves.snapshot(descriptor: descriptor, file: file)?.isActive != true,
               let window = view.window, window.attachedSheet == nil else { return }
+        let token = UUID()
+        torrentSavePanelToken = token
         let panel = NSSavePanel()
         panel.title = L("torrent.saveFile")
-        panel.nameFieldStringValue = context.file.displayName
-        panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let destination = panel.url, let self else { return }
-            self.torrentSaveGeneration &+= 1
-            let generation = self.torrentSaveGeneration
-            self.torrentDownloadProgress = nil
+        panel.nameFieldStringValue = file.displayName
+        panel.beginSheetModal(for: window) { [weak self, weak window] response in
+            guard response == .OK, let destination = panel.url, let self, let window,
+                  self.view.window === window, self.hasMediaSession,
+                  self.torrentSavePanelToken == token, self.torrentCacheRestartToken == nil,
+                  let current = self.torrentContext,
+                  current.descriptor.hash == descriptor.hash,
+                  current.descriptor.files.contains(file) else { return }
             let ownsGrant = destination.startAccessingSecurityScopedResource()
             let replaceExisting = FileManager.default.fileExists(atPath: destination.path)
-            self.torrentSaveTask = Task { @MainActor [weak self] in
-                defer { if ownsGrant { destination.stopAccessingSecurityScopedResource() } }
-                guard let self else { return }
-                do {
-                    _ = try await SPTorrentServer.shared.saveFile(context.descriptor, file: context.file,
-                        to: destination, replaceExisting: replaceExisting) { [weak self] progress in
-                            guard let self, self.torrentSaveGeneration == generation else { return }
-                            self.torrentDownloadProgress = progress.fraction
-                            self.refreshPlaylistView()
-                        }
-                    self.showTransientNotice(L("torrent.saved"))
-                } catch is CancellationError {
-                } catch {
-                    if !Task.isCancelled {
-                        self.presentNonBlockingAlert(message: L("torrent.saveFailed"), informative: self.torrentErrorMessage(error))
+            let accepted = self.torrentFileSaves.start(descriptor: current.descriptor, file: file,
+                to: destination, replaceExisting: replaceExisting) { [weak self] result in
+                    if ownsGrant { destination.stopAccessingSecurityScopedResource() }
+                    // The row keeps the durable outcome; a departed playlist
+                    // must not interrupt a different video with a stale alert.
+                    guard let self, self.torrentContext?.descriptor.hash == descriptor.hash else { return }
+                    if case .failure(let error) = result, !(error is CancellationError) {
+                        self.presentNonBlockingAlert(message: L("torrent.saveFailed"),
+                            informative: self.torrentErrorMessage(error))
                     }
                 }
-                if self.torrentSaveGeneration == generation {
-                    self.torrentSaveTask = nil
-                    self.torrentDownloadProgress = nil
-                    self.refreshPlaylistView()
-                }
-            }
-            self.refreshPlaylistView()
+            if !accepted, ownsGrant { destination.stopAccessingSecurityScopedResource() }
         }
+    }
+
+    private func torrentFileDownloadPresentations(
+        for context: SPTorrentPlaybackContext
+    ) -> [URL: SPTorrentFileSavePresentation] {
+        var result: [URL: SPTorrentFileSavePresentation] = [:]
+        for file in context.playableFiles {
+            guard let snapshot = torrentFileSaves.snapshot(descriptor: context.descriptor, file: file) else { continue }
+            let phase: SPTorrentFileSavePresentation.Phase
+            switch snapshot.phase {
+            case .saving: phase = .saving
+            case .cancelling: phase = .cancelling
+            case .saved: phase = .saved
+            case .failed: phase = .failed
+            case .cancelled: phase = .cancelled
+            }
+            result[context.identityURL(for: file)] = SPTorrentFileSavePresentation(
+                phase: phase, receivedBytes: snapshot.receivedBytes, expectedBytes: snapshot.expectedBytes,
+                failureDescription: snapshot.failureDescription)
+        }
+        return result
     }
 
     // MARK: - Live folder playlists
@@ -4175,7 +4215,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                 }
                 panel.onOpenTorrent = { [weak self] in self?.openTorrentAction(nil) }
                 panel.onSaveTorrentFile = { [weak self] in self?.saveTorrentFileAction(nil) }
-                panel.onCancelTorrentSave = { [weak self] in self?.torrentSaveTask?.cancel() }
+                panel.onCancelTorrentSave = { [weak self] in self?.cancelTorrentSaveAction(nil) }
+                panel.onSaveTorrentEntry = { [weak self] in self?.saveTorrentPlaylistEntry($0) }
+                panel.onCancelTorrentEntrySave = { [weak self] in self?.cancelTorrentPlaylistEntrySave($0) }
+                panel.onRevealTorrentEntrySave = { [weak self] in self?.revealTorrentPlaylistEntrySave($0) }
                 panel.onCancelTorrentOpen = { [weak self] in self?.cancelTorrentOpen() }
                 panel.onTogglePauseBuffer = { [weak self] in self?.toggleTorrentPauseBuffer() }
                 panel.onSelect = { [weak self] url in
@@ -4210,6 +4253,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             autoAdvance: playlistAutoAdvance, isRefreshing: playlistController.isRefreshing,
             error: torrentContext != nil || playlistController.error == nil ? nil : L("playlist.scanFailed"))
         panel.setTorrentPresentation(torrentPresentation)
+        panel.setTorrentFileDownloads(torrentContext.map { torrentFileDownloadPresentations(for: $0) },
+                                      sourceRoot: torrentContext?.rootURL)
     }
 
     private func layoutPlaylist() {
@@ -5543,9 +5588,14 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(saveTorrentFileAction(_:)) {
-            return torrentContext != nil && hasMediaSession && torrentSaveTask == nil
+            guard let context = torrentContext else { return false }
+            return hasMediaSession && torrentCacheRestartToken == nil &&
+                torrentFileSaves.snapshot(descriptor: context.descriptor, file: context.file)?.isActive != true
         }
-        if menuItem.action == #selector(cancelTorrentSaveAction(_:)) { return torrentSaveTask != nil }
+        if menuItem.action == #selector(cancelTorrentSaveAction(_:)) {
+            guard let context = torrentContext else { return false }
+            return torrentFileSaves.snapshot(descriptor: context.descriptor, file: context.file)?.phase == .saving
+        }
         if menuItem.action == #selector(frameInterpolationAction(_:)) {
             return hasVideoSession
         }

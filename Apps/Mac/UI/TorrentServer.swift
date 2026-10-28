@@ -574,6 +574,7 @@ final class SPTorrentServer {
                   replaceExisting: Bool = false,
                   progress: (@MainActor @Sendable (SPTorrentDownloadProgress) -> Void)? = nil) async throws -> URL {
         guard destination.isFileURL else { throw SPTorrentServerError.invalidInput }
+        guard file.id > 0, file.length > 0, descriptor.files.contains(file) else { throw SPTorrentServerError.invalidFile }
         let retained = try retain(descriptor)
         let download = SPTorrentFileDownload()
         downloads[retained.leaseID] = download
@@ -586,8 +587,9 @@ final class SPTorrentServer {
         let url = try streamURL(hash: descriptor.hash, file: file)
         var request = Self.mediaRequest(url)
         request.timeoutInterval = 120
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         return try await download.run(request: request, destination: destination,
-                                      replaceExisting: replaceExisting, progress: progress)
+                                      expectedLength: file.length, replaceExisting: replaceExisting, progress: progress)
     }
 
     /// The UI coordinator closes every playback lease before calling this.
@@ -1029,12 +1031,13 @@ private final class SPTorrentFileDownload: NSObject, URLSessionDownloadDelegate,
     private var session: URLSession?
     private var task: URLSessionDownloadTask?
     private var destination: URL?
+    private var expectedLength: Int64 = 0
     private var replaceExisting = false
     private var cancelled = false
     private var lastProgressAt: TimeInterval = 0
     private var progress: (@MainActor @Sendable (SPTorrentDownloadProgress) -> Void)?
 
-    func run(request: URLRequest, destination: URL, replaceExisting: Bool,
+    func run(request: URLRequest, destination: URL, expectedLength: Int64, replaceExisting: Bool,
              progress: (@MainActor @Sendable (SPTorrentDownloadProgress) -> Void)?) async throws -> URL {
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -1047,6 +1050,7 @@ private final class SPTorrentFileDownload: NSObject, URLSessionDownloadDelegate,
                 }
                 self.continuation = continuation
                 self.destination = destination
+                self.expectedLength = expectedLength
                 self.replaceExisting = replaceExisting
                 self.progress = progress
                 let config = URLSessionConfiguration.ephemeral
@@ -1088,6 +1092,7 @@ private final class SPTorrentFileDownload: NSObject, URLSessionDownloadDelegate,
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         lock.lock()
         let destination = destination
+        let expectedLength = expectedLength
         let replace = replaceExisting
         let cancelled = cancelled
         lock.unlock()
@@ -1095,8 +1100,17 @@ private final class SPTorrentFileDownload: NSObject, URLSessionDownloadDelegate,
             guard !cancelled else { throw CancellationError() }
             guard let response = downloadTask.response as? HTTPURLResponse else { throw SPTorrentServerError.invalidResponse }
             guard response.statusCode == 200 else { throw SPTorrentServerError.http(response.statusCode) }
-            guard let destination else { throw SPTorrentServerError.invalidResponse }
+            guard let destination, expectedLength > 0 else { throw SPTorrentServerError.invalidResponse }
+            let encoding = response.value(forHTTPHeaderField: "Content-Encoding")?.lowercased()
+            guard encoding == nil || encoding == "identity",
+                  response.expectedContentLength < 0 || response.expectedContentLength == expectedLength else {
+                throw SPTorrentServerError.invalidResponse
+            }
             let fm = FileManager.default
+            let attributes = try fm.attributesOfItem(atPath: location.path)
+            guard let size = attributes[.size] as? NSNumber, size.int64Value == expectedLength else {
+                throw SPTorrentServerError.invalidResponse
+            }
             if fm.fileExists(atPath: destination.path) {
                 guard replace else { throw SPTorrentServerError.destinationExists }
                 // Replacement must use a sibling on the destination volume;
