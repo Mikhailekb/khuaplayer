@@ -56,8 +56,12 @@ private enum SPHoldControl { case toggle }
 }
 
 @MainActor private final class SPHoldPanel: NSPanel {
+    var presentationRequests = 0
     override var canBecomeKey: Bool { true }
     override var isKeyWindow: Bool { true }
+    // An old double-click callback may request activation. Record that boundary
+    // without ordering even this owned fixture window onto the user's screen.
+    override func makeKeyAndOrderFront(_ sender: Any?) { presentationRequests += 1 }
 }
 @MainActor private final class SPHoldActionTarget: NSObject {
     var calls = 0
@@ -249,6 +253,16 @@ private enum SPHoldControl { case toggle }
             panel.contentView = owner.playerView
             check(owner.acceptsPoint(CGPoint(x: 100, y: 30)),
                   "main-window chrome exclusion never leaks into relocated PiP video")
+            owner.floatingVideo.isActive = true
+            let point = CGPoint(x: 100, y: 120)
+            SPHoldFixtureInput.pointer = panel.convertPoint(toScreen: point)
+            mouse(owner, panel, down: true, count: 2, point: point)
+            check(owner.floatingVideo.isActive && owner.playerView.window === panel &&
+                  owner.fullscreens == 0 && panel.presentationRequests == 0,
+                  "double click on relocated PiP video leaves PiP active without restoring or fullscreen")
+            mouse(owner, panel, down: false, count: 2, point: point)
+            check(owner.core?.toggles == 0 && owner.core?.rates.isEmpty == true && owner.turbo.owners.isEmpty,
+                  "ignored PiP double click and release do not toggle playback or leave Turbo input")
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }

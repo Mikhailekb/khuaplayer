@@ -778,11 +778,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             guard let self,
                   isVideoPlaybackPoint(playerView.convert(event.locationInWindow, from: nil)) else { return }
             cancelVideoClick()
-            if floatingVideo.isActive {
-                floatingVideo.restore()
-                view.window?.makeKeyAndOrderFront(nil)
-                return
-            }
+            guard !floatingVideo.isActive else { return }
             showControlsTemporarily()
             perform(.toggleFullscreen)
         }
