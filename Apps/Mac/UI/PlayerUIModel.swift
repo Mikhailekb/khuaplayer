@@ -359,6 +359,23 @@ struct ChromePresentation: Equatable {
     var shouldRevealControls: Bool { lifecycle == .ended }
 }
 
+/// Navigation belongs to the active catalogue, independent of whether its
+/// sidebar is open. An invalid or single-item catalogue reserves no controls.
+struct SPPlaylistNavigationPresentation: Equatable {
+    let isVisible: Bool
+    let canPrevious: Bool
+    let canNext: Bool
+
+    init(hasMedia: Bool, count: Int, currentIndex: Int, enabled: Bool = true) {
+        let valid = hasMedia && count > 1 && currentIndex >= 0 && currentIndex < count
+        isVisible = valid
+        canPrevious = valid && enabled && currentIndex > 0
+        canNext = valid && enabled && currentIndex < count - 1
+    }
+
+    static let none = Self(hasMedia: false, count: 0, currentIndex: -1)
+}
+
 enum PlayerPresentationEvent: Equatable {
     case stateChanged(PlayerPresentationLifecycle, PlayerPresentationSnapshot)
     case timelineChanged(position: Double, duration: Double, rate: Double)

@@ -3173,6 +3173,8 @@ final class SPChromeView: NSView, PlayerChromePresenting {
 #endif
 
     var onPlayPause: (() -> Void)?
+    var onPreviousMedia: (() -> Void)?
+    var onNextMedia: (() -> Void)?
     var onScrubBegan: ((Double) -> Void)?
     var onScrubCoarse: ((Double) -> Void)?
     var onScrubEnded: ((Double, Bool) -> Void)?
@@ -3205,6 +3207,9 @@ final class SPChromeView: NSView, PlayerChromePresenting {
 
     private let scrim = CAGradientLayer()
     private let playBtn = SPPlayPauseButton(size: SPM.btnMain)
+    private let previousBtn = SPIconButton(symbol: "backward.end.alt.fill", pointSize: SPM.symAux, size: SPM.btnAux)
+    private let nextBtn = SPIconButton(symbol: "forward.end.alt.fill", pointSize: SPM.symAux, size: SPM.btnAux)
+    private var playlistNavigation = SPPlaylistNavigationPresentation.none
     private let muteBtn = SPIconButton(symbol: "speaker.wave.2.fill", pointSize: SPM.symAux, size: SPM.btnAux)
     private let fsBtn = SPIconButton(symbol: "arrow.up.left.and.arrow.down.right", pointSize: SPM.symAux, size: SPM.btnAux)
     private let pipBtn = SPIconButton(symbol: "pip.enter", pointSize: SPM.symAux, size: SPM.btnAux)
@@ -3218,6 +3223,27 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     private let subtitlesBtn = SPIconButton(symbol: "rectangle", pointSize: SPM.symAux, size: SPM.btnAux)
     private static let subtitlesOutline = makeSubtitlesImage(filled: false)
     private static let subtitlesFilled = makeSubtitlesImage(filled: true)
+    private static func makeSkipImage(previous: Bool) -> NSImage {
+        let image = NSImage(size: NSSize(width: 22, height: 18), flipped: false) { _ in
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            if previous {
+                context.translateBy(x: 22, y: 0)
+                context.scaleBy(x: -1, y: 1)
+            }
+            context.move(to: CGPoint(x: 2, y: 1))
+            context.addLine(to: CGPoint(x: 17, y: 9))
+            context.addLine(to: CGPoint(x: 2, y: 17))
+            context.closePath()
+            context.fillPath()
+            context.addPath(CGPath(roundedRect: CGRect(x: 18, y: 1, width: 2.4, height: 16),
+                                   cornerWidth: 0.8, cornerHeight: 0.8, transform: nil))
+            context.fillPath()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
     private static let playlistImage: NSImage = {
         let image = NSImage(size: NSSize(width: 22, height: 18), flipped: false) { _ in
             guard let context = NSGraphicsContext.current?.cgContext else { return false }
@@ -3364,6 +3390,32 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         layer?.insertSublayer(turboRing, above: scrim)
 
         playBtn.target = self; playBtn.action = #selector(playTapped)
+        previousBtn.target = self; previousBtn.action = #selector(previousTapped)
+        nextBtn.target = self; nextBtn.action = #selector(nextTapped)
+        previousBtn.image = Self.makeSkipImage(previous: true)
+        nextBtn.image = Self.makeSkipImage(previous: false)
+        for (button, label, identifier) in [
+            (previousBtn, L("control.previousVideo"), "sp.chrome.previousVideo"),
+            (nextBtn, L("control.nextVideo"), "sp.chrome.nextVideo")
+        ] {
+            button.toolTip = label
+            button.setAccessibilityLabel(label)
+            button.setAccessibilityIdentifier(identifier)
+            button.refusesFirstResponder = false
+            button.preservesKeyboardFocusOnClick = true
+            button.isHidden = true
+            button.isEnabled = false
+            button.onFocusChanged = { [weak self, weak button] focused in
+                guard let self, let button else { return }
+                if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    noAnim { button.layer?.backgroundColor = focused ? SPT.fillHover.cgColor : nil }
+                } else if focused {
+                    self.glowMove(to: button)
+                } else {
+                    self.glowExit(from: button)
+                }
+            }
+        }
         muteBtn.target = self; muteBtn.action = #selector(muteTapped)
         fsBtn.target = self; fsBtn.action = #selector(fsTapped)
         pipBtn.target = self; pipBtn.action = #selector(pictureInPictureTapped)
@@ -3450,7 +3502,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         }
 
         // Omitted feature chips never enter the view or layout hierarchy.
-        var installedViews: [NSView] = [track, playBtn, volumeGroup]
+        var installedViews: [NSView] = [track, playBtn, previousBtn, nextBtn, volumeGroup]
         if SPFeatures.enhancements { installedViews += [motionBtn] }
         installedViews += [rateChip, playlistBtn, subtitlesBtn, settingsBtn, pipBtn, fsBtn,
                            timeLabel, bubble, previewCard]
@@ -3486,6 +3538,8 @@ final class SPChromeView: NSView, PlayerChromePresenting {
             if inside { self.glowMove(to: b) } else { self.glowExit(from: b) }
         }
         playBtn.onHoverChanged = handler
+        previousBtn.onHoverChanged = handler
+        nextBtn.onHoverChanged = handler
         muteBtn.onHoverChanged = handler
         settingsBtn.onHoverChanged = handler
         playlistBtn.onHoverChanged = handler
@@ -3538,7 +3592,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         // Treat an enter within 0.25 seconds of exit as a handoff.
         let prev = glowButton ?? ((now - lastGlowExit < 0.25) ? lastGlowButton : nil)
         glowButton = b
-        let trio: [NSButton] = [playBtn, muteBtn]
+        let trio: [NSButton] = [playBtn, previousBtn, nextBtn, muteBtn]
         if let prev, prev !== b, let g = activeGlow,
            trio.contains(where: { $0 === prev }), trio.contains(where: { $0 === b }) {
             glowSlide(g, to: target, duration: 0.17)
@@ -3777,28 +3831,40 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         let colX = (bounds.width - colW) / 2
         let byC = SPM.bot + SPM.btnRow / 2
         let compact = colW < 620
-        let actionGap: CGFloat = compact ? 4 : SPM.gapIn
+        let tightPlaylist = playlistNavigation.isVisible && colW < 500
+        let actionGap: CGFloat = tightPlaylist ? 2 : (compact ? 4 : SPM.gapIn)
+        let actionSide: CGFloat = tightPlaylist ? 28 : SPM.btnAux
         volSlider.setCompact(compact)
         volumeGroup.needsLayout = true
-        updateVolumeWidthTarget(volumeGroup.preferredVisualWidth, animated: animateVolume)
-        visibleVolumeWidth = sampleVolumeWidth(at: ProcessInfo.processInfo.systemUptime)
-        let volumeFrame = NSRect(x: playBtn.frame.maxX + SPM.gapIn,
-                                 y: byC - SPM.btnRow / 2,
-                                 width: visibleVolumeWidth,
-                                 height: SPM.btnRow)
-        volumeGroup.frame = volumeFrame
-        volumeGroup.layoutSubtreeIfNeeded()
         var rx = colX + colW
         var rightActions: [NSButton] = [fsBtn, pipBtn, settingsBtn, subtitlesBtn]
         if SPFeatures.enhancements { rightActions.append(motionBtn) }
         rightActions.append(playlistBtn)
         motionBtn.setCompact(compact)
         for button in rightActions {
-            let width = button === motionBtn ? motionBtn.preferredWidth : SPM.btnAux
+            let width = button === motionBtn ? (tightPlaylist ? actionSide : motionBtn.preferredWidth) : actionSide
             button.frame = NSRect(x: rx - width, y: byC - SPM.btnAux / 2,
                                    width: width, height: SPM.btnAux)
             rx = button.frame.minX - actionGap
         }
+        var left = playBtn.frame.maxX
+        if playlistNavigation.isVisible {
+            for button in [previousBtn, nextBtn] {
+                button.frame = NSRect(x: left + actionGap, y: byC - SPM.btnAux / 2,
+                                      width: actionSide, height: SPM.btnAux)
+                left = button.frame.maxX
+            }
+        }
+        let volumeX = left + (tightPlaylist ? 4 : SPM.gapIn)
+        // An expanded volume rail may use the time budget, never the quick
+        // action hit targets. Its clipping group keeps the animation continuous.
+        let volumeBudget = max(SPM.btnAux, rx - volumeX)
+        updateVolumeWidthTarget(min(volumeGroup.preferredVisualWidth, volumeBudget), animated: animateVolume)
+        visibleVolumeWidth = min(volumeBudget, sampleVolumeWidth(at: ProcessInfo.processInfo.systemUptime))
+        let volumeFrame = NSRect(x: volumeX, y: byC - SPM.btnRow / 2,
+                                 width: visibleVolumeWidth, height: SPM.btnRow)
+        volumeGroup.frame = volumeFrame
+        volumeGroup.layoutSubtreeIfNeeded()
         let timeX = volumeFrame.maxX + 8
         let timeBudget = max(0, rx - 8 - timeX)
         let showRate = abs(currentRate - 1) > 0.0001
@@ -3864,7 +3930,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     var ownsKeyboardFocus: Bool {
-        volumeGroup.hasFocusedControl || timeLabel.hasInteractionFocus || motionBtn.hasInteractionFocus || pipBtn.hasInteractionFocus
+        volumeGroup.hasFocusedControl || timeLabel.hasInteractionFocus || motionBtn.hasInteractionFocus || pipBtn.hasInteractionFocus || previousBtn.hasInteractionFocus || nextBtn.hasInteractionFocus
     }
 
     func settingsButtonRect(in parent: NSView) -> NSRect {
@@ -4112,6 +4178,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
             b.alphaValue = locked ? 0.4 : 1
         }
         track.interactionLocked = locked
+        updatePlaylistNavigationButtons()
 
         turboFrozenMotion = locked ? motionPresentation : nil
         guard !isHidden else { return }
@@ -4177,6 +4244,23 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         playlistBtn.setAccessibilityValue(shown ? L("chrome.a11y.on") : L("chrome.a11y.off"))
     }
 
+    func setPlaylistNavigation(_ presentation: SPPlaylistNavigationPresentation) {
+        guard presentation != playlistNavigation else { return }
+        playlistNavigation = presentation
+        updatePlaylistNavigationButtons()
+        glowReset()
+        if bounds.width > 0 { layoutRightControls() }
+    }
+
+    private func updatePlaylistNavigationButtons() {
+        previousBtn.isHidden = !playlistNavigation.isVisible
+        nextBtn.isHidden = !playlistNavigation.isVisible
+        previousBtn.isEnabled = playlistNavigation.canPrevious && !turboLocked
+        nextBtn.isEnabled = playlistNavigation.canNext && !turboLocked
+        previousBtn.alphaValue = previousBtn.isEnabled ? 1 : 0.35
+        nextBtn.alphaValue = nextBtn.isEnabled ? 1 : 0.35
+    }
+
     func setPictureInPictureSelected(_ selected: Bool) {
         pipBtn.showsSelection = selected
         pipBtn.state = selected ? .on : .off
@@ -4188,6 +4272,14 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
 
     @objc private func playTapped() { onPlayPause?() }
+    @objc private func previousTapped() {
+        guard !previousBtn.isHidden, previousBtn.isEnabled else { return }
+        onPreviousMedia?()
+    }
+    @objc private func nextTapped() {
+        guard !nextBtn.isHidden, nextBtn.isEnabled else { return }
+        onNextMedia?()
+    }
     @objc private func muteTapped() { onMute?() }
     @objc private func fsTapped() { onFullscreen?() }
     @objc private func pictureInPictureTapped() { onPictureInPicture?() }

@@ -901,6 +901,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func transitionPresentation(_ event: PlayerPresentationEvent) {
         chromePresentation = PlayerPresentationReducer.reduce(chromePresentation, event)
         chromePresenter?.render(chromePresentation)
+        refreshPlaylistNavigationControls()
         refreshPlaybackSettings(force: false)
     }
 
@@ -1160,6 +1161,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private func setupNewChrome() {
         let c = SPChromeView()
         c.onPlayPause = { [weak self] in self?.perform(.togglePlayback) }
+        c.onPreviousMedia = { [weak self] in self?.navigatePlaylist(forward: false) }
+        c.onNextMedia = { [weak self] in self?.navigatePlaylist(forward: true) }
+        c.setPlaylistNavigation(playlistNavigationPresentation)
         // Clicks and drags remain coarse keyframe seeks. This keeps each step
         // visible and its latency independent of GOP decode length.
         c.onScrubBegan = { [weak self] target in
@@ -2782,6 +2786,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             currentMediaIndex = 0
         }
 
+        refreshPlaylistNavigationControls()
+
         scheduleDirectorySubtitleRanking(snapshot, for: mediaURL,
                                          generation: generation,
                                          uiLanguage: uiLanguage)
@@ -3718,6 +3724,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         let generation = torrentOpenGeneration
         torrentOpenTask?.cancel()
         torrentResolving = true
+        refreshPlaylistNavigationControls()
         let ownsFileGrant = file?.startAccessingSecurityScopedResource() == true
         showTorrentLoading(L("torrent.resolving"), detail: L("torrent.cachePolicy"))
         torrentOpenTask = Task { @MainActor [weak self] in
@@ -3754,7 +3761,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                           }) else { throw SPTorrentHistoryOpenError.fileMissing }
                     selected = file
                 } else {
-                    guard let first = descriptor.files.first(where: \.isPlayable) else { throw SPTorrentServerError.noPlayableFiles }
+                    guard let first = SPTorrentPlaybackContext.orderedPlayableFiles(in: descriptor).first
+                    else { throw SPTorrentServerError.noPlayableFiles }
                     selected = first
                 }
                 self.torrentResolving = false
@@ -3967,6 +3975,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func updateTorrentLoadingForCoreState(_ state: SPPlayerState) {
+        refreshPlaylistNavigationControls()
         if torrentResolving { return }
         if torrentContext != nil, state == .opening {
             showTorrentLoading(L("torrent.buffering"), detail: torrentPresentation?.details)
@@ -3979,6 +3988,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         torrentOpenTask?.cancel()
         torrentOpenTask = nil
         torrentResolving = false
+        refreshPlaylistNavigationControls()
         torrentLoadingView?.isHidden = true
         if !resolving, torrentContext != nil, core?.state == .opening { handleWindowClose() }
     }
@@ -4179,12 +4189,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private static func playlistPathLess(_ lhs: String, _ rhs: String) -> Bool {
-        let left = lhs.split(separator: "/"), right = rhs.split(separator: "/")
-        for (a, b) in zip(left, right) {
-            let order = String(a).localizedStandardCompare(String(b))
-            if order != .orderedSame { return order == .orderedAscending }
-        }
-        return left.count == right.count ? lhs < rhs : left.count < right.count
+        SPPlaylistOrder.pathLess(lhs, rhs)
     }
 
     private func savePlaylistProfile() {
@@ -4365,6 +4370,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func refreshPlaylistView() {
+        refreshPlaylistNavigationControls()
         guard isPlaylistShown, let panel = playlistPanel else { return }
         panel.configure(root: torrentContext?.rootURL ?? playlistController.rootURL,
             entries: torrentContext?.entries ?? playlistController.entries,
@@ -4374,6 +4380,26 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         panel.setTorrentPresentation(torrentPresentation)
         panel.setTorrentFileDownloads(torrentContext.map { torrentFileDownloadPresentations(for: $0) },
                                       sourceRoot: torrentContext?.rootURL)
+    }
+
+    private var playlistNavigationPresentation: SPPlaylistNavigationPresentation {
+        let ready = core.map { $0.state == .ready || $0.state == .playing ||
+            $0.state == .paused || $0.state == .ended } ?? false
+        let currentMatches = mediaList.indices.contains(currentMediaIndex) &&
+            playbackIdentityURL?.standardizedFileURL == mediaList[currentMediaIndex].standardizedFileURL
+        return SPPlaylistNavigationPresentation(hasMedia: hasMediaSession && currentMatches,
+            count: mediaList.count, currentIndex: currentMediaIndex,
+            enabled: ready && !torrentResolving && torrentCacheRestartToken == nil)
+    }
+
+    private func refreshPlaylistNavigationControls() {
+        chrome?.setPlaylistNavigation(playlistNavigationPresentation)
+    }
+
+    private func navigatePlaylist(forward: Bool) {
+        let navigation = playlistNavigationPresentation
+        guard forward ? navigation.canNext : navigation.canPrevious else { return }
+        perform(forward ? .nextMedia : .previousMedia)
     }
 
     private func layoutPlaylist() {
@@ -4392,7 +4418,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         guard currentMediaIndex >= 0, currentMediaIndex + 1 < mediaList.count else { return }
         let keepPlaylistOpen = isPlaylistShown
         open(url: mediaList[currentMediaIndex + 1])
-        if keepPlaylistOpen { setPlaylistShown(true) }
+        setPlaylistShown(keepPlaylistOpen)
     }
 
     func playPreviousMedia() {
@@ -4402,7 +4428,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         guard currentMediaIndex > 0, currentMediaIndex < mediaList.count else { return }
         let keepPlaylistOpen = isPlaylistShown
         open(url: mediaList[currentMediaIndex - 1])
-        if keepPlaylistOpen { setPlaylistShown(true) }
+        setPlaylistShown(keepPlaylistOpen)
     }
 
     private var playlistFolderAccessRequestable: Bool {
@@ -6193,6 +6219,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func showPlaybackFeedback(isPlaying: Bool) {
+        // PiP has its own hover-only play/pause control. The main player's
+        // decorative echo must not follow the relocated video into that window.
+        guard !floatingVideo.isActive else {
+            playbackFeedback?.dismiss()
+            return
+        }
         let feedback: SPPlaybackFeedbackView
         if let existing = playbackFeedback {
             feedback = existing
@@ -6251,7 +6283,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func relocateVideoOverlays() {
-        if let feedback = playbackFeedback { placeVideoOverlay(feedback); feedback.place(in: playerView.frame) }
+        if let feedback = playbackFeedback {
+            if floatingVideo.isActive { feedback.dismiss() }
+            else { placeVideoOverlay(feedback); feedback.place(in: playerView.frame) }
+        }
         if let feedback = seekFeedback { placeVideoOverlay(feedback); feedback.place(in: playerView.frame) }
         if let feedback = volumeFeedback { placeVideoOverlay(feedback); feedback.place(in: volumeFeedbackBounds) }
         if playbackNotice != nil { layoutPlaybackNotice() }

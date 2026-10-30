@@ -456,7 +456,13 @@ private final class SPFloatingVideoSliderCell: NSSliderCell {
     var bufferedRanges: [ClosedRange<Double>] = []
     var showsBufferedRanges = false
     override func drawBar(inside rect: NSRect, flipped: Bool) {
-        let track = NSRect(x: rect.minX, y: rect.midY - 1.5, width: rect.width, height: 3)
+        // Native slider tracking leaves half a knob at both ends. Use the same
+        // travel range for the painted rail, then the native rounded position
+        // for the fill endpoint instead of a second full-width calculation.
+        let nativeKnob = knobRect(flipped: flipped)
+        let inset = min(max(0, rect.width / 2), nativeKnob.width / 2)
+        let track = NSRect(x: rect.minX + inset, y: rect.midY - 1.5,
+                           width: max(0, rect.width - 2 * inset), height: 3)
         NSColor.white.withAlphaComponent(0.35).setFill()
         NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
         if showsBufferedRanges {
@@ -469,10 +475,10 @@ private final class SPFloatingVideoSliderCell: NSSliderCell {
             }
             NSGraphicsContext.restoreGraphicsState()
         }
-        let fraction = maxValue > minValue ? min(1, max(0, (doubleValue - minValue) / (maxValue - minValue))) : 0
+        let end = min(track.maxX, max(track.minX, nativeKnob.midX))
         NSColor.white.setFill()
         NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY,
-            width: track.width * fraction, height: track.height), xRadius: 1.5, yRadius: 1.5).fill()
+            width: max(0, end - track.minX), height: track.height), xRadius: 1.5, yRadius: 1.5).fill()
     }
     override func drawKnob(_ rect: NSRect) {
         let knob = NSRect(x: rect.midX - 3.5, y: rect.midY - 3.5, width: 7, height: 7)

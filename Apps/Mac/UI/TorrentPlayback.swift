@@ -76,6 +76,26 @@ struct SPTorrentPlaybackContext: Sendable {
     let descriptor: SPTorrentDescriptor
     let file: SPTorrentFile
     let streamURL: URL
+    private let orderedFiles: [SPTorrentFile]
+
+    init(descriptor: SPTorrentDescriptor, file: SPTorrentFile, streamURL: URL) {
+        self.descriptor = descriptor
+        self.file = file
+        self.streamURL = streamURL
+        orderedFiles = Self.orderedPlayableFiles(in: descriptor)
+    }
+
+    static func orderedPlayableFiles(in descriptor: SPTorrentDescriptor) -> [SPTorrentFile] {
+        descriptor.files.filter(\.isPlayable).sorted {
+            SPPlaylistOrder.pathLess(displayRelativePath(for: $0, in: descriptor),
+                                     displayRelativePath(for: $1, in: descriptor))
+        }
+    }
+
+    private static func displayRelativePath(for file: SPTorrentFile, in descriptor: SPTorrentDescriptor) -> String {
+        let prefix = descriptor.name + "/"
+        return file.path.hasPrefix(prefix) ? String(file.path.dropFirst(prefix.count)) : file.path
+    }
 
     var rootURL: URL {
         let title = (descriptor.name as NSString).lastPathComponent
@@ -86,7 +106,7 @@ struct SPTorrentPlaybackContext: Sendable {
             .appendingPathComponent(safeTitle, isDirectory: true)
     }
 
-    var playableFiles: [SPTorrentFile] { descriptor.files.filter(\.isPlayable) }
+    var playableFiles: [SPTorrentFile] { orderedFiles }
     var identityURL: URL { identityURL(for: file) }
 
     func identityURL(for file: SPTorrentFile) -> URL {
@@ -95,8 +115,7 @@ struct SPTorrentPlaybackContext: Sendable {
 
     var entries: [SPPlaylistEntry] {
         playableFiles.map { item in
-            let prefix = descriptor.name + "/"
-            let relative = item.path.hasPrefix(prefix) ? String(item.path.dropFirst(prefix.count)) : item.path
+            let relative = Self.displayRelativePath(for: item, in: descriptor)
             return SPPlaylistEntry(url: identityURL(for: item), relativePath: relative,
                 displayName: item.displayName, isGrowing: false)
         }

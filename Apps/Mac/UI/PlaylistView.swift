@@ -786,8 +786,9 @@ final class SPPlaylistView: NSView, NSOutlineViewDataSource, NSOutlineViewDelega
         }
         func sort(_ node: SPPlaylistNode) {
             node.children.sort {
-                if $0.isFolder != $1.isFolder { return $0.isFolder }
-                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                SPPlaylistOrder.nodeLess($0.name, $1.name,
+                    leftIsFolder: $0.isFolder, rightIsFolder: $1.isFolder,
+                    leftKey: $0.key, rightKey: $1.key)
             }
             node.children.filter(\.isFolder).forEach(sort)
         }

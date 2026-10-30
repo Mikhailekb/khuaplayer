@@ -12,6 +12,31 @@ struct SPPlaylistEntry: Equatable, Sendable {
     let isGrowing: Bool
 }
 
+/// One order for the visible tree and Previous/Next: folders first, then
+/// natural names at each level, traversed depth first. Identity stays unchanged.
+enum SPPlaylistOrder {
+    static func nodeLess(_ leftName: String, _ rightName: String,
+                         leftIsFolder: Bool, rightIsFolder: Bool,
+                         leftKey: String, rightKey: String) -> Bool {
+        if leftIsFolder != rightIsFolder { return leftIsFolder }
+        let order = leftName.localizedStandardCompare(rightName)
+        return order == .orderedSame ? leftKey < rightKey : order == .orderedAscending
+    }
+
+    static func pathLess(_ lhs: String, _ rhs: String) -> Bool {
+        let left = lhs.split(separator: "/"), right = rhs.split(separator: "/")
+        for i in 0..<min(left.count, right.count) {
+            let leftFolder = i < left.count - 1, rightFolder = i < right.count - 1
+            if left[i] == right[i] && leftFolder == rightFolder { continue }
+            let a = String(left[i]), b = String(right[i])
+            return nodeLess(leftFolder ? a : (a as NSString).deletingPathExtension,
+                rightFolder ? b : (b as NSString).deletingPathExtension,
+                leftIsFolder: leftFolder, rightIsFolder: rightFolder, leftKey: a, rightKey: b)
+        }
+        return left.count == right.count ? lhs < rhs : left.count < right.count
+    }
+}
+
 private final class SPPlaylistCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
@@ -392,7 +417,7 @@ final class SPPlaylistController {
             try files.sort {
                 comparisons &+= 1
                 if comparisons & 255 == 0, cancellation.isCancelled { throw CancellationError() }
-                return naturalPathLess($0.relativePath, $1.relativePath)
+                return SPPlaylistOrder.pathLess($0.relativePath, $1.relativePath)
             }
         } catch { return .cancelled }
         var nextEntries: [SPPlaylistEntry] = []
@@ -434,17 +459,6 @@ final class SPPlaylistController {
             type?.conforms(to: .bundle) == true
         cache[ext] = isPackage
         return isPackage
-    }
-
-    private nonisolated static func naturalPathLess(_ lhs: String, _ rhs: String) -> Bool {
-        let left = lhs.split(separator: "/", omittingEmptySubsequences: false)
-        let right = rhs.split(separator: "/", omittingEmptySubsequences: false)
-        for (a, b) in zip(left, right) {
-            let order = String(a).localizedStandardCompare(String(b))
-            if order != .orderedSame { return order == .orderedAscending }
-        }
-        if left.count != right.count { return left.count < right.count }
-        return lhs < rhs
     }
 
     private nonisolated static func posixError(_ code: Int32, path: String) -> String {

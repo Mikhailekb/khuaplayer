@@ -56,8 +56,8 @@ struct PlaylistFilesystemChecks {
         controller.setRoot(root, recursive: true)
         let recursiveReady = wait(5) { !controller.isRefreshing && controller.entries.count == 7 }
         check(recursiveReady, "recursive scan includes season directories without entering packages or symlink cycles")
-        check(controller.entries.map(\.relativePath) == ["E1.MP4", "E2.mp4", "E10.mp4", "Season 2/E1.mp4", "Season 2/E2.mp4", "Season 2/E10.mp4", "Season 10/E1.mp4"],
-              "recursive natural order preserves episode and season number order")
+        check(controller.entries.map(\.relativePath) == ["Season 2/E1.mp4", "Season 2/E2.mp4", "Season 2/E10.mp4", "Season 10/E1.mp4", "E1.MP4", "E2.mp4", "E10.mp4"],
+              "recursive natural order matches the visible folders-first season tree")
         check(controller.contains(root.appendingPathComponent("Season 10/E1.mp4")), "controller root membership remains independent of immediate parent directory")
         spin(0.8)
         let live = root.appendingPathComponent("Season 2/E3.mp4")

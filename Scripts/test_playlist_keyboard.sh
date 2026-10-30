@@ -5,7 +5,23 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CHECK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/khua-playlist-keyboard.XXXXXX")"
 trap 'rm -rf "$CHECK_DIR"' EXIT
 
+python3 - "$ROOT" "$CHECK_DIR" <<'PY'
+from pathlib import Path
+import sys
+root, scratch = map(Path, sys.argv[1:])
+source = (root / 'Apps/Mac/UI/Playlist.swift').read_text()
+start = source.index('enum SPPlaylistOrder {')
+brace = source.index('{', start)
+depth, end = 1, brace + 1
+while depth:
+    if source[end] == '{': depth += 1
+    elif source[end] == '}': depth -= 1
+    end += 1
+(scratch / 'PlaylistOrder.swift').write_text('import Foundation\n' + source[start:end] + '\n')
+PY
+
 xcrun swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library \
+  "$CHECK_DIR/PlaylistOrder.swift" \
   "$ROOT/Apps/Mac/UI/PlaylistView.swift" "$ROOT/Apps/Mac/UI/TorrentViews.swift" \
   "$ROOT/Apps/Mac/UI/TorrentBufferStatusView.swift" "$ROOT/Scripts/tests/playlist_keyboard.swift" \
   -o "$CHECK_DIR/playlist-keyboard-checks"
@@ -39,6 +55,7 @@ pathlib.Path(sys.argv[2]).write_text(source)
 PY
   xcrun swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library \
     -D PLAYLIST_KEYBOARD_BASELINE "$CHECK_DIR/PlaylistView-baseline.swift" \
+    "$CHECK_DIR/PlaylistOrder.swift" \
     "$ROOT/Apps/Mac/UI/TorrentViews.swift" "$ROOT/Apps/Mac/UI/TorrentBufferStatusView.swift" \
     "$ROOT/Scripts/tests/playlist_keyboard.swift" -o "$CHECK_DIR/baseline-checks"
   set +e

@@ -37,6 +37,9 @@ struct FloatingVideoChecks {
     }
 
     static func barWhite(_ slider: NSSlider, at fraction: Double) -> Double {
+        let originalFrame = slider.frame
+        slider.setFrameSize(NSSize(width: 400, height: 20))
+        defer { slider.frame = originalFrame }
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 400, pixelsHigh: 20,
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
@@ -44,14 +47,53 @@ struct FloatingVideoChecks {
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)!
         NSColor.black.setFill()
         NSRect(x: 0, y: 0, width: 400, height: 20).fill()
-        (slider.cell as! NSSliderCell).drawBar(inside: NSRect(x: 0, y: 0, width: 400, height: 20), flipped: false)
+        (slider.cell as! NSSliderCell).draw(withFrame: slider.bounds, in: slider)
         NSGraphicsContext.restoreGraphicsState()
         return bitmap.colorAt(x: Int(fraction * 400), y: 10)!.usingColorSpace(.deviceRGB)!.redComponent
+    }
+
+    static func sliderGeometryChecks() {
+        for width: CGFloat in [60, 100, 200, 400] {
+            let slider = SPFloatingVideoSlider(frame: NSRect(x: 0, y: 0, width: width, height: 20))
+            slider.minValue = 0; slider.maxValue = 100
+            let cell = slider.cell as! NSSliderCell
+            for value: Double in [72, 0, 25, 50, 90, 100] {
+                slider.doubleValue = value
+                let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(width * 4), pixelsHigh: 80,
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)!
+                NSGraphicsContext.current!.cgContext.scaleBy(x: 4, y: 4)
+                NSColor.black.setFill(); slider.bounds.fill()
+                // Use native drawing dispatch so AppKit publishes this frame's
+                // knob geometry before the overridden bar is painted.
+                cell.draw(withFrame: slider.bounds, in: slider)
+                // Inspect the filled bar without the circular thumb covering
+                // its endpoint; the native layout above remains unchanged.
+                NSColor.black.setFill(); slider.bounds.fill()
+                cell.drawBar(inside: cell.barRect(flipped: slider.isFlipped), flipped: slider.isFlipped)
+                NSGraphicsContext.restoreGraphicsState()
+                let knob = cell.knobRect(flipped: false)
+                let center = knob.midX
+                if value > 0 {
+                    let before = bitmap.colorAt(x: Int((center - 2) * 4), y: 40)!.usingColorSpace(.deviceRGB)!.redComponent
+                    expect(before > 0.95, "White fill reaches the native thumb centre at \(value)% / \(width)pt")
+                }
+                if center + 2 < width {
+                    let after = bitmap.colorAt(x: Int((center + 2) * 4), y: 40)!.usingColorSpace(.deviceRGB)!.redComponent
+                    expect(after < 0.45, "White fill never extends beyond the native thumb centre at \(value)% / \(width)pt")
+                }
+                expect(center >= knob.width / 2 && center <= width - knob.width / 2,
+                       "Thumb travel keeps the native endpoint insets")
+            }
+        }
     }
 
     static func main() throws {
         setbuf(stdout, nil)
         NSApplication.shared.setActivationPolicy(.prohibited)
+        sliderGeometryChecks()
         let source = NSWindow(contentRect: NSRect(x: -2000, y: -2000, width: 640, height: 360),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         source.isReleasedWhenClosed = false
