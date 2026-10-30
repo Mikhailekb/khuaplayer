@@ -22,14 +22,19 @@ enum SPTimelineStyleSettings {
 }
 // Peripheral Dust dependency is deterministic. The real progress view still
 // exercises its dynamic layer insertion, style changes and interaction paths.
-final class SPDustHost {
+@MainActor final class SPDustHost {
     static let enabled = false
+    static var latest: SPDustHost?
+    var buffered: [ClosedRange<Double>] = []
+    var showsBuffered = false
+    init() { Self.latest = self }
     let layer = CALayer()
     func attach(to view: NSView) { layer.name = "test.dust" }
     func detach() {}
     func setGeometry(bounds: CGRect, scale: CGFloat) { layer.frame = bounds }
     func setSnapshot(_ snapshot: SPThumbDustSnapshot?, duration: Double) {}
     func setDamage(bands: [SPDamageBand], duration: Double) {}
+    func setBufferedRanges(_ ranges: [ClosedRange<Double>], visible: Bool) { buffered = ranges; showsBuffered = visible }
     func setSplit(_ split: CGFloat) {}
     func setVisible(_ visible: Bool) {}
     func pointerEntered(x: CGFloat) {}
@@ -126,14 +131,28 @@ struct BufferedTimelineChecks {
                "Leaving the timeline restores the resting rail height")
         view.setDustEnabled(true)
         let dust = view.layer!.sublayers!.first { $0.name == "test.dust" }!
-        expect(shape(view, "base").zPosition > dust.zPosition && !shape(view, "base").isHidden,
-               "Dynamically inserted Dust cannot obscure the cached rail")
+        expect(shape(view, "base").isHidden && shape(view, "ranges").isHidden && shape(view, "played").isHidden,
+               "Particle style hides every solid cache rail instead of covering its grains")
+        expect(SPDustHost.latest?.buffered == [0.5...0.6] && SPDustHost.latest?.showsBuffered == true,
+               "Enabling particle style transfers current resident ranges to the renderer")
+        view.setBufferedRanges([0.2...0.25, 0.6...0.9], visible: true)
+        expect(SPDustHost.latest?.buffered == [0.2...0.25, 0.6...0.9],
+               "Cache changes reach the particle renderer while the solid rail remains hidden")
+        expect(dust.superlayer === view.layer, "Particle layer stays attached to the progress view")
         view.setDamage(bands: [.init(cls: SPDamageBand.partial, from: 2, until: 3)], duration: 10)
         let overlays = view.layer!.sublayers!.compactMap { $0 as? CAShapeLayer }
-        expect(overlays.contains { $0.zPosition == 15 && !$0.isHidden && $0.path != nil },
-               "Damage indicators remain above the cache rail even with Dust enabled")
+        expect(overlays.filter { $0.zPosition == 15 }.allSatisfy { $0.isHidden },
+               "Damage is presented by particles without rectangular overlays")
         view.setBufferedRanges([], visible: false)
-        expect(shape(view, "base").isHidden, "Disabling cache mode restores the original particle presentation")
+        expect(shape(view, "base").isHidden && SPDustHost.latest?.showsBuffered == false && SPDustHost.latest?.buffered.isEmpty == true,
+               "Disabling cache mode clears particle coverage and keeps solid layers hidden")
+        view.setBufferedRanges([0.4...0.5], visible: true)
+        view.setDustEnabled(false)
+        expect(!shape(view, "base").isHidden && !shape(view, "ranges").isHidden,
+               "Returning to a solid style restores its current cache rail")
+        view.setDustEnabled(true)
+        expect(SPDustHost.latest?.buffered == [0.4...0.5] && shape(view, "base").isHidden,
+               "Returning to particles transfers the latest coverage without a stale rail")
         view.setDustEnabled(false)
         view.setDamage(bands: [], duration: 0)
         view.setValue(0.2)

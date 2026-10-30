@@ -6,22 +6,42 @@ struct SPPlaylistAudioPreference: Codable, Equatable {
     private let language: String
     private let codec: String
     private let channels: Int
+    // For tracks with no distinct label, remember the selected position within
+    // the same metadata cohort, never an absolute container stream index.
+    private var indistinguishableOrdinal: Int?
+    private var indistinguishableCount: Int?
 
-    init?(track: [String: Any]) {
-        let identity = Track(track)
-        guard !identity.voice.isEmpty || !identity.language.isEmpty else { return nil }
+    init?(selectedIndex: Int, in tracks: [[String: Any]]) {
+        guard let selected = tracks.first(where: { Track($0).index == selectedIndex }) else { return nil }
+        self.init(identity: Track(selected))
+        let identity = Track(selected)
+        let equivalents = tracks.map(Track.init).filter { $0.index >= 0 && $0.sameIdentity(as: identity) }
+        if let ordinal = equivalents.firstIndex(where: { $0.index == selectedIndex }) {
+            indistinguishableOrdinal = ordinal
+            indistinguishableCount = equivalents.count
+        }
+    }
+
+    private init(identity: Track) {
         voice = identity.voice
         language = identity.language
         codec = identity.codec
         channels = identity.channels
     }
 
+    init?(track: [String: Any]) {
+        let identity = Track(track)
+        guard !identity.voice.isEmpty || !identity.language.isEmpty else { return nil }
+        self.init(identity: identity)
+    }
+
     func bestMatch(in tracks: [[String: Any]]) -> Int? {
         var candidates = tracks.map(Track.init).filter { $0.index >= 0 }
         if voice.isEmpty {
-            // Language alone cannot distinguish two different dubbed voices.
-            candidates = candidates.filter { $0.language == language }
-            return candidates.count == 1 ? candidates.first?.index : nil
+            candidates = candidates.filter { $0.language == language && (!language.isEmpty || $0.voice.isEmpty) }
+            if let count = indistinguishableCount, count > 1 { return indistinguishableMatch(in: candidates) }
+            if candidates.count == 1 { return candidates.first?.index }
+            return indistinguishableMatch(in: candidates)
         }
         candidates = candidates.filter { $0.voice == voice }
         if !language.isEmpty {
@@ -31,6 +51,7 @@ struct SPPlaylistAudioPreference: Codable, Equatable {
         } else if Set(candidates.map(\.language).filter { !$0.isEmpty }).count > 1 {
             return nil
         }
+        if let count = indistinguishableCount, count > 1 { return indistinguishableMatch(in: candidates) }
         if candidates.count == 1 { return candidates.first?.index }
         // Encoding changes between episodes are harmless. Codec/channel count
         // only disambiguate otherwise identical named voices; ties stay unset.
@@ -38,9 +59,20 @@ struct SPPlaylistAudioPreference: Codable, Equatable {
             (track.index, (!codec.isEmpty && track.codec == codec ? 1 : 0)
                 + (channels > 0 && track.channels == channels ? 1 : 0))
         }
-        guard let best = scored.map(\.1).max(), best > 0 else { return nil }
+        guard let best = scored.map(\.1).max(), best > 0 else {
+            return indistinguishableMatch(in: candidates)
+        }
         let winners = scored.filter { $0.1 == best }
-        return winners.count == 1 ? winners.first?.0 : nil
+        if winners.count == 1 { return winners.first?.0 }
+        return indistinguishableMatch(in: candidates)
+    }
+
+    private func indistinguishableMatch(in tracks: [Track]) -> Int? {
+        let equivalent = tracks.filter { $0.voice == voice && $0.language == language &&
+            $0.codec == codec && $0.channels == channels }
+        guard let ordinal = indistinguishableOrdinal, let count = indistinguishableCount,
+              equivalent.count == count, equivalent.indices.contains(ordinal) else { return nil }
+        return equivalent[ordinal].index
     }
 
     private struct Track {
@@ -49,6 +81,10 @@ struct SPPlaylistAudioPreference: Codable, Equatable {
         var language = ""
         var codec = ""
         var channels = 0
+
+        func sameIdentity(as other: Self) -> Bool {
+            voice == other.voice && language == other.language && codec == other.codec && channels == other.channels
+        }
 
         init(_ track: [String: Any]) {
             index = track["index"] as? Int ?? -1
@@ -177,7 +213,9 @@ struct SPPlaylistAudioPreference: Codable, Equatable {
         if unspecified.contains(where: { normalized($0) == value }) { return true }
         let prefixes = ["Audio track", "Audiospur", "Pista de audio", "Piste audio", "Trek audio",
                         "Traccia audio", "音声トラック", "오디오 트랙", "Audiospoor", "Ścieżka dźwiękowa",
-                        "Faixa de áudio", "Звуковая дорожка", "แทร็กเสียง", "Ses parçası", "Bản âm thanh", "音轨", "音訊軌道"]
+                        "Faixa de áudio", "Звуковая дорожка", "แทร็กเสียง", "Ses parçası", "Bản âm thanh", "音轨", "音訊軌道",
+                        "Subtitle track", "Subtitle", "Untertitel", "Subtítulo", "Sous-titre", "Subtitel",
+                        "Sottotitolo", "字幕", "자막", "Napisy", "Legenda", "Субтитры", "คำบรรยาย", "Altyazı", "Phụ đề"]
         return prefixes.contains { prefix in
             let prefix = normalized(prefix)
             guard value.hasPrefix(prefix) else { return false }
@@ -187,8 +225,30 @@ struct SPPlaylistAudioPreference: Codable, Equatable {
     }
 }
 
+/// Off is an explicit choice. A missing match leaves this preference intact so
+/// a later episode which contains the selected subtitles can restore it again.
+enum SPPlaylistSubtitlePreference: Codable, Equatable {
+    case off
+    case embedded(SPPlaylistAudioPreference)
+
+    init?(selectedIndex: Int, in tracks: [[String: Any]]) {
+        if selectedIndex < 0 { self = .off }
+        else if let preference = SPPlaylistAudioPreference(selectedIndex: selectedIndex, in: tracks) {
+            self = .embedded(preference)
+        } else { return nil }
+    }
+
+    func bestMatch(in tracks: [[String: Any]]) -> Int? {
+        switch self {
+        case .off: return -1
+        case .embedded(let preference): return preference.bestMatch(in: tracks)
+        }
+    }
+}
+
 struct SPPlaylistProfile: Codable, Equatable {
     var audio: SPPlaylistAudioPreference?
+    var subtitle: SPPlaylistSubtitlePreference?
     var brightness: Double = 0
     var contrast: Double = 0
     var saturation: Double = 0

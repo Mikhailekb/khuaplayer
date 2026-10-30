@@ -2449,6 +2449,7 @@ final class SPProgressView: NSView {
         guard bufferedRanges != normalized || showsBufferedRanges != visible else { return }
         bufferedRanges = normalized
         showsBufferedRanges = visible
+        dust?.setBufferedRanges(normalized, visible: visible)
         updateTrackVisibility()
         relayout()
     }
@@ -2535,6 +2536,7 @@ final class SPProgressView: NSView {
             damageNoneLayer.isHidden = true
             damagePendingLayer.isHidden = true
             d.setDamage(bands: damageBands, duration: damageDuration)
+            d.setBufferedRanges(bufferedRanges, visible: showsBufferedRanges)
             if bounds.width > 0 {
                 d.setGeometry(bounds: bounds, scale: window?.backingScaleFactor ?? 2)
                 d.setSplit(bounds.width * CGFloat(value))
@@ -2557,10 +2559,14 @@ final class SPProgressView: NSView {
     private func updateTrackVisibility() {
         remainLayer.isHidden = dust != nil || showsBufferedRanges
         fillLayer.isHidden = dust != nil || showsBufferedRanges
-        for l in [bufferedBaseLayer, bufferedLayer, bufferedPlayedLayer] { l.isHidden = !showsBufferedRanges }
-        knobLayer.isHidden = dust != nil && !showsBufferedRanges
+        // The particle renderer owns its cache and damage presentation. A solid
+        // rail (or a separate knob) would cover the gaps between its grains.
+        for l in [bufferedBaseLayer, bufferedLayer, bufferedPlayedLayer] {
+            l.isHidden = dust != nil || !showsBufferedRanges
+        }
+        knobLayer.isHidden = dust != nil
         for l in [damagePendingLayer, damagePartialLayer, damageNoneLayer] {
-            l.isHidden = dust != nil && !showsBufferedRanges
+            l.isHidden = dust != nil
         }
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -2696,7 +2702,7 @@ final class SPProgressView: NSView {
     }
 
     private func updateBufferedTrack(halfBase: CGFloat, duration: CFTimeInterval, cancelInFlight: Bool) {
-        guard showsBufferedRanges else { return }
+        guard showsBufferedRanges, dust == nil else { return }
         let full = trackPath(from: 0, to: bounds.width, halfBase: halfBase)
         let played = trackPath(from: 0, to: bounds.width * CGFloat(value), halfBase: halfBase)
         let mask = CGMutablePath()

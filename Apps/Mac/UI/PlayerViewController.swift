@@ -753,6 +753,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             guard let self else { return }
             self.activeExternalSubtitleURL = nil
             self.userTouchedSubtitleSelection = true
+            self.playlistProfile.subtitle = nil
+            self.savePlaylistProfile()
             self.refreshPlaybackSettings()
         }
         c.onDisplaySelection = { [weak self] in
@@ -3104,6 +3106,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             self.activeGrantedSubtitleURL = url
 #endif
             self.activeExternalSubtitleURL = url
+            // A subtitle file belongs to this episode; never reopen that same
+            // file against the next episode or resurrect a prior embedded choice.
+            self.playlistProfile.subtitle = nil
+            self.savePlaylistProfile()
             if spDebugEnabled {
                 NSLog("[SubScan] 手动加载生效: %@", url.lastPathComponent)
             }
@@ -3317,9 +3323,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         profile.mirror = currentMirror
         profile.motionMode = core.frameInterpolationMode.rawValue
         profile.xdr = core.xdrEnabled
-        if let track = core.audioTrackList.first(where: {
-            ($0["index"] as? NSNumber)?.intValue == core.currentAudioTrackIndex
-        }) as? [String: Any] { profile.audio = SPPlaylistAudioPreference(track: track) }
+        if let selection = SPPlaylistAudioPreference(selectedIndex: core.currentAudioTrackIndex,
+            in: core.audioTrackList.compactMap { $0 as? [String: Any] }) { profile.audio = selection }
         return SPTorrentCacheRestartSnapshot(owner: ObjectIdentifier(self), token: UUID(),
             descriptor: context.descriptor, file: context.file, position: core.position,
             wasPlaying: core.state == .playing || burstWasPlaying || scrollSeekWasPlaying,
@@ -4211,12 +4216,51 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         core.xdrEnabled = profile.xdr
         applyHDRViewingPreference()
-        if let index = profile.audio?.bestMatch(in: core.audioTrackList.compactMap { $0 as? [String: Any] }),
-           index != core.currentAudioTrackIndex {
+        restorePlaylistTrackPreferences()
+        refreshPlaybackSettings()
+    }
+
+    private func rememberPlaylistAudioSelection(_ index: Int) {
+        guard let core else { return }
+        if let preference = SPPlaylistAudioPreference(selectedIndex: index,
+            in: core.audioTrackList.compactMap { $0 as? [String: Any] }) {
+            playlistProfile.audio = preference
+        }
+    }
+
+    private func rememberPlaylistSubtitleSelection(_ index: Int) {
+        guard let core else { return }
+        if let preference = SPPlaylistSubtitlePreference(selectedIndex: index,
+            in: core.subtitleTrackList.compactMap { $0 as? [String: Any] }) {
+            playlistProfile.subtitle = preference
+        }
+    }
+
+    private func restorePlaylistTrackPreferences() {
+        guard let core else { return }
+        let audio = playlistProfile.audio?.bestMatch(in: core.audioTrackList.compactMap { $0 as? [String: Any] })
+        if let index = audio, index != core.currentAudioTrackIndex {
             yieldDirectoryScanToForegroundIO()
             core.selectAudioTrack(at: index)
         }
-        refreshPlaybackSettings()
+        if let preference = playlistProfile.subtitle {
+            // An explicit embedded/Off choice outranks the later directory
+            // autoload. Missing tracks stay off for this episode, while the
+            // remembered choice survives for a later episode that has it.
+            userTouchedSubtitleSelection = true
+            let index = preference.bestMatch(in: core.subtitleTrackList.compactMap { $0 as? [String: Any] }) ?? -1
+            if index >= 0 { lastQuickSubtitleID = "embedded:\(index)" }
+            cancelTorrentSubtitleBackgroundJob()
+            torrentSubtitleBackgroundSuppressed = index < 0
+            if index != core.currentSubtitleTrackIndex {
+                pauseTorrentBackgroundJobsForSeek()
+                cancelTorrentPauseBuffer()
+                cancelTorrentPlaybackWindowPolicy()
+                if index >= 0 { yieldDirectoryScanToForegroundIO() }
+                core.selectSubtitleTrack(at: index)
+                startTorrentPlaybackWindowPolicyIfNeeded()
+            }
+        }
     }
 
     private func schedulePlaylistAdvanceIfFinished(_ core: SPPlayerCore) {
@@ -5057,6 +5101,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         case .showMediaInfo:
             presentMediaInfo()
         case .selectSubtitleTrack(let index):
+            rememberPlaylistSubtitleSelection(index)
             cancelTorrentSubtitleBackgroundJob()
             torrentSubtitleBackgroundSuppressed = index < 0
             recordPlaybackDiagnostic(.control, control: .setSubtitleTrack, commandValue: Double(index))
@@ -5074,9 +5119,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             recordPlaybackDiagnostic(.control, control: .setAudioTrack, commandValue: Double(index))
             cancelTorrentPauseBuffer()
             cancelTorrentPlaybackWindowPolicy()
-            if let track = core?.audioTrackList.first(where: { ($0["index"] as? NSNumber)?.intValue == index }) as? [String: Any] {
-                playlistProfile.audio = SPPlaylistAudioPreference(track: track)
-            }
+            rememberPlaylistAudioSelection(index)
             if core?.currentAudioTrackIndex != index {
                 yieldDirectoryScanToForegroundIO()
                 resetVolumeBoostForNewSource()

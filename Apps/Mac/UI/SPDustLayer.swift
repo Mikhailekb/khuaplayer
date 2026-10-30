@@ -447,6 +447,13 @@ final class SPDustHost: NSObject {
     private var grains: [SPDustGrain] = []
     private var firstFrame = true
 
+    // Resident torrent ranges are independent of thumbnail coverage. Classify
+    // each grain at its exact media coordinate, rather than rounding to the
+    // two-point thumbnail bins (which could paint across an uncached gap).
+    private var bufferedRanges: [ClosedRange<Double>] = []
+    private var showsBufferedRanges = false
+    private var bufferedParticles: [Bool] = []
+
     // Interaction state.
     private var split: Float = 0
     private var px: Float = -10_000
@@ -570,6 +577,28 @@ final class SPDustHost: NSObject {
         kick()
     }
     private var pendingSnapshot: SPThumbDustSnapshot?
+
+    func setBufferedRanges(_ ranges: [ClosedRange<Double>], visible: Bool) {
+        let normalized = visible ? SPBufferedTimeline.normalized(ranges) : []
+        guard bufferedRanges != normalized || showsBufferedRanges != visible else { return }
+        bufferedRanges = normalized
+        showsBufferedRanges = visible
+        rebuildBufferedParticles()
+        kick()
+    }
+
+    private func rebuildBufferedParticles() {
+        guard showsBufferedRanges, W > 0, !home.isEmpty else {
+            bufferedParticles = []
+            return
+        }
+        var next = 0
+        bufferedParticles = home.map { x in
+            let fraction = Double(x) / Double(W)
+            while next < bufferedRanges.count && bufferedRanges[next].upperBound <= fraction { next += 1 }
+            return next < bufferedRanges.count && bufferedRanges[next].lowerBound <= fraction
+        }
+    }
     // Resilient playback damage bands (bucket-level channel): 0 fluent, 1 partial, 2 none, 3 not downloaded yet; healthy files pass an empty array at zero cost.
     private var damageBands: [SPDamageBand] = []
     private var damageBins: [UInt8] = []
@@ -684,6 +713,7 @@ final class SPDustHost: NSObject {
         born = Array(repeating: 0, count: n)
         grains = Array(repeating: SPDustGrain(pos: .zero, size: 0, lum: 0, col: SIMD4(1, 1, 1, 0)), count: n)
         firstFrame = true
+        rebuildBufferedParticles()
         allocBuffers()
     }
 
@@ -793,7 +823,13 @@ final class SPDustHost: NSObject {
         for i in 0..<n {
             let hx = home[i]
             let bi = min(B - 1, max(0, Int(hx * binScale)))
+            let cached = bufferedParticles.isEmpty ? false : bufferedParticles[i]
+            let cacheAhead = showsBufferedRanges && hx > split
             var dv = bins.alive[bi]
+            // Cached grains remain readable before preview thumbnails arrive.
+            // Uncached grains keep the sparse guide instead of borrowing the
+            // thumbnail scanner's coverage as proof that video is resident.
+            if cacheAhead { dv = cached ? max(dv, 0.82) : min(dv, 0.16) }
             let br = bins.bright[bi]
             // Reduce unplayed non-rail survival for unavailable and pending regions.
             // The guide rail stays present. Later color mapping uses amber for partial
@@ -870,6 +906,16 @@ final class SPDustHost: NSObject {
                 // hue and keep resting particles within the layer's SDR range.
                 let m = max(col.x, max(col.y, col.z))
                 if m > 1 { col /= m }
+            }
+            if cacheAhead {
+                col = SIMD3(repeating: 1)
+                if cached {
+                    // A denser, light-neutral cloud marks resident media. Keep
+                    // every mark a particle, including while hovering/dragging.
+                    L = max(L, (isRail ? 0.58 : 0.30) * bn)
+                } else {
+                    L *= 0.24
+                }
             }
             if dmg == 1 {
                 col = col * 0.45 + SIMD3<Float>(1.0, 0.62, 0.18) * 0.55

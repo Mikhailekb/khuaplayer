@@ -107,11 +107,22 @@ jobs:
           ./Scripts/test_video_context_policy.sh
           ./Scripts/test_floating_video.sh
           ./Scripts/test_buffered_timeline.sh
+          if ./Scripts/test_particle_buffered_timeline.sh; then
+            :
+          else
+            status=$?
+            if [ "$status" -eq 77 ]; then
+              echo "SKIP: no Metal device available for particle timeline checks"
+            else
+              exit "$status"
+            fi
+          fi
           ./Scripts/test_cached_timeline.sh
           ./Scripts/test_source_playback_waiting.sh
           ./Scripts/test_torrent_cache_timeline.sh
           ./Scripts/test_torrent_cache_polling.sh
           ./Scripts/test_playlist_filesystem.sh
+          ./Scripts/test_playlist_track_inheritance.sh
           ./Scripts/test_playlist_keyboard.sh
           ./Scripts/test_playlist_file_download_rows.sh
           ./Scripts/test_torrent_file_saves.sh

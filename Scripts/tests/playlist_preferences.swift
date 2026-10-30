@@ -34,6 +34,7 @@ struct PlaylistPreferencesChecks {
         rawAudioMatchingChecks()
         conservativeAudioMatchingChecks()
         legacyAudioMatchingChecks()
+        try explicitTrackAndSubtitleChecks()
         try profileChecks()
         try storeChecks()
         rememberedRootChecks()
@@ -209,6 +210,66 @@ struct PlaylistPreferencesChecks {
             ["index": 19, "title": "NewStudio · Russian · PCM_S24LE 6 ch"],
             ["index": 20, "title": "LostFilm · Russian · AAC 2 ch"]
         ]), 20, "Legacy PCM codec decorations do not become part of the voice identity")
+    }
+
+    private static func explicitTrackAndSubtitleChecks() throws {
+        let unnamed = [audio(index: 2, language: "und"), audio(index: 8, language: "und")]
+        let preference = SPPlaylistAudioPreference(selectedIndex: 8, in: unnamed)!
+        expect(preference.bestMatch(in: [audio(index: 12, language: "und"), audio(index: 17, language: "und")]),
+               17, "Explicit untagged track remembers its cohort position after stream indices change")
+        expect(preference.bestMatch(in: [audio(index: 12, language: "und")]), nil,
+               "A second unnamed track cannot become the first after its cohort shrinks")
+        expect(preference.bestMatch(in: [audio(index: 11, voice: "Unrelated Studio", language: "und")]),
+               nil, "An unidentified voice does not switch to a newly named unknown-language voice")
+        expect(SPPlaylistAudioPreference(selectedIndex: 999, in: unnamed), nil, "An absent selection creates no preference")
+        let named = SPPlaylistAudioPreference(selectedIndex: 2, in: [audio(index: 2, voice: "LostFilm", language: "ru")])!
+        expect(named.bestMatch(in: [audio(index: 8, voice: "NewStudio", language: "ru")]), nil,
+               "Explicit capture preserves the named-voice guard")
+        let languages = [audio(index: 2, language: "ru"), audio(index: 3, language: "ru")]
+        let second = SPPlaylistAudioPreference(selectedIndex: 3, in: languages)!
+        expect(second.bestMatch(in: [audio(index: 30, language: "ru"), audio(index: 40, language: "ru")]), 40,
+               "Explicit language-only choice resolves equal metadata by cohort position")
+        expect(second.bestMatch(in: [audio(index: 30, language: "ru"), audio(index: 40, language: "ru"), audio(index: 50, language: "ru")]),
+               nil, "A changed indistinguishable cohort is not guessed by absolute stream index")
+        let subs: [[String: Any]] = [["index": 3, "title": "Русский"], ["index": 8, "title": "English SDH"]]
+        let subtitle = SPPlaylistSubtitlePreference(selectedIndex: 8, in: subs)!
+        expect(subtitle.bestMatch(in: [["index": 8, "title": "Русский"], ["index": 18, "title": "English SDH"]]),
+               18, "Subtitle identity follows title rather than the reused previous stream index")
+        expect(subtitle.bestMatch(in: [["index": 18, "title": "English Forced"]]), nil,
+               "Full/SDH and forced subtitle labels stay distinct")
+        let russian = SPPlaylistSubtitlePreference(selectedIndex: 3, in: subs)!
+        expect(russian.bestMatch(in: [["index": 20, "title": "Russian"]]), 20,
+               "Language-only subtitle names survive the display language changing")
+        expect(russian.bestMatch(in: [["index": 20, "title": "English"]]), nil,
+               "Subtitle matching does not cross languages")
+        let generic = SPPlaylistSubtitlePreference(selectedIndex: 12, in: [["index": 5, "title": "Субтитры 1"], ["index": 12, "title": "Субтитры 2"]])!
+        expect(generic.bestMatch(in: [["index": 31, "title": "Subtitle track 1"], ["index": 41, "title": "Subtitle track 2"]]),
+               41, "Unlabelled subtitle ordinal ignores localized generated labels and container indices")
+        expect(generic.bestMatch(in: [["index": 31, "title": "Subtitle track 1"]]), nil,
+               "A missing second generic subtitle cannot silently become the remaining first")
+        let duplicateNamed = SPPlaylistAudioPreference(selectedIndex: 7,
+            in: [audio(index: 3, voice: "Studio", language: "ru"), audio(index: 7, voice: "Studio", language: "ru")])!
+        expect(duplicateNamed.bestMatch(in: [audio(index: 19, voice: "Studio", language: "ru")]), nil,
+               "An indistinguishable named cohort also cannot shrink into an arbitrary unique choice")
+        expect(SPPlaylistSubtitlePreference(selectedIndex: -1, in: subs)?.bestMatch(in: subs), -1,
+               "Off is an explicit stored subtitle selection")
+        expect(SPPlaylistSubtitlePreference(selectedIndex: 999, in: subs), nil,
+               "Invalid subtitle selection cannot erase a remembered choice")
+        var profile = SPPlaylistProfile()
+        profile.audio = preference; profile.subtitle = subtitle; profile.gamma = 13
+        let encoded = try JSONEncoder().encode(profile)
+        expect(try JSONDecoder().decode(SPPlaylistProfile.self, from: encoded), profile,
+               "Audio cohort and embedded subtitle preferences survive persistence")
+        profile.subtitle = .off
+        expect(try JSONDecoder().decode(SPPlaylistProfile.self, from: JSONEncoder().encode(profile)), profile,
+               "Explicit Off survives persistence")
+        var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(SPPlaylistProfile())) as! [String: Any]
+        legacy.removeValue(forKey: "subtitle")
+        legacy["audio"] = ["voice": "lostfilm", "language": "ru", "codec": "ac3", "channels": 6]
+        let old = try JSONDecoder().decode(SPPlaylistProfile.self, from: JSONSerialization.data(withJSONObject: legacy))
+        expect(old.subtitle, nil, "Older saved image/audio profiles without subtitles remain readable")
+        expect(old.audio?.bestMatch(in: [audio(index: 20, voice: "LostFilm", language: "ru")]), 20,
+               "Older audio identities without ordinal fields remain readable")
     }
 
     private static func profileChecks() throws {
