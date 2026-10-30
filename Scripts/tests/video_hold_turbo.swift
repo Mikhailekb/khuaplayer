@@ -19,10 +19,22 @@ private enum SPHoldState { case playing, paused, ended, opening }
     func play() { state = .playing; toggles += 1 }
     func pause() { state = .paused; toggles += 1 }
 }
-@MainActor private final class SPHoldChrome {
+@MainActor private final class SPHoldChrome: NSView {
     var phase: SPTurboGesture.Phase = .idle
+    let track = NSView(frame: NSRect(x: 20, y: 70, width: 600, height: 22))
+    let button = NSButton(frame: NSRect(x: 20, y: 16, width: 44, height: 44))
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 640, height: 150))
+        addSubview(track); addSubview(button)
+    }
+    required init?(coder: NSCoder) { fatalError() }
     func setTurboPhase(_ phase: SPTurboGesture.Phase) { self.phase = phase }
     func playVolumeBoostInvitation() {}
+    // INSERT_PRODUCTION_CHROME_METHODS
+}
+@MainActor private final class SPHoldFloating {
+    var isActive = false
+    func restore() { isActive = false }
 }
 @MainActor private final class SPHoldHUD {
     var visible = false
@@ -32,7 +44,7 @@ private enum SPHoldState { case playing, paused, ended, opening }
     func engage(baseRate: Double, rate: Double) { visible = true; active = true }
     func dismiss() { visible = false; active = false }
 }
-private enum SPHoldCommand { case togglePlayback }
+private enum SPHoldCommand { case togglePlayback, toggleFullscreen }
 private enum SPHoldPresentation { case playbackRateChanged(Double) }
 private enum SPHoldDiagnostic { case control }
 private enum SPHoldControl { case toggle }
@@ -46,6 +58,10 @@ private enum SPHoldControl { case toggle }
 @MainActor private final class SPHoldPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var isKeyWindow: Bool { true }
+}
+@MainActor private final class SPHoldActionTarget: NSObject {
+    var calls = 0
+    @objc func tapped(_ sender: Any?) { calls += 1 }
 }
 
 @MainActor private final class SPHoldOwner {
@@ -70,7 +86,10 @@ private enum SPHoldControl { case toggle }
     var openPanelQuietPrewarmWork: DispatchWorkItem?
     var view: NSView { playerView }
     var feedback: [Bool] = []
+    let floatingVideo = SPHoldFloating()
+    var fullscreens = 0
     init() {
+        // INSERT_PRODUCTION_DOUBLE_CLICK
         playerView.onMouseDown = { [weak self] in self?.noteVideoMouseDown($0) }
         playerView.onMouseUp = { [weak self] in self?.resolveClickCandidate($0) }
         playerView.onKeyDown = { [weak self] event in
@@ -86,7 +105,13 @@ private enum SPHoldControl { case toggle }
         if let clickUpMonitor { NSEvent.removeMonitor(clickUpMonitor); self.clickUpMonitor = nil }
     }
     func cancelPlaybackScroll(resumePlayback: Bool = true) {}
-    func perform(_ command: SPHoldCommand) { togglePlaybackNow() }
+    func perform(_ command: SPHoldCommand) {
+        switch command {
+        case .togglePlayback: togglePlaybackNow()
+        case .toggleFullscreen: fullscreens += 1
+        }
+    }
+    func showControlsTemporarily() {}
     func stopRepeat(resumePlayback: Bool = true) { repeatOwnerKeyCode = nil }
     func yieldDirectoryScanToForegroundIO() {}
     func setMotionCompare(_ on: Bool) { compareActive = on }
@@ -99,6 +124,7 @@ private enum SPHoldControl { case toggle }
     func poll() { validateVideoHold() }
     func cancel() { cancelVideoClick() }
     func lifecycleEnd() { endTurbo(reason: "settingsOrSession") }
+    func acceptsPoint(_ point: NSPoint) -> Bool { isVideoPlaybackPoint(point) }
     // INSERT_PRODUCTION_METHODS
 }
 
@@ -120,13 +146,15 @@ private enum SPHoldControl { case toggle }
             let owner = SPHoldOwner()
             let window = SPHoldWindow(contentRect: NSRect(x: 100, y: 100, width: 640, height: 400),
                                       styleMask: [.borderless], backing: .buffered, defer: false)
-            window.contentView = owner.playerView
+            let root = NSView(frame: owner.playerView.frame)
+            root.addSubview(owner.playerView); root.addSubview(owner.chrome!)
+            window.contentView = root
             return (owner, window)
         }
         func mouse(_ owner: SPHoldOwner, _ window: NSWindow, down: Bool, count: Int = 1,
-                   flags: NSEvent.ModifierFlags = []) {
+                   flags: NSEvent.ModifierFlags = [], point: NSPoint = CGPoint(x: 100, y: 100)) {
             let event = NSEvent.mouseEvent(with: down ? .leftMouseDown : .leftMouseUp,
-                location: CGPoint(x: 100, y: 100), modifierFlags: flags,
+                location: point, modifierFlags: flags,
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                 context: nil, eventNumber: 1, clickCount: count, pressure: down ? 1 : 0)!
             if down { owner.playerView.mouseDown(with: event) }
@@ -138,6 +166,89 @@ private enum SPHoldControl { case toggle }
                 windowNumber: owner.playerView.window!.windowNumber, context: nil,
                 characters: " ", charactersIgnoringModifiers: " ", isARepeat: repeatKey, keyCode: 49)!
             if down { owner.playerView.keyDown(with: event) } else { owner.playerView.keyUp(with: event) }
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            let chrome = owner.chrome!
+            for x: CGFloat in [1, 100, 320, 639] {
+                check(chrome.hitTest(CGPoint(x: x, y: 65)) === chrome,
+                      "empty strip below timeline consumes clicks across full window width")
+            }
+            check(chrome.hitTest(CGPoint(x: 35, y: 30)) === chrome.button,
+                  "real control child keeps priority over inert strip")
+            check(chrome.hitTest(CGPoint(x: 100, y: 81)) === chrome.track,
+                  "timeline keeps its own pointer target")
+            check(chrome.hitTest(CGPoint(x: 100, y: 120)) == nil,
+                  "empty chrome above timeline still passes through to video")
+            let target = SPHoldActionTarget()
+            chrome.button.target = target; chrome.button.action = #selector(SPHoldActionTarget.tapped(_:))
+            chrome.button.performClick(nil)
+            check(target.calls == 1, "button action still executes through AppKit")
+            let event = NSEvent.mouseEvent(with: .leftMouseDown, location: CGPoint(x: 320, y: 30),
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+            chrome.mouseDown(with: event); chrome.mouseUp(with: event)
+            check(owner.core?.toggles == 0 && owner.turbo.owners.isEmpty,
+                  "empty strip responder methods do not forward a video press")
+        }
+        for hidden in [false, true] {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            owner.chrome?.isHidden = hidden
+            mouse(owner, window, down: true, point: CGPoint(x: 320, y: 30))
+            wait(0.30)
+            check(owner.turbo.owners.isEmpty && owner.core?.rates.isEmpty == true,
+                  "lower strip cannot start Turbo even if chrome is hidden: \(hidden)")
+            mouse(owner, window, down: false, point: CGPoint(x: 320, y: 30))
+            check(owner.core?.toggles == 0 && owner.feedback.isEmpty,
+                  "lower strip cannot pause or resume playback: \(hidden)")
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            // Two points of movement remain within the click jitter tolerance;
+            // the live timeline boundary must independently reject release.
+            SPHoldFixtureInput.pointer = window.convertPoint(toScreen: CGPoint(x: 100, y: 82))
+            mouse(owner, window, down: true, point: CGPoint(x: 100, y: 82))
+            SPHoldFixtureInput.pointer.y -= 2
+            mouse(owner, window, down: false, point: CGPoint(x: 100, y: 80))
+            check(owner.core?.toggles == 0 && owner.turbo.owners.isEmpty,
+                  "native-up-first crossing below timeline cannot become a stray tap")
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            SPHoldFixtureInput.pointer = window.convertPoint(toScreen: CGPoint(x: 100, y: 82))
+            mouse(owner, window, down: true, point: CGPoint(x: 100, y: 82))
+            SPHoldFixtureInput.pointer.y -= 2; owner.poll(); wait(0.30)
+            mouse(owner, window, down: false, point: CGPoint(x: 100, y: 80))
+            check(owner.core?.rates.isEmpty == true && owner.core?.toggles == 0,
+                  "watchdog crossing below timeline cancels charge and trailing tap")
+        }
+        do {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            mouse(owner, window, down: true, count: 2, point: CGPoint(x: 320, y: 30))
+            mouse(owner, window, down: false)
+            check(owner.fullscreens == 0 && owner.core?.toggles == 0,
+                  "double click below timeline cannot toggle fullscreen or pause")
+            mouse(owner, window, down: true, count: 2, point: CGPoint(x: 320, y: 120))
+            check(owner.fullscreens == 1, "double click above timeline keeps fullscreen action")
+        }
+        do {
+            let (owner, _) = fixture(); defer { owner.shutdown() }
+            owner.playerView.setFrameSize(NSSize(width: 1280, height: 720))
+            owner.chrome?.setFrameSize(NSSize(width: 1280, height: 200))
+            owner.chrome?.track.frame = NSRect(x: 80, y: 150, width: 1120, height: 22)
+            check(!owner.acceptsPoint(CGPoint(x: 1, y: 160)) &&
+                  !owner.acceptsPoint(CGPoint(x: 1279, y: 160)),
+                  "resized exclusion uses actual timeline position and both side margins")
+            check(owner.acceptsPoint(CGPoint(x: 640, y: 162)),
+                  "resized point just above timeline remains a video surface")
+        }
+        do {
+            let (owner, _) = fixture(); defer { owner.shutdown() }
+            let panel = SPHoldPanel(contentRect: NSRect(x: 10, y: 10, width: 640, height: 400),
+                                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.contentView = owner.playerView
+            check(owner.acceptsPoint(CGPoint(x: 100, y: 30)),
+                  "main-window chrome exclusion never leaks into relocated PiP video")
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }

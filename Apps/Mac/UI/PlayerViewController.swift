@@ -774,8 +774,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         playerView.frame = view.bounds
         playerView.autoresizingMask = []
-        playerView.onDoubleClick = { [weak self] in
-            guard let self else { return }
+        playerView.onDoubleClick = { [weak self] event in
+            guard let self,
+                  isVideoPlaybackPoint(playerView.convert(event.locationInWindow, from: nil)) else { return }
             cancelVideoClick()
             if floatingVideo.isActive {
                 floatingVideo.restore()
@@ -1596,13 +1597,23 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var videoClick = SPVideoClickGesture()
     nonisolated(unsafe) private var clickUpMonitor: Any?
 
+    private func isVideoPlaybackPoint(_ point: NSPoint) -> Bool {
+        guard playerView.bounds.contains(point) else { return false }
+        // PiP relocates the same PlayerView to another window. Its controls own
+        // their own input; never apply the main window's chrome geometry there.
+        if let chrome, chrome.window === playerView.window,
+           chrome.videoGestureExclusionRect(in: playerView).contains(point) { return false }
+        return true
+    }
+
     private func noteVideoMouseDown(_ event: NSEvent) {
         cancelVideoClick()
         guard let win = playerView.window else { return }
         videoClick.mouseDown(clickCount: event.clickCount,
                              eligible: event.type == .leftMouseDown &&
                                 !event.modifierFlags.contains(.control) && hasMediaSession &&
-                                win.attachedSheet == nil && !isSettingsPanelShown && !isPlaylistShown,
+                                win.attachedSheet == nil && !isSettingsPanelShown && !isPlaylistShown &&
+                                isVideoPlaybackPoint(playerView.convert(event.locationInWindow, from: nil)),
                              windowOrigin: win.frame.origin, pointer: NSEvent.mouseLocation)
         if videoClick.isTracking {
             beginTurbo(owner: .mouse)
@@ -1671,7 +1682,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         cancelClickCandidateIfDragged()
         guard turbo.hasOwner(.mouse) else { return }
         let point = playerView.convert(win.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
-        guard playerView.bounds.contains(point) else { cancelVideoClick(); return }
+        guard isVideoPlaybackPoint(point) else { cancelVideoClick(); return }
         if NSEvent.pressedMouseButtons & 1 == 0 { finishVideoPress(sameWindow: true) }
     }
 
@@ -1690,7 +1701,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             return
         }
         let point = playerView.convert(win.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
-        guard playerView.bounds.contains(point),
+        guard isVideoPlaybackPoint(point),
               let token = videoClick.mouseUp(sameWindow: sameWindow,
                                              windowOrigin: win.frame.origin,
                                              pointer: NSEvent.mouseLocation) else {

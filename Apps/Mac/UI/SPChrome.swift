@@ -3709,10 +3709,26 @@ final class SPChromeView: NSView, PlayerChromePresenting {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    /// The entire strip under the timeline belongs to controls, including the
+    /// empty gaps and side margins. Keep this geometry available while hidden
+    /// so a press which reveals chrome cannot also toggle the underlying video.
+    func videoGestureExclusionRect(in targetView: NSView) -> NSRect {
+        let height = max(0, min(bounds.height, track.frame.midY - bounds.minY))
+        return convert(NSRect(x: bounds.minX, y: bounds.minY,
+                              width: bounds.width, height: height), to: targetView)
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         let v = super.hitTest(point)
-        return v === self ? nil : v
+        guard v === self else { return v }
+        let local = convert(point, from: superview)
+        return videoGestureExclusionRect(in: self).contains(local) ? self : nil
     }
+
+    // Do not forward clicks on empty control chrome into the responder chain.
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+    override var mouseDownCanMoveWindow: Bool { false }
 
     func layoutChrome(in parentBounds: NSRect) {
         let chromeFrame = NSRect(x: 0, y: 0, width: parentBounds.width, height: SPM.scrimH)

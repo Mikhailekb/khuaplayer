@@ -24,6 +24,13 @@ def function(signature):
         end += 1
     return source[start:end]
 methods = '    private var videoClick' + region('    private var videoClick', '    private var videoActionIdentity:')
+if baseline := os.environ.get('VIDEO_HOLD_SURFACE_BASELINE_SOURCE'):
+    old = pathlib.Path(baseline).read_text()
+    start, end = '    private var videoClick', '    private var videoActionIdentity:'
+    methods = start + old.split(start, 1)[1].split(end, 1)[0]
+    # Keep the fixture's geometry query available while exercising the exact
+    # previous controller routing which accepted the whole video view.
+    methods += '\n' + function('    private func isVideoPlaybackPoint(_ point: NSPoint) -> Bool')
 if baseline := os.environ.get('VIDEO_HOLD_BASELINE_SOURCE'):
     old = pathlib.Path(baseline).read_text()
     start, end = '    private var videoClick', '    private var videoActionIdentity:'
@@ -34,6 +41,7 @@ if baseline := os.environ.get('VIDEO_HOLD_BASELINE_SOURCE'):
     methods += '\n' + function('    private func startVideoHoldMonitor()')
     methods += '\n' + function('    private func validateVideoHold()')
     methods += '\n' + function('    private func finishVideoPress(sameWindow: Bool)')
+    methods += '\n' + function('    private func isVideoPlaybackPoint(_ point: NSPoint) -> Bool')
 for signature in ['    private static func turboAllowedKey(_ event: NSEvent) -> Bool',
                   '    private func togglePlaybackNow()',
                   '    private func handleKeyUp(_ event: NSEvent)',
@@ -50,7 +58,16 @@ methods = methods.replace('SPTurboSettings.isEnabled', 'SPHoldFixtureInput.enabl
 methods = methods.replace('SPTurboSettings.rate', 'SPHoldFixtureInput.configuredRate')
 fixture = (root / 'Scripts/tests/video_hold_turbo.swift').read_text()
 assert fixture.count('    // INSERT_PRODUCTION_METHODS') == 1
-(output / 'checks.swift').write_text(fixture.replace('    // INSERT_PRODUCTION_METHODS', methods))
+chrome = (root / 'Apps/Mac/UI/SPChrome.swift').read_text()
+start, end = '    func videoGestureExclusionRect(in targetView: NSView)', '    func layoutChrome(in parentBounds: NSRect)'
+assert chrome.count(start) == 1 and chrome.count(end) == 1
+chrome_methods = start + chrome.split(start, 1)[1].split(end, 1)[0]
+start, end = '        playerView.onDoubleClick = { [weak self] event in', '        playerView.onMouseDown ='
+assert source.count(start) == 1
+double_click = start + source.split(start, 1)[1].split(end, 1)[0]
+(output / 'checks.swift').write_text(fixture.replace('    // INSERT_PRODUCTION_METHODS', methods)
+    .replace('    // INSERT_PRODUCTION_CHROME_METHODS', chrome_methods)
+    .replace('        // INSERT_PRODUCTION_DOUBLE_CLICK', double_click))
 # Guard the production call sites which are intentionally outside this focused
 # projection (full controller compilation is the application build's job).
 assert 'case turboSpaceKeyCode, 53, 125, 126: return true' in source

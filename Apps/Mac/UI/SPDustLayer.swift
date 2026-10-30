@@ -907,14 +907,18 @@ final class SPDustHost: NSObject {
                 let m = max(col.x, max(col.y, col.z))
                 if m > 1 { col /= m }
             }
-            if cacheAhead {
+            if showsBufferedRanges {
+                // Cache states have stable colors independent of thumbnail
+                // hues: watched is white, resident ahead is cool blue.
                 col = SIMD3(repeating: 1)
-                if cached {
-                    // A denser, light-neutral cloud marks resident media. Keep
-                    // every mark a particle, including while hovering/dragging.
-                    L = max(L, (isRail ? 0.58 : 0.30) * bn)
-                } else {
-                    L *= 0.24
+                if cacheAhead {
+                    if cached {
+                        col = SIMD3(0.035, 0.42, 1)
+                        // Cap EDR brightness so blue never clips to white.
+                        L = min(0.68, max(L, (isRail ? 0.58 : 0.30) * bn))
+                    } else {
+                        L *= 0.24
+                    }
                 }
             }
             if dmg == 1 {
@@ -928,7 +932,10 @@ final class SPDustHost: NSObject {
                 L *= 0.55
             }
             let w = sz * (ember[i] ? 1.6 : 1) * (1 + 0.22 * c) * (1 + 0.24 * t.unify * c * (1 - tt))
-            grains[i] = SPDustGrain(pos: SIMD2(x, y), size: w, lum: L, col: SIMD4(col.x, col.y, col.z, g * bn))
+            // Geometry keeps the full hover response; reduce shader whitening
+            // and white halos on cached grains to preserve their status color.
+            let colorGlow = g * bn * (cacheAhead && cached ? 0.12 : 1)
+            grains[i] = SPDustGrain(pos: SIMD2(x, y), size: w, lum: L, col: SIMD4(col.x, col.y, col.z, colorGlow))
         }
         firstFrame = false
         let tweensDone = open.done && press.done && rebound == 0

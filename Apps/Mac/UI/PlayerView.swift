@@ -4,7 +4,7 @@ import QuartzCore
 final class PlayerView: NSView {
     let metalLayer = CAMetalLayer()
 
-    var onDoubleClick: (() -> Void)?
+    var onDoubleClick: ((NSEvent) -> Void)?
 
     var onMouseDown: ((NSEvent) -> Void)?
 
@@ -59,7 +59,7 @@ final class PlayerView: NSView {
         }
         onMouseDown?(event)
         if event.clickCount == 2 {
-            onDoubleClick?()
+            onDoubleClick?(event)
         }
     }
 
