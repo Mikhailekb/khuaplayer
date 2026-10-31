@@ -11,7 +11,11 @@ struct PlaybackFeedbackChecks {
     }
 
     static func runLoop(_ seconds: TimeInterval) {
+        #if SP_FEEDBACK_REAL_SCHEDULER
         RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+        #else
+        SPFeedbackTestClock.advance(by: seconds)
+        #endif
     }
 
     static func bezel(_ view: SPPlaybackFeedbackView) -> CALayer {
@@ -74,6 +78,9 @@ struct PlaybackFeedbackChecks {
     }
 
     static func main() {
+        #if SP_FEEDBACK_REAL_SCHEDULER
+        realSchedulerChecks()
+        #else
         let view = SPPlaybackFeedbackView(frame: .zero, reducedMotion: { false })
         check(view.isHidden, "Feedback starts hidden")
         view.place(in: CGRect(x: 10, y: 20, width: 640, height: 360))
@@ -109,11 +116,15 @@ struct PlaybackFeedbackChecks {
         let pause = glyph(view).path!
         check(pause.contains(CGPoint(x: 36, y: 48)) && pause.contains(CGPoint(x: 60, y: 48)), "Pause has two solid bars")
         check(!pause.contains(CGPoint(x: 48, y: 48)), "Pause keeps the gap between bars")
-        runLoop(0.25)
+        // Cross the old play cleanup at 0.75 while the replacement pause is
+        // still valid until 1.05. Cancelled callbacks deliberately execute.
+        runLoop(0.5)
         check(!view.isHidden && view.displayedPlaying == false, "An obsolete hide cannot erase the latest click")
+        check(SPFeedbackTestClock.cancelledCallbacksExecuted == 1,
+              "The obsolete callback actually ran after cancellation")
         view.place(in: CGRect(x: 2, y: 4, width: 320, height: 180))
         check(view.frame.midX == 162 && view.frame.midY == 94, "A resize keeps feedback centered")
-        runLoop(0.55)
+        runLoop(0.26)
         check(view.isHidden && view.displayedPlaying == nil, "The latest animation hides after completion")
         check(bezel(view).animationKeys()?.isEmpty ?? true, "Finished feedback leaves no animations running")
         check(glyph(view).animationKeys()?.isEmpty ?? true, "Finished feedback clears its glyph animation")
@@ -122,8 +133,15 @@ struct PlaybackFeedbackChecks {
         view.dismiss()
         runLoop(0.1)
         view.show(isPlaying: false)
-        runLoop(0.68)
-        check(!view.isHidden, "A dismissed session cannot hide the next session's feedback")
+        runLoop(0.66)
+        check(!view.isHidden && view.displayedPlaying == false,
+              "A dismissed session cannot hide the next session's feedback")
+        check(SPFeedbackTestClock.cancelledCallbacksExecuted == 2,
+              "The dismissed session's cancelled cleanup actually ran")
+        runLoop(0.1)
+        check(view.isHidden && view.displayedPlaying == nil,
+              "The next session still performs its own eventual cleanup")
+        view.show(isPlaying: false)
         view.dismiss()
         check(view.isHidden && view.displayedPlaying == nil, "Dismiss clears presentation state")
         check(bezel(view).animationKeys()?.isEmpty ?? true, "Dismiss removes animations")
@@ -154,8 +172,79 @@ struct PlaybackFeedbackChecks {
             print("Rendered detached component states: \(output.path)")
         }
         print("Playback feedback checks passed (\(checks) assertions).")
+        #endif
+    }
+
+    #if SP_FEEDBACK_REAL_SCHEDULER
+    static func realSchedulerChecks() {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        // This build compiles the unmodified production view, using its real
+        // DispatchWorkItem/main queue. Only eventual completion is wall-clock
+        // based; visibility near an expiry deadline belongs to the fake clock.
+        for reducedMotion in [false, true] {
+            let view = SPPlaybackFeedbackView(frame: .zero, reducedMotion: { reducedMotion })
+            view.place(in: CGRect(x: 0, y: 0, width: 320, height: 240))
+            view.show(isPlaying: true)
+            check(!view.isHidden && view.displayedPlaying == true,
+                  "Real scheduling immediately presents feedback")
+            let deadline = ProcessInfo.processInfo.systemUptime + 2.5
+            while !view.isHidden && ProcessInfo.processInfo.systemUptime < deadline {
+                runLoop(0.02)
+            }
+            check(view.isHidden && view.displayedPlaying == nil,
+                  "Real main-queue scheduling eventually completes feedback; reducedMotion=\(reducedMotion)")
+            check((bezel(view).animationKeys()?.isEmpty ?? true) &&
+                  (glyph(view).animationKeys()?.isEmpty ?? true),
+                  "Real completion removes both animations")
+            view.dismiss()
+        }
+        print("Unmodified playback feedback real-scheduler checks passed (\(checks) assertions).")
+    }
+    #endif
+}
+
+#if !SP_FEEDBACK_REAL_SCHEDULER
+// Substitute only the asynchronous scheduling boundary. A cancelled item still
+// runs its exact production closure, modeling an already-dispatched callback
+// and requiring the production generation guard to protect newer feedback.
+@MainActor
+final class SPFeedbackTestWorkItem {
+    private let body: () -> Void
+    private(set) var isCancelled = false
+    init(block: @escaping () -> Void) { body = block }
+    func cancel() { isCancelled = true }
+    func performEvenIfCancelled() { body() }
+}
+
+@MainActor
+enum SPFeedbackTestClock {
+    private struct Pending {
+        let deadline: TimeInterval
+        let item: SPFeedbackTestWorkItem
+    }
+    private static var now: TimeInterval = 0
+    private static var pending: [Pending] = []
+    private(set) static var cancelledCallbacksExecuted = 0
+
+    static func schedule(after delay: TimeInterval, execute item: SPFeedbackTestWorkItem) {
+        precondition(delay.isFinite && delay >= 0)
+        pending.append(Pending(deadline: now + delay, item: item))
+        pending.sort { $0.deadline < $1.deadline }
+    }
+
+    static func advance(by interval: TimeInterval) {
+        precondition(interval.isFinite && interval >= 0)
+        let target = now + interval
+        while let next = pending.first, next.deadline <= target {
+            pending.removeFirst()
+            now = next.deadline
+            if next.item.isCancelled { cancelledCallbacksExecuted += 1 }
+            next.item.performEvenIfCancelled()
+        }
+        now = target
     }
 }
+#endif
 
 private extension CGRect {
     var center: CGPoint { CGPoint(x: midX, y: midY) }

@@ -4,12 +4,36 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CHECK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kinolet-playback-feedback.XXXXXX")"
 trap 'rm -rf "$CHECK_DIR"' EXIT
+FEEDBACK_SOURCE="${PLAYBACK_FEEDBACK_SOURCE:-$ROOT/Apps/Mac/UI/PlaybackFeedbackView.swift}"
+
+python3 - "$FEEDBACK_SOURCE" "$CHECK_DIR/scheduled-feedback.swift" <<'PY'
+from pathlib import Path
+import sys
+source, output = map(Path, sys.argv[1:])
+original = source.read_text()
+schedule = 'DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)'
+assert original.count('DispatchWorkItem') == 2
+assert original.count(schedule) == 1
+projected = original.replace('DispatchWorkItem', 'SPFeedbackTestWorkItem').replace(
+    schedule, 'SPFeedbackTestClock.schedule(after: duration, execute: work)')
+# The lifecycle, generation/cancellation and cleanup closure remain byte-exact;
+# only work-item construction/type and asynchronous scheduling are substituted.
+assert projected.replace('SPFeedbackTestWorkItem', 'DispatchWorkItem').replace(
+    'SPFeedbackTestClock.schedule(after: duration, execute: work)', schedule) == original
+output.write_text(projected)
+PY
 
 xcrun swiftc -swift-version 6 -parse-as-library \
-  "$ROOT/Apps/Mac/UI/PlaybackFeedbackView.swift" \
+  "$CHECK_DIR/scheduled-feedback.swift" \
   "$ROOT/Scripts/tests/playback_feedback.swift" \
   -o "$CHECK_DIR/playback-feedback-checks"
 "$CHECK_DIR/playback-feedback-checks" "$@"
+
+# Independently retain a smoke check of the unmodified production scheduler.
+xcrun swiftc -swift-version 6 -parse-as-library -D SP_FEEDBACK_REAL_SCHEDULER \
+  "$FEEDBACK_SOURCE" "$ROOT/Scripts/tests/playback_feedback.swift" \
+  -o "$CHECK_DIR/real-feedback-checks"
+"$CHECK_DIR/real-feedback-checks"
 
 python3 - "$ROOT" "$CHECK_DIR" <<'PY'
 from pathlib import Path
