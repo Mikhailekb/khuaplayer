@@ -674,29 +674,41 @@ struct TorrentPauseBufferChecks {
         let manager = SPTorrentPauseBuffer(retryDelays: [.milliseconds(200)])
         let source = url("quota-shrink", "quota-before-ack")
         let originalUpper: Int64 = 8 * 1_024 * 1_024
+        var acceptedPrefix: Int64?
+        manager.onChange = { snapshot in
+            guard snapshot.state == .filling, [.shortRead, .transport].contains(snapshot.failure) else { return }
+            // scheduleRetry publishes synchronously after creating its MainActor
+            // task. Check ACK updates in this same non-suspending actor turn;
+            // a busy runner cannot legitimately cross the200ms retry deadline
+            // between two50ms sleeps as it could in the old fixture.
+            manager.onChange = nil
+            let prefix = snapshot.receivedBytes
+            acceptedPrefix = prefix
+            check(prefix > 0 && prefix <= originalUpper / 2,
+                  "a premature Content-Length body preserves validated bytes while waiting for automatic recovery")
+            manager.start(identity: identity, streamURL: source, offset: 0,
+                          fileLength: fileLength, forwardEndOffset: prefix + 1)
+            check(manager.snapshot.state == .filling && manager.snapshot.receivedBytes == prefix &&
+                  manager.snapshot.failure == snapshot.failure && manager.snapshot.budgetBytes == prefix + 1 &&
+                  requests("quota-before-ack").count == 1,
+                  "a smaller ACK updates the bounded target without bypassing recovery backoff")
+            manager.start(identity: identity, streamURL: source, offset: 0,
+                          fileLength: fileLength, forwardEndOffset: originalUpper + 1_024)
+            check(manager.snapshot.state == .filling && manager.snapshot.receivedBytes == prefix &&
+                  manager.snapshot.failure == snapshot.failure && manager.snapshot.budgetBytes == originalUpper + 1_024 &&
+                  requests("quota-before-ack").count == 1,
+                  "a growing ACK does not trigger an immediate retry of a truncated request")
+            manager.start(identity: identity, streamURL: source, offset: 0,
+                          fileLength: fileLength, forwardEndOffset: prefix)
+            check(manager.snapshot.state == .filled && manager.snapshot.failure == nil &&
+                  manager.snapshot.receivedBytes == prefix && manager.snapshot.rangeEnd == prefix - 1 &&
+                  requests("quota-before-ack").count == 1,
+                  "a target entirely covered by validated bytes completes without pretending the close was a capacity proof")
+        }
         manager.start(identity: identity, streamURL: source, offset: 0,
                       fileLength: fileLength, forwardEndOffset: originalUpper)
-        try await awaitTransientFailure(manager)
-        let prefix = manager.snapshot.receivedBytes
-        check([.shortRead, .transport].contains(manager.snapshot.failure) && prefix > 0 && prefix <= originalUpper / 2,
-              "a premature Content-Length body preserves validated bytes while waiting for automatic recovery")
-        manager.start(identity: identity, streamURL: source, offset: 0,
-                      fileLength: fileLength, forwardEndOffset: prefix + 1)
-        try await Task.sleep(for: .milliseconds(50))
-        check(manager.snapshot.state == .filling && manager.snapshot.receivedBytes == prefix &&
-              requests("quota-before-ack").count == 1,
-              "a smaller ACK updates the bounded target without bypassing recovery backoff")
-        manager.start(identity: identity, streamURL: source, offset: 0,
-                      fileLength: fileLength, forwardEndOffset: originalUpper + 1_024)
-        try await Task.sleep(for: .milliseconds(50))
-        check(manager.snapshot.state == .filling && requests("quota-before-ack").count == 1,
-              "a growing ACK does not trigger an immediate retry of a truncated request")
-        manager.start(identity: identity, streamURL: source, offset: 0,
-                      fileLength: fileLength, forwardEndOffset: prefix)
-        check(manager.snapshot.state == .filled && manager.snapshot.failure == nil &&
-              manager.snapshot.receivedBytes == prefix && manager.snapshot.rangeEnd == prefix - 1 &&
-              requests("quota-before-ack").count == 1,
-              "a target entirely covered by validated bytes completes without pretending the close was a capacity proof")
+        try await wait { acceptedPrefix != nil }
+        let prefix = acceptedPrefix!
         try await Task.sleep(for: .milliseconds(300))
         check(requests("quota-before-ack").count == 1,
               "completing an approved smaller target cancels its pending retry")
