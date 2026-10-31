@@ -27,6 +27,34 @@ struct FloatingVideoChecks {
     static func runLoop(_ seconds: TimeInterval) {
         RunLoop.main.run(until: Date().addingTimeInterval(seconds))
     }
+
+    static func preservesAspect(_ size: NSSize, ratio: CGFloat, backingScale: CGFloat) -> Bool {
+        guard size.width.isFinite, size.height.isFinite, ratio.isFinite, backingScale.isFinite,
+              size.width > 0, size.height > 0, ratio > 0, backingScale > 0 else { return false }
+        // NSWindow can align its content size to physical pixels. For example,
+        // 420 x 236.25 at 16:9 becomes 420 x 236 on a 1x CI display. A ratio
+        // epsilon over-penalizes these small windows; compare native geometry.
+        return abs(size.height - size.width / ratio) <= 1 / backingScale
+    }
+
+    static func aspectRoundingChecks() {
+        expect(preservesAspect(NSSize(width: 420, height: 236.25), ratio: 16 / 9, backingScale: 1),
+               "Exact 16:9 content keeps its aspect")
+        expect(preservesAspect(NSSize(width: 420, height: 236), ratio: 16 / 9, backingScale: 1),
+               "One-times native display rounding is accepted")
+        expect(preservesAspect(NSSize(width: 420, height: 236.5), ratio: 16 / 9, backingScale: 2),
+               "Retina native display rounding is accepted")
+        expect(!preservesAspect(NSSize(width: 420, height: 234), ratio: 16 / 9, backingScale: 1),
+               "More than a physical pixel of aspect distortion is rejected")
+        expect(!preservesAspect(NSSize(width: 620, height: 340), ratio: 16 / 9, backingScale: 2),
+               "An unresized source view cannot pass the floating aspect check")
+        expect(!preservesAspect(.zero, ratio: 16 / 9, backingScale: 1) &&
+               !preservesAspect(NSSize(width: CGFloat.nan, height: 236), ratio: 16 / 9, backingScale: 1),
+               "Missing or non-finite content dimensions are rejected")
+        expect(!preservesAspect(NSSize(width: 420, height: 236), ratio: 0, backingScale: 1) &&
+               !preservesAspect(NSSize(width: 420, height: 236), ratio: 16 / 9, backingScale: 0),
+               "Invalid aspect or backing scale is rejected")
+    }
     static func render(_ window: NSWindow, path: URL) throws {
         let view = window.contentView!
         view.layoutSubtreeIfNeeded()
@@ -93,6 +121,7 @@ struct FloatingVideoChecks {
     static func main() throws {
         setbuf(stdout, nil)
         NSApplication.shared.setActivationPolicy(.prohibited)
+        aspectRoundingChecks()
         sliderGeometryChecks()
         let source = NSWindow(contentRect: NSRect(x: -2000, y: -2000, width: 640, height: 360),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)
@@ -135,7 +164,10 @@ struct FloatingVideoChecks {
         expect(content.layer?.cornerRadius == 10 && content.layer?.masksToBounds == true, "Rounded content clips the existing video and overlay together")
         expect(video.autoresizingMask.isEmpty && video.layer === originalLayer, "Floating content owns layout without replacing the rendered layer")
         expect(video.frame == content.bounds, "Video fills the entire floating window with no permanent footer")
-        expect(abs(video.bounds.width / video.bounds.height - 16 / 9) < 0.001, "Video keeps its source aspect with overlay controls")
+        expect(abs(panel.contentAspectRatio.width / panel.contentAspectRatio.height - 16 / 9) < 0.000001,
+               "The floating window requests the exact source aspect")
+        expect(preservesAspect(video.bounds.size, ratio: 16 / 9, backingScale: panel.backingScaleFactor),
+               "Video keeps its source aspect within one native pixel: video=\(video.bounds.size), content=\(content.bounds.size), frame=\(panel.frame.size), scale=\(panel.backingScaleFactor)")
         expect(controls.alphaValue == 0, "Paused video initially has no controls without hover")
         expect(barWhite(timeline, at: 0.1) > 0.95 && barWhite(timeline, at: 0.55) > 0.72 &&
                barWhite(timeline, at: 0.7) < 0.45, "PiP paints white played, gray cached and darker uncached regions")
@@ -224,7 +256,8 @@ struct FloatingVideoChecks {
         panel.setFrame(NSRect(origin: panel.frame.origin, size: proposed), display: false)
         panel.contentView?.needsLayout = true
         panel.contentView?.layoutSubtreeIfNeeded()
-        expect(abs(video.bounds.width - video.bounds.height * 16 / 9) <= 1, "Resizing preserves aspect within native integral window rounding")
+        expect(preservesAspect(video.bounds.size, ratio: 16 / 9, backingScale: panel.backingScaleFactor),
+               "Resizing preserves aspect within one native pixel: video=\(video.bounds.size), scale=\(panel.backingScaleFactor)")
         expect(video.frame == content.bounds && timeline.frame.maxX <= content.bounds.maxX, "The full video and overlay relayout after resize")
         expect(layouts > 0, "Owner is told to update the existing renderer's viewport")
         expect(controller.present(videoView: video, aspectRatio: 16 / 9, sourceWindow: source, showWindow: false), "Entering twice is idempotent")
