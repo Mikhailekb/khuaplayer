@@ -89,54 +89,65 @@ jobs:
 
       - name: Check playback, playlist and torrent models
         run: |
-          ./Scripts/test_brand_migration.sh
-          ./Scripts/test_turbo_speed.sh
-          ./Scripts/test_video_click.sh
-          ./Scripts/test_video_hold_turbo.sh
-          ./Scripts/test_playback_feedback.sh
-          ./Scripts/test_playback_control_intent.sh
-          ./Scripts/test_playback_diagnostics.sh
-          ./Scripts/test_playback_diagnostic_projection.sh
-          ./Scripts/test_torrent_background_admission.sh
-          ./Scripts/test_torrent_background_urls.sh
-          ./Scripts/test_torrent_background_lifecycle.sh
-          ./Scripts/test_torrent_subtitle_cache.sh
-          ./Scripts/test_torrent_preview_cache.sh
-          ./Scripts/test_persistent_thumbnail_store.sh
-          ./Scripts/test_video_context_menu.sh
-          ./Scripts/test_video_context_policy.sh
-          ./Scripts/test_floating_video.sh
-          ./Scripts/test_buffered_timeline.sh
-          if ./Scripts/test_particle_buffered_timeline.sh; then
-            :
-          else
-            status=$?
-            if [ "$status" -eq 77 ]; then
-              echo "SKIP: no Metal device available for particle timeline checks"
+          ci_failed_checks=()
+          run_check() {
+            local ci_check="$1" ci_status
+            echo "::group::$ci_check"
+            if "$ci_check"; then
+              echo "PASS: $ci_check"
             else
-              exit "$status"
+              ci_status=$?
+              if [ "$ci_check" = "./Scripts/test_particle_buffered_timeline.sh" ] && [ "$ci_status" -eq 77 ]; then
+                echo "SKIP: no Metal device available for particle timeline checks"
+              else
+                ci_failed_checks+=("$ci_check (exit $ci_status)")
+                echo "::error::$ci_check failed with exit $ci_status"
+              fi
             fi
+            echo "::endgroup::"
+          }
+          run_check ./Scripts/test_brand_migration.sh
+          run_check ./Scripts/test_turbo_speed.sh
+          run_check ./Scripts/test_video_click.sh
+          run_check ./Scripts/test_video_hold_turbo.sh
+          run_check ./Scripts/test_playback_feedback.sh
+          run_check ./Scripts/test_playback_control_intent.sh
+          run_check ./Scripts/test_playback_diagnostics.sh
+          run_check ./Scripts/test_playback_diagnostic_projection.sh
+          run_check ./Scripts/test_torrent_background_admission.sh
+          run_check ./Scripts/test_torrent_background_urls.sh
+          run_check ./Scripts/test_torrent_background_lifecycle.sh
+          run_check ./Scripts/test_torrent_subtitle_cache.sh
+          run_check ./Scripts/test_torrent_preview_cache.sh
+          run_check ./Scripts/test_persistent_thumbnail_store.sh
+          run_check ./Scripts/test_video_context_menu.sh
+          run_check ./Scripts/test_video_context_policy.sh
+          run_check ./Scripts/test_floating_video.sh
+          run_check ./Scripts/test_buffered_timeline.sh
+          run_check ./Scripts/test_particle_buffered_timeline.sh
+          run_check ./Scripts/test_cached_timeline.sh
+          run_check ./Scripts/test_source_playback_waiting.sh
+          run_check ./Scripts/test_torrent_cache_timeline.sh
+          run_check ./Scripts/test_torrent_cache_polling.sh
+          run_check ./Scripts/test_playlist_filesystem.sh
+          run_check ./Scripts/test_playlist_track_inheritance.sh
+          run_check ./Scripts/test_playlist_keyboard.sh
+          run_check ./Scripts/test_playlist_navigation.sh
+          run_check ./Scripts/test_playlist_file_download_rows.sh
+          run_check ./Scripts/test_torrent_file_saves.sh
+          run_check ./Scripts/test_torrent_buffer_metrics.sh
+          run_check ./Scripts/test_torrent_models.sh
+          run_check ./Scripts/test_torrent_playback.sh
+          run_check ./Scripts/test_torrent_server.sh
+          run_check ./Scripts/test_torrent_pause_buffer.sh
+          run_check ./Scripts/test_torrent_prefetch_lifecycle.sh
+          run_check ./Scripts/test_torrent_window_lifecycle.sh
+          run_check ./Scripts/test_torrent_recents.sh
+          run_check ./Scripts/test_torrent_resume_store.sh
+          if [ "${#ci_failed_checks[@]}" -ne 0 ]; then
+            printf '%s\n' 'Failed playback, playlist and torrent checks:' "${ci_failed_checks[@]}" >&2
+            exit 1
           fi
-          ./Scripts/test_cached_timeline.sh
-          ./Scripts/test_source_playback_waiting.sh
-          ./Scripts/test_torrent_cache_timeline.sh
-          ./Scripts/test_torrent_cache_polling.sh
-          ./Scripts/test_playlist_filesystem.sh
-          ./Scripts/test_playlist_track_inheritance.sh
-          ./Scripts/test_playlist_keyboard.sh
-          ./Scripts/test_playlist_navigation.sh
-          ./Scripts/test_playlist_file_download_rows.sh
-          ./Scripts/test_torrent_file_saves.sh
-          ./Scripts/test_torrent_buffer_metrics.sh
-          ./Scripts/test_torrent_models.sh
-          ./Scripts/test_torrent_playback.sh
-          ./Scripts/test_torrent_server.sh
-          ./Scripts/test_torrent_pause_buffer.sh
-          ./Scripts/test_torrent_prefetch_lifecycle.sh
-          ./Scripts/test_torrent_window_lifecycle.sh
-          ./Scripts/test_torrent_recents.sh
-          ./Scripts/test_torrent_resume_store.sh
-
       - name: Check public repository boundary
         run: ./Scripts/check_public_repo.sh
 

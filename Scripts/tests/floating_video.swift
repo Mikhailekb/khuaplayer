@@ -123,6 +123,15 @@ struct FloatingVideoChecks {
         NSApplication.shared.setActivationPolicy(.prohibited)
         aspectRoundingChecks()
         sliderGeometryChecks()
+        let renderDirectory = CommandLine.arguments.count == 2
+            ? URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true) : nil
+        try windowChecks(contentWidth: nil, renderDirectory: renderDirectory)
+        try windowChecks(contentWidth: 280,
+                         renderDirectory: renderDirectory?.appendingPathComponent("minimum-width", isDirectory: true))
+        print("Floating video checks passed (\(checks) assertions; preferred and 280pt owned hidden windows).")
+    }
+
+    static func windowChecks(contentWidth: CGFloat?, renderDirectory: URL?) throws {
         let source = NSWindow(contentRect: NSRect(x: -2000, y: -2000, width: 640, height: 360),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         source.isReleasedWhenClosed = false
@@ -152,6 +161,13 @@ struct FloatingVideoChecks {
         expect(controller.present(videoView: video, aspectRatio: 16 / 9, sourceWindow: source, showWindow: false), "Existing video enters floating mode")
         let panel = controller.window!
         let content = panel.contentView!
+        if let contentWidth {
+            panel.setContentSize(NSSize(width: contentWidth, height: contentWidth * 9 / 16))
+            content.needsLayout = true
+            content.layoutSubtreeIfNeeded()
+            expect(abs(content.bounds.width - contentWidth) <= 1 / panel.backingScaleFactor,
+                   "The minimum-width scenario actually exercises \(contentWidth)pt content: \(content.bounds.size)")
+        }
         let controls = find(panel, "sp.floatingVideo.controls", as: NSView.self)
         let timeline = find(panel, "sp.floatingVideo.timeline", as: SPFloatingVideoSlider.self)
         let volume = find(panel, "sp.floatingVideo.volume", as: SPFloatingVideoSlider.self)
@@ -191,7 +207,16 @@ struct FloatingVideoChecks {
         expect(mute.frame.minX > content.bounds.midX && volume.frame.minX > mute.frame.minX, "Mute and volume are at the top right")
         expect(abs(play.frame.midX - content.bounds.midX) < 0.01 && abs(play.frame.midY - content.bounds.midY) < 0.01, "Play/pause is centered over the video")
         expect(timeline.frame.maxY < current.frame.midY && current.frame.midY < content.bounds.midY, "Time and seek controls overlay the bottom of the video")
-        expect(content.hitTest(NSPoint(x: 110, y: content.bounds.midY)) === video, "Noninteractive overlay space passes through to the video")
+        // Choose the middle of the empty gap to the left of Play, rather than
+        // assuming x110 is empty: at280pt that is the Play button's left edge.
+        let emptyPoint = NSPoint(x: (content.bounds.minX + play.frame.minX) / 2,
+                                 y: content.bounds.midY)
+        let interactive = descendants(controls).compactMap { $0 as? NSControl }
+            .filter { !($0 is NSTextField) }
+        expect(content.bounds.contains(emptyPoint) && !interactive.isEmpty &&
+               interactive.allSatisfy { !content.convert($0.bounds, from: $0).contains(emptyPoint) },
+               "The pass-through probe is strictly outside every interactive control: point=\(emptyPoint), content=\(content.bounds.size)")
+        expect(content.hitTest(emptyPoint) === video, "Noninteractive overlay space passes through to the video")
         expect(content.hitTest(NSPoint(x: play.frame.midX, y: play.frame.midY)) === play, "Visible play control receives its own clicks")
         play.performClick(nil)
         expect(toggles == 1, "Play control calls the existing playback owner")
@@ -240,8 +265,7 @@ struct FloatingVideoChecks {
         expect(timeline.maxValue == 0.5 && timeline.doubleValue == 0.2 && timeline.isEnabled,
                "Subsecond media cannot seek beyond its actual duration")
         controller.update(isPlaying: false, position: 394, duration: 1014, volumePercent: 72, muted: false)
-        if CommandLine.arguments.count == 2 {
-            let directory = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        if let directory = renderDirectory {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try render(panel, path: directory.appendingPathComponent("pip-hover.png"))
             hover(panel, entered: false)
@@ -283,6 +307,5 @@ struct FloatingVideoChecks {
         expect(video.layer === originalLayer && focusLosses == 4, "System close preserves the layer and cancels held input")
         expect(!controller.present(videoView: NSView(), aspectRatio: 1, sourceWindow: nil, showWindow: false), "A detached view cannot lose its restoration owner")
         source.close()
-        print("Floating video checks passed (\(checks) assertions; owned hidden windows only).")
     }
 }
