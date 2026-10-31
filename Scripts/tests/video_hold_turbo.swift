@@ -143,6 +143,12 @@ private enum SPHoldControl { case toggle }
         func wait(_ seconds: TimeInterval) {
             RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds))
         }
+        func waitUntil(_ condition: () -> Bool) {
+            let deadline = ProcessInfo.processInfo.systemUptime + 2.5
+            while !condition() && ProcessInfo.processInfo.systemUptime < deadline {
+                wait(0.02)
+            }
+        }
         func fixture() -> (SPHoldOwner, SPHoldWindow) {
             SPHoldFixtureInput.pointer = CGPoint(x: 300, y: 300)
             SPHoldFixtureInput.buttons = 1
@@ -301,7 +307,13 @@ private enum SPHoldControl { case toggle }
             mouse(owner, window, down: true)
             owner.videoHoldTimer?.invalidate() // Exercise threshold callback itself.
             SPHoldFixtureInput.buttons = 0
-            wait(0.30)
+            let threshold = owner.turboTimer
+            check(threshold?.isValid == true,
+                  "queued short release has an actual scheduled Foundation threshold timer")
+            // Deliver this specific ordering directly through Foundation's
+            // real callback. A wall-clock wait leaves only50ms of slack and
+            // cannot guarantee a busy CI run loop delivered this timer yet.
+            threshold?.fire()
             check(owner.core?.toggles == 1 && owner.core?.state == .paused,
                   "threshold callback can finish a queued short release without engaging turbo")
             mouse(owner, window, down: false)
@@ -314,7 +326,8 @@ private enum SPHoldControl { case toggle }
             SPHoldFixtureInput.buttons = 0; owner.poll()
             check(owner.turbo.owners == [.space] && owner.core?.toggles == 0,
                   "watchdog mouse release preserves independently held Space ownership")
-            mouse(owner, window, down: false); wait(0.30)
+            mouse(owner, window, down: false)
+            waitUntil { owner.core?.playbackRate == 2 }
             check(owner.core?.playbackRate == 2 && owner.core?.toggles == 0,
                   "queued mouse up cannot cancel remaining Space threshold")
             space(owner, down: false)
@@ -368,7 +381,8 @@ private enum SPHoldControl { case toggle }
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }
-            mouse(owner, window, down: true); wait(0.32)
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
             check(owner.core?.playbackRate == 2 && owner.turboHUD?.active == true, "real common-mode timer engages mouse turbo and HUD")
             space(owner, down: false)
             check(owner.core?.playbackRate == 2 && owner.turbo.phase == .active, "unrelated Space release cannot restore a mouse hold")
@@ -379,7 +393,7 @@ private enum SPHoldControl { case toggle }
         for mouseFirst in [true, false] {
             let (owner, window) = fixture(); defer { owner.shutdown() }
             if mouseFirst { mouse(owner, window, down: true) } else { space(owner, down: true) }
-            wait(0.30)
+            waitUntil { owner.turbo.phase == .active }
             if mouseFirst { space(owner, down: true) } else { mouse(owner, window, down: true) }
             check(owner.turbo.owners.count == 2 && owner.core?.rates == [2], "second physical owner joins without multiplying speed")
             if mouseFirst { mouse(owner, window, down: false) } else { space(owner, down: false) }
@@ -396,7 +410,7 @@ private enum SPHoldControl { case toggle }
         for active in [false, true] {
             let (owner, window) = fixture(); defer { owner.shutdown() }
             mouse(owner, window, down: true)
-            if active { wait(0.30) }
+            if active { waitUntil { owner.turbo.phase == .active } }
             SPHoldFixtureInput.pointer.x += 5; owner.drag()
             SPHoldFixtureInput.pointer.x -= 5
             mouse(owner, window, down: false); wait(0.30)
@@ -414,15 +428,18 @@ private enum SPHoldControl { case toggle }
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }
-            mouse(owner, window, down: true); wait(0.30)
-            SPHoldFixtureInput.buttons = 0; wait(0.08)
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
+            SPHoldFixtureInput.buttons = 0
+            waitUntil { owner.turbo.owners.isEmpty }
             check(owner.core?.rates == [2, 1.25] && owner.turboHUD?.visible == false, "lost outside-app release is recovered without a global monitor")
             mouse(owner, window, down: false)
             check(owner.core?.toggles == 0, "late release after watchdog cleanup never pauses")
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }
-            mouse(owner, window, down: true); wait(0.30)
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
             window.fixtureKey = false; owner.poll()
             check(owner.core?.playbackRate == 1.25 && owner.turboHUD?.visible == false, "key-window loss restores mouse hold immediately")
             mouse(owner, window, down: false)
@@ -430,7 +447,8 @@ private enum SPHoldControl { case toggle }
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }
-            mouse(owner, window, down: true); wait(0.30)
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
             owner.lifecycleEnd()
             check(owner.core?.playbackRate == 1.25 && owner.turbo.owners.isEmpty, "settings/session cleanup restores speed and all ownership")
             mouse(owner, window, down: false)
@@ -438,7 +456,8 @@ private enum SPHoldControl { case toggle }
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }
-            mouse(owner, window, down: true); wait(0.30)
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
             let original = window.frame.origin
             window.setFrameOrigin(CGPoint(x: original.x + 1, y: original.y)); owner.poll()
             window.setFrameOrigin(original)
@@ -450,7 +469,7 @@ private enum SPHoldControl { case toggle }
             let (owner, window) = fixture(); defer { owner.shutdown() }
             mouse(owner, window, down: true)
             SPHoldFixtureInput.pointer.x += 4
-            wait(0.30)
+            waitUntil { owner.turbo.phase == .active }
             check(owner.core?.playbackRate == 2, "four-pixel jitter remains inside hold tolerance")
             let elsewhere = SPHoldWindow(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
             mouse(owner, elsewhere, down: false)
@@ -459,7 +478,8 @@ private enum SPHoldControl { case toggle }
         }
         for closeSource in [false, true] {
             let (owner, window) = fixture(); defer { owner.shutdown() }
-            mouse(owner, window, down: true); wait(0.30)
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
             if closeSource { owner.hasMediaSession = false } else { owner.isSettingsPanelShown = true }
             owner.poll(); mouse(owner, window, down: false)
             check(owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
@@ -472,7 +492,8 @@ private enum SPHoldControl { case toggle }
             window.fixtureKey = false
             panel.contentView = owner.playerView
             SPHoldFixtureInput.pointer = CGPoint(x: 100, y: 100)
-            mouse(owner, panel, down: true); wait(0.30)
+            mouse(owner, panel, down: true)
+            waitUntil { owner.turbo.phase == .active }
             check(owner.core?.playbackRate == 2, "PiP hold uses the actual keyable panel rather than the main window")
             mouse(owner, panel, down: false)
             check(owner.core?.rates == [2, 1.25], "PiP-panel release restores original speed")
